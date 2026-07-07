@@ -114,6 +114,35 @@ _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
+# --- NVTX phase annotation for utilization profiling (counter runs only) ------
+# Zero-overhead unless SGLANG_NVTX_PROFILE=1. The sync at range end makes the
+# CPU-side NVTX interval cover the (async) GPU execution, so nsys GPU-metrics
+# samples join to the right phase; that perturbs timing, hence counter runs and
+# timing runs stay separate (see parallel_sd_inference EXPERIMENTS.md).
+import functools
+import os
+
+_NVTX_PROFILE = os.environ.get("SGLANG_NVTX_PROFILE", "0") == "1"
+
+
+def _nvtx_phase(name):
+    def deco(fn):
+        if not _NVTX_PROFILE:
+            return fn
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            torch.cuda.nvtx.range_push(name)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_pop()
+
+        return wrapper
+
+    return deco
+
 
 def _get_plan_stream(
     device: str,
@@ -473,6 +502,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    @_nvtx_phase("draft")
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = self.prepare_for_draft(
@@ -813,6 +843,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_for_logprob_per_req=1,
         )
 
+    @_nvtx_phase("draft_extend")
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
@@ -1444,6 +1475,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ) = backup
             dw._rebuild_topk1_chain_buffers()
 
+    @_nvtx_phase("verify")
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
