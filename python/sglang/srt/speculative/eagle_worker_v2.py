@@ -114,32 +114,111 @@ _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
-# --- NVTX phase annotation for utilization profiling (counter runs only) ------
-# Zero-overhead unless SGLANG_NVTX_PROFILE=1. The sync at range end makes the
-# CPU-side NVTX interval cover the (async) GPU execution, so nsys GPU-metrics
-# samples join to the right phase; that perturbs timing, hence counter runs and
-# timing runs stay separate (see parallel_sd_inference EXPERIMENTS.md).
+# --- per-phase profiling hooks (draft / draft_extend / verify) ----------------
+# Two mutually exclusive opt-in modes, zero-overhead when neither env is set
+# (see parallel_sd_inference EXPERIMENTS.md §2):
+#   SGLANG_NVTX_PROFILE=1  — COUNTER runs: NVTX range + torch.cuda.synchronize()
+#     at range end, so the CPU-side interval covers the async GPU execution and
+#     nsys GPU-metrics samples join to the right phase. The sync serializes the
+#     pipeline → wall-clock under this mode is NOT a timing number.
+#   SGLANG_PHASE_EVENTS=1  — TIMING runs: CUDA event pair per phase call, no
+#     sync, no profiler (~µs overhead; overlap scheduler unaffected). gpu_ms =
+#     stream time from reaching the start marker to draining the phase's work
+#     (launch gaps included); cpu_enqueue_ms = CPU wall of the method (the
+#     launch-overhead signal). JSONL appended to SGLANG_PHASE_EVENTS_OUT
+#     (default /tmp/phase_times.jsonl), flushed every 64 records + atexit.
+# If both are set, NVTX wins (a counter run is already timing-invalid).
+import atexit
 import functools
+import json
 import os
 
 _NVTX_PROFILE = os.environ.get("SGLANG_NVTX_PROFILE", "0") == "1"
+_PHASE_EVENTS = (
+    os.environ.get("SGLANG_PHASE_EVENTS", "0") == "1" and not _NVTX_PROFILE
+)
+_PHASE_EVENTS_OUT = os.environ.get(
+    "SGLANG_PHASE_EVENTS_OUT", "/tmp/phase_times.jsonl"
+)
 
 
-def _nvtx_phase(name):
+class _PhaseEventLog:
+    FLUSH_EVERY = 64
+
+    def __init__(self, path):
+        self._path = path
+        self._file = None
+        self._pending = []  # (phase, cpu_enqueue_ms, start_evt, end_evt)
+        self._n = 0
+        atexit.register(self.flush, final=True)
+
+    def record(self, phase, cpu_ms, start_evt, end_evt):
+        self._pending.append((phase, cpu_ms, start_evt, end_evt))
+        self._n += 1
+        if self._n % self.FLUSH_EVERY == 0:
+            self.flush()
+
+    def flush(self, final=False):
+        if self._file is None:
+            if not self._pending:
+                return
+            self._file = open(self._path, "w")
+        if final:
+            torch.cuda.synchronize()
+        keep = []
+        for phase, cpu_ms, s, e in self._pending:
+            if e.query():  # end done => start done (same stream, in order)
+                self._file.write(
+                    json.dumps(
+                        {
+                            "phase": phase,
+                            "gpu_ms": round(s.elapsed_time(e), 4),
+                            "cpu_enqueue_ms": round(cpu_ms, 4),
+                        }
+                    )
+                    + "\n"
+                )
+            else:
+                keep.append((phase, cpu_ms, s, e))
+        self._pending = keep
+        self._file.flush()
+
+
+_PHASE_LOG = _PhaseEventLog(_PHASE_EVENTS_OUT) if _PHASE_EVENTS else None
+
+
+def _profile_phase(name):
     def deco(fn):
-        if not _NVTX_PROFILE:
-            return fn
+        if _NVTX_PROFILE:
 
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            torch.cuda.nvtx.range_push(name)
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                torch.cuda.synchronize()
-                torch.cuda.nvtx.range_pop()
+            @functools.wraps(fn)
+            def nvtx_wrapper(*args, **kwargs):
+                torch.cuda.nvtx.range_push(name)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    torch.cuda.synchronize()
+                    torch.cuda.nvtx.range_pop()
 
-        return wrapper
+            return nvtx_wrapper
+
+        if _PHASE_EVENTS:
+
+            @functools.wraps(fn)
+            def event_wrapper(*args, **kwargs):
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                t0 = time.perf_counter()
+                s.record()
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    e.record()
+                    _PHASE_LOG.record(name, (time.perf_counter() - t0) * 1e3, s, e)
+
+            return event_wrapper
+
+        return fn
 
     return deco
 
@@ -502,7 +581,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
-    @_nvtx_phase("draft")
+    @_profile_phase("draft")
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = self.prepare_for_draft(
@@ -843,7 +922,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_for_logprob_per_req=1,
         )
 
-    @_nvtx_phase("draft_extend")
+    @_profile_phase("draft_extend")
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
@@ -1475,7 +1554,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ) = backup
             dw._rebuild_topk1_chain_buffers()
 
-    @_nvtx_phase("verify")
+    @_profile_phase("verify")
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
