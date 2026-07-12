@@ -3598,6 +3598,30 @@ class Scheduler(
                         # relay stash (small-stream FIFO after the same-slot
                         # flush below) and any prefill stash (large stream,
                         # relay event).
+                        #
+                        # M2.6 dep-graph audit (can the gathers be pulled OFF
+                        # the [extend, gathers, draft] chain?): NO — measured
+                        # and by data dependency. Per slot X, tick n:
+                        #
+                        #   verify(X,n) --> extend(X,n) --> stash(X,n) --> gathers(X,n+1) --> draft(X,n+1)
+                        #     (large)       (small)      (on_relay, small)     (here)          (small)
+                        #
+                        # The stash payload's topk_p/topk_index are OUTPUTS of
+                        # the extend FORWARD (_draft_extend_for_decode topk/
+                        # argmax over its logits); only bonus_tokens comes from
+                        # verify. gather_spec_extras reads exactly those bufs,
+                        # and draft's first forward consumes topk_index — so
+                        # extend -> gathers -> draft is true-serial. All three
+                        # reordering candidates are falsified: (a) gathers
+                        # before extend — reads the stash extend hasn't written;
+                        # (b) gathers on the large tail after verify(X,n) — the
+                        # stash lands at extend end on the SMALL stream, later;
+                        # (c) a second small-partition stream — no ordering
+                        # win, same dep chain. Measured cost of the gathers is
+                        # noise anyway (nsys 20260712T2110, c=32 @76,32:
+                        # 0.14 ms GPU-busy in a 0.93 ms extend-end->draft-start
+                        # window; the other ~0.8 ms is CPU enqueue latency, see
+                        # the M2.6 sync-free plan work in flashinfer_backend).
                         small = self._spec_pdmux_small_stream
                         small.wait_stream(self.schedule_stream)
                         if self._spec_pdmux_prefill_relay_pending[spec_pdmux_slot]:
