@@ -124,6 +124,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- core state ------------------------------------------------
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.is_multimodal
+        # spec-pdmux (M1): capture prefill graphs on the LARGE green-ctx stream
+        # too — graph SM affinity is baked at CAPTURE time, so a plain capture
+        # stream would let prefill escape the partition (measured: brief 99%
+        # SM-Active bursts at each prefill). None => stock behavior.
+        self.capture_stream_override = None
+        if model_runner.server_args.enable_spec_pdmux:
+            from sglang.srt.multiplex.pdmux_context import get_spec_streams
+
+            self.capture_stream_override = get_spec_streams()[0]
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
@@ -656,7 +665,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            with graph_capture() as graph_capture_context:
+            with graph_capture(
+                stream=getattr(self, "capture_stream_override", None)
+            ) as graph_capture_context:
                 self.stream = graph_capture_context.stream
                 with self.backend.capture_session(self.stream):
                     self._capture_one_stream()

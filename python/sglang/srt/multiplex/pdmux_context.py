@@ -1,14 +1,24 @@
+import logging
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, Tuple
 
 import torch
 import yaml
+
+logger = logging.getLogger(__name__)
 
 STREAM_GROUPS = []
 SM_COUNTS = []
 SM_GROUP_NUM = 8  # Default number of SM groups
 CURRENT_STREAM_IDX = 0
 CURRENT_STREAM_GROUP = None
+
+# --- spec-pdmux (co-located speculative decoding, M1) -----------------------
+# One process-wide green-context stream pair: (large, small). Step 2 runs the
+# whole forward path (verify + draft) on the LARGE stream; step 3 moves the
+# drafter to the small stream.
+SPEC_STREAM_PAIR: Optional[Tuple[torch.cuda.Stream, torch.cuda.Stream]] = None
+SPEC_SM_SPLIT: Optional[Tuple[int, int]] = None
 
 
 @dataclass
@@ -139,6 +149,87 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
 
     CURRENT_STREAM_IDX = 0
     CURRENT_STREAM_GROUP = STREAM_GROUPS[CURRENT_STREAM_IDX]
+
+
+def resolve_spec_sm_split(
+    gpu_id: int, split_str: Optional[str] = None
+) -> Tuple[int, int]:
+    """Resolve --spec-pdmux-sm-split ("LARGE,SMALL") or compute the default:
+    small = 16 rounded up to the arch multiple (>= arch min), large = rest
+    rounded down to the arch multiple (e.g. 92,16 on a 108-SM A100)."""
+    from sgl_kernel import spatial
+
+    total = spatial.get_sm_available(gpu_id)
+    min_per_part, multiple = get_arch_constraints(
+        torch.cuda.get_device_capability(torch.cuda.current_device())
+    )
+    if split_str:
+        try:
+            large, small = (int(x) for x in split_str.split(","))
+        except ValueError:
+            raise ValueError(
+                f"--spec-pdmux-sm-split must be 'LARGE,SMALL', got {split_str!r}"
+            )
+    else:
+        small = max(min_per_part, 16)
+        small = ((small + multiple - 1) // multiple) * multiple
+        large = ((total - small) // multiple) * multiple
+    for name, sm in (("LARGE", large), ("SMALL", small)):
+        if sm < min_per_part or sm % multiple != 0:
+            raise ValueError(
+                f"spec-pdmux {name} partition of {sm} SMs violates arch "
+                f"constraints (min {min_per_part}, multiple of {multiple})"
+            )
+    if large + small > total:
+        raise ValueError(
+            f"spec-pdmux split {large}+{small} exceeds {total} available SMs"
+        )
+    if large <= small:
+        raise ValueError(
+            f"spec-pdmux split must have LARGE > SMALL, got {large},{small}"
+        )
+    return large, small
+
+
+def initialize_spec_stream_pair(
+    gpu_id: int, large_sm: int, small_sm: int
+) -> Tuple[torch.cuda.Stream, torch.cuda.Stream]:
+    """Create the process-wide (large, small) green-ctx stream pair once.
+    Idempotent: repeat calls (target + draft model runners share one process)
+    return the existing pair, and must ask for the same split."""
+    global SPEC_STREAM_PAIR, SPEC_SM_SPLIT
+    if SPEC_STREAM_PAIR is not None:
+        if SPEC_SM_SPLIT != (large_sm, small_sm):
+            raise ValueError(
+                f"spec-pdmux stream pair already initialized with split "
+                f"{SPEC_SM_SPLIT}, cannot re-initialize with {(large_sm, small_sm)}"
+            )
+        return SPEC_STREAM_PAIR
+    from sgl_kernel import spatial
+
+    SPEC_STREAM_PAIR = spatial.create_greenctx_stream_by_value(
+        large_sm, small_sm, gpu_id
+    )
+    SPEC_SM_SPLIT = (large_sm, small_sm)
+    logger.info(
+        "[spec-pdmux] green-ctx stream pair created on gpu %d: "
+        "large=%d SMs, small=%d SMs (total=%d)",
+        gpu_id,
+        large_sm,
+        small_sm,
+        spatial.get_sm_available(gpu_id),
+    )
+    return SPEC_STREAM_PAIR
+
+
+def get_spec_streams() -> Tuple[torch.cuda.Stream, torch.cuda.Stream]:
+    """The (large, small) spec-pdmux stream pair; init must have run."""
+    if SPEC_STREAM_PAIR is None:
+        raise RuntimeError(
+            "spec-pdmux stream pair not initialized "
+            "(initialize_spec_stream_pair must run first)"
+        )
+    return SPEC_STREAM_PAIR
 
 
 def set_current_stream_idx(idx: int):

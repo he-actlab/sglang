@@ -2413,6 +2413,14 @@ class ServerArgs:
         "The path of the PD-Multiplexing config file.",
     ] = None
     sm_group_num: A[int, "Number of sm partition groups."] = 8
+    enable_spec_pdmux: A[
+        bool,
+        "Co-located speculative decoding on green-context streams (M1): run the forward path on the LARGE SM partition of a green-context (large, small) stream pair. Requires a speculative algorithm, tp_size=1, and CUDA; incompatible with --enable-pdmux.",
+    ] = False
+    spec_pdmux_sm_split: A[
+        Optional[str],
+        "SM split for --enable-spec-pdmux as 'LARGE,SMALL' (e.g. '92,16'). Default: SMALL=16 rounded up to the arch granularity, LARGE=the rest (92,16 on a 108-SM A100).",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Model weight update and weight loading
@@ -7025,6 +7033,24 @@ class ServerArgs:
                     f"  Current torch version is {torch.__version__}.\n"
                     "  Please manually install torch 2.6.x."
                 )
+
+        # Check spec-pdmux (co-located speculative decoding, M1)
+        if self.enable_spec_pdmux:
+            assert (
+                not self.enable_pdmux
+            ), "--enable-spec-pdmux is incompatible with --enable-pdmux."
+            assert (
+                self.speculative_algorithm is not None
+            ), "--enable-spec-pdmux requires a speculative algorithm."
+            assert (
+                self.tp_size == 1
+            ), "--enable-spec-pdmux currently requires tp_size=1."
+            assert self.device == "cuda", "--enable-spec-pdmux requires CUDA."
+            if self.spec_pdmux_sm_split is not None:
+                parts = self.spec_pdmux_sm_split.split(",")
+                assert len(parts) == 2 and all(
+                    p.strip().isdigit() for p in parts
+                ), "--spec-pdmux-sm-split must be 'LARGE,SMALL' (two integers)."
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"

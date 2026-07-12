@@ -116,6 +116,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Disable parent paths that don't apply.
         self.compile_bs = []
         self.enable_pdmux = False
+        # spec-pdmux (M1 step 2): draft-extend graphs also captured on the
+        # LARGE green-ctx stream for now; step 3 flips these to the small one.
+        self.capture_stream_override = None
+        if model_runner.server_args.enable_spec_pdmux:
+            from sglang.srt.multiplex.pdmux_context import get_spec_streams
+
+            self.capture_stream_override = get_spec_streams()[0]
         self.record_nolora_graph = False
         self.is_dllm = False
 

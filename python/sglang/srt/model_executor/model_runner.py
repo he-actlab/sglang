@@ -548,7 +548,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        if server_args.enable_spec_pdmux:
+            # spec-pdmux (M1 step 2): the whole forward path runs on the LARGE
+            # green-context partition; the small partition is reserved for the
+            # drafter (step 3). One pair per process — the target and draft
+            # model runners share it (initialize_spec_stream_pair is idempotent).
+            from sglang.srt.multiplex.pdmux_context import (
+                initialize_spec_stream_pair,
+                resolve_spec_sm_split,
+            )
+
+            large_sm, small_sm = resolve_spec_sm_split(
+                self.gpu_id, server_args.spec_pdmux_sm_split
+            )
+            self.forward_stream = initialize_spec_stream_pair(
+                self.gpu_id, large_sm, small_sm
+            )[0]
+            logger.info(
+                "[spec-pdmux] forward_stream -> LARGE green-ctx stream "
+                "(%d SMs; is_draft_worker=%s)",
+                large_sm,
+                self.is_draft_worker,
+            )
+        else:
+            self.forward_stream = torch.get_device_module(self.device).Stream()
 
         # WAR fast-path: a decode-graph forward publishes a fresh event here after
         # load_batch; the scheduler's WAR barrier waits on it (then clears it)

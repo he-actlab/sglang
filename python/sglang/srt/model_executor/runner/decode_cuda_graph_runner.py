@@ -199,6 +199,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.enable_pdmux = model_runner.server_args.enable_pdmux
+        # spec-pdmux (M1): capture graphs on the LARGE green-ctx stream so the
+        # captured SM affinity matches the forward/replay stream. None => stock
+        # behavior (graph_capture allocates its own stream).
+        self.capture_stream_override = None
+        if model_runner.server_args.enable_spec_pdmux:
+            from sglang.srt.multiplex.pdmux_context import get_spec_streams
+
+            self.capture_stream_override = get_spec_streams()[0]
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -687,7 +695,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
+                # capture_stream_override (spec-pdmux): capture on the given
+                # (green-ctx) stream; getattr because EAGLE subclasses set up
+                # their own state without calling our __init__.
+                with graph_capture(
+                    stream=getattr(self, "capture_stream_override", None)
+                ) as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
