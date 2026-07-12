@@ -188,6 +188,83 @@ class _PhaseEventLog:
 
 _PHASE_LOG = _PhaseEventLog(_PHASE_EVENTS_OUT) if _PHASE_EVENTS else None
 
+# SGLANG_ACCEPT_HIST=1 — per-scheduler-process accept-length histogram + lag-1
+# full-window persistence (the batched draft-ahead decider,
+# parallel_sd_inference design/schedule-review-2026-07-12.md). Fed from
+# on_verify_complete_cpu, where the scheduler already moved accept_lens to CPU
+# — zero GPU-path cost, no extra sync. Snapshot JSON written to
+# SGLANG_ACCEPT_HIST_OUT (default /tmp/accept_hist.json) every 64 verify
+# iterations + atexit. accept_len = accepted drafts + bonus token, i.e. the
+# verify() accept_lens value, range [1, num_draft_tokens]; "full" means
+# accept_len == num_draft_tokens (the whole window survived).
+_ACCEPT_HIST = os.environ.get("SGLANG_ACCEPT_HIST", "0") == "1"
+_ACCEPT_HIST_OUT = os.environ.get("SGLANG_ACCEPT_HIST_OUT", "/tmp/accept_hist.json")
+
+
+class _AcceptHistLog:
+    FLUSH_EVERY = 64
+
+    def __init__(self, path):
+        self._path = path
+        self._hist = {}  # accept_len -> count
+        self._trans = [[0, 0], [0, 0]]  # [prev_full][cur_full] counts
+        self._prev_full = {}  # req_pool_idx -> 0/1 last-iteration full flag
+        self._iters = 0
+        self._max_len = 0
+        atexit.register(self.flush)
+
+    def record(self, accept_lens, req_pool_indices, max_len):
+        # APPROXIMATION (documented): lag-1 state is keyed by req_pool_idx.
+        # When a request finishes and its pool slot is reused, one transition
+        # crosses request boundaries (uncompensated); finished/retracted reqs
+        # in the batch still contribute their verify outcome.
+        self._max_len = max(self._max_len, max_len)
+        have_idx = req_pool_indices is not None
+        for i, al in enumerate(accept_lens):
+            self._hist[al] = self._hist.get(al, 0) + 1
+            if have_idx and i < len(req_pool_indices):
+                cur = 1 if al >= max_len else 0
+                idx = req_pool_indices[i]
+                prev = self._prev_full.get(idx)
+                if prev is not None:
+                    self._trans[prev][cur] += 1
+                self._prev_full[idx] = cur
+        self._iters += 1
+        if self._iters % self.FLUSH_EVERY == 0:
+            self.flush()
+
+    def flush(self):
+        if self._iters == 0:
+            return
+        tmp = self._path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(
+                {
+                    "num_draft_tokens": self._max_len,
+                    "hist": {str(k): v for k, v in sorted(self._hist.items())},
+                    # full = accept_len == num_draft_tokens
+                    "transitions": {
+                        "nonfull_to_nonfull": self._trans[0][0],
+                        "nonfull_to_full": self._trans[0][1],
+                        "full_to_nonfull": self._trans[1][0],
+                        "full_to_full": self._trans[1][1],
+                    },
+                    "verify_iters": self._iters,
+                    "method": (
+                        "CPU-side on_verify_complete_cpu hook; accept_len ="
+                        " num_correct_drafts+1 (bonus incl.); lag-1 keyed by"
+                        " req_pool_idx, slot reuse across requests"
+                        " uncompensated"
+                    ),
+                },
+                f,
+                indent=1,
+            )
+        os.replace(tmp, self._path)
+
+
+_ACCEPT_HIST_LOG = _AcceptHistLog(_ACCEPT_HIST_OUT) if _ACCEPT_HIST else None
+
 
 def _profile_phase(name):
     def deco(fn):
@@ -1732,8 +1809,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        req_pool_indices: Optional[list[int]] = None,
     ) -> None:
+        if _ACCEPT_HIST_LOG is not None and num_correct_drafts_per_req:
+            _ACCEPT_HIST_LOG.record(
+                [n + 1 for n in num_correct_drafts_per_req],
+                req_pool_indices,
+                self.speculative_num_draft_tokens,
+            )
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
                 num_correct_drafts_per_req, batch_size=batch_size
