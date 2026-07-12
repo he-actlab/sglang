@@ -635,6 +635,34 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
+        if self.server_args.enable_spec_pdmux:
+            # spec-pdmux step 6 (M2.1): with two sub-batch slots, a draft(B)
+            # that wrote tree-mask/positions into the TARGET attn backend's
+            # verify buffers here would clobber verify(A)'s metadata once
+            # step 7 relaxes the sequential joins. Measured in the supported
+            # config (flashinfer target backend, overlap plan stream off):
+            # BOTH buffers are None -- build_tree_kernel_efficient allocates
+            # FRESH per-iteration outputs, so the draft->verify coupling is
+            # a per-batch tensor handoff (custom_mask/positions/retrieve_*
+            # on EagleVerifyInput) and needs no per-slot staging; the copy
+            # into the shared static graph-input buffers happens inside
+            # verify() itself, on the forward (large) stream, where verifies
+            # stay serialized. Fail fast if a backend that DOES expose
+            # fill-after-draft buffers (triton, trtllm_mla, ascend, aiter)
+            # is ever combined with spec-pdmux -- that combination would
+            # need per-slot staging (draft writes to staging[slot], verify
+            # copies staging[slot] -> backend buffers after its entry join)
+            # before any concurrency is safe. Checked per call because
+            # adaptive spec (apply_runtime_state) can swap the target
+            # backend at runtime.
+            assert tree_mask_buf is None and position_buf is None, (
+                "--enable-spec-pdmux: target attention backend "
+                f"{type(self.target_worker.model_runner.attn_backend).__name__} "
+                "exposes verify buffers to fill after draft; draft(B) would "
+                "clobber verify(A)'s tree-mask/positions under two-slot "
+                "operation. Per-slot staging (spec-pdmux M2.1) is required "
+                "for this backend."
+            )
 
         # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
         # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
@@ -1122,6 +1150,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
         by first use: the target ModelRunner creates it in its init."""
         if not self.server_args.enable_spec_pdmux:
             return None
+        # spec-pdmux step 6 (M2.1): the two-slot hazard analysis (see the
+        # assert in EagleDraftWorker.draft) assumes the verify plan runs on
+        # the forward stream. SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1 moves
+        # eagle_prepare_for_verify + the post-plan verify-buffer fixup
+        # (update_verify_buffers_to_fill_after_draft) onto a third stream --
+        # unvalidated against the slot machinery, and the fixup is
+        # NotImplementedError on the flashinfer backend anyway.
+        assert self.plan_stream is None, (
+            "--enable-spec-pdmux is incompatible with "
+            "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1 (verify plan/fixup on a "
+            "separate stream is unvalidated against two-slot operation)."
+        )
         from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
         small = get_spec_streams()[1]
@@ -1138,9 +1178,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         semantics: the small stream first waits for everything queued on the
         current (forward = large) stream, and the current stream waits for the
         small stream before continuing. The exit join is unconditional and must
-        stay so for now -- draft writes directly into the target attn backend's
-        verify buffers (get_verify_buffers_to_fill_after_draft), so the join
-        must dominate verify's consumption. No-op when spec-pdmux is off."""
+        stay so for now -- verify consumes the draft-ALLOCATED per-iteration
+        tensors (EagleVerifyInput.custom_mask/positions/retrieve_*/
+        draft_token), so the join must dominate verify's reads. (Step-6
+        correction: draft does NOT write into the target attn backend's
+        verify buffers in the supported config -- flashinfer's
+        get_verify_buffers_to_fill_after_draft returns [None, None]; the
+        assert in draft() pins that invariant.) No-op when spec-pdmux is
+        off."""
         small = self._spec_pdmux_small_stream
         if small is None:
             yield
@@ -1319,7 +1364,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # spec-pdmux: draft on the SMALL green-ctx stream; the exit
                 # join (back onto the forward stream) precedes the spec_info
                 # rebind and verify below, so verify's reads of the draft-
-                # filled verify buffers are ordered after draft completion.
+                # allocated verify_input tensors are ordered after draft
+                # completion.
                 with (
                     self._draft_stream_region(),
                     self.draft_worker.draft_tp_context(
