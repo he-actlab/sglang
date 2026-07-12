@@ -258,7 +258,24 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
-        self.buffers.share_buffers()
+        # spec-pdmux M2.5: draft-side graph statics in a dedicated pool
+        # namespace -- see EAGLEDraftExtendCudaGraphRunner (the draft decode
+        # graph also replays on the SMALL stream concurrently with the
+        # target's verify graph; its bs-shaped statics -- seq_lens /
+        # req_pool_indices / seq_lens_cpu -- would otherwise alias the target
+        # runner's).
+        buffer_namespace = ""
+        if (
+            self.model_runner.server_args.enable_spec_pdmux
+            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+        ):
+            buffer_namespace = "spec-pdmux-draft"
+            logger.info(
+                "[spec-pdmux] %s: graph statics in DEDICATED input-buffer "
+                "namespace",
+                type(self).__name__,
+            )
+        self.buffers.share_buffers(namespace=buffer_namespace)
 
         self.backend = resolve_decode_backend(self)
 

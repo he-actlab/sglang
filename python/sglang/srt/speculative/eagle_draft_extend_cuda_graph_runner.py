@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -264,7 +265,27 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
-        self.buffers.share_buffers()
+        # spec-pdmux M2.5: draft-side graph statics must NOT alias the target
+        # runners' through the process-wide input-buffer pool -- the extend
+        # graph replays on the SMALL green-ctx stream concurrently with the
+        # target verify graph, whose load_batch fills would overwrite the
+        # aliased statics (identical keys: both runners use num_tokens_per_bs
+        # = num_draft_tokens and the same max_bs). Measured as the step-7
+        # "extend-forward || verify corrupts the drafter" hazard (tau 3.12 ->
+        # ~2 at c=2). Draft-side runners still share among themselves: all
+        # draft-phase work is serialized on the one small stream.
+        buffer_namespace = ""
+        if (
+            model_runner.server_args.enable_spec_pdmux
+            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+        ):
+            buffer_namespace = "spec-pdmux-draft"
+            logger.info(
+                "[spec-pdmux] %s: graph statics in DEDICATED input-buffer "
+                "namespace",
+                type(self).__name__,
+            )
+        self.buffers.share_buffers(namespace=buffer_namespace)
 
         self.backend = resolve_decode_backend(self)
 

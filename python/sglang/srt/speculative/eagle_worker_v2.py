@@ -1214,7 +1214,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             "pending": [None, None],
             "draft_done": [dev.Event(), dev.Event()],
             "verify_done": [dev.Event(), dev.Event()],
-            "extend_fwd_done": [None, None],  # lazily created on first flush
             "flush_done": [None, None],  # lazily created on first flush
         }
 
@@ -1244,28 +1243,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Data dependency of extend(X): verify(X)-done (predict /
             # accept_lens / hidden_states).
             small.wait_event(p["verify_done"])
-            # MEASURED HAZARD (M2.2 bisection, c=2 gsm8k): the draft-extend
-            # GRAPH FORWARD racing a concurrent target forward on the large
-            # stream corrupts the drafter state (tau 3.12 -> 1.97; draft
-            # token 1 -- relayed extend output -- stays correct, tokens 2..K
-            # -- draft forwards -- collapse). Isolated by selective joins:
-            # draft-forward || verify is CLEAN (tau identical to fully
-            # serialized), extend-forward || verify is NOT; the stash is
-            # clean. Split flashinfer float workspaces and split CUDA-graph
-            # memory pools did NOT fix it (both landed in this commit for
-            # the crashes they DID fix); the precise shared resource is
-            # still unidentified. Until it is, the extend forward is
-            # excluded from cross-stream overlap in BOTH directions:
-            # - entry: wait everything queued on the LARGE stream (its own
-            #   verify + any prefill in flight);
-            # - exit: extend_fwd_done, waited by the next verify (see
-            #   forward_batch_generation) and by prefills (flush_done).
-            # The draft phase -- the bigger drafter share -- stays fully
-            # concurrent with the other slot's verify; the extend stays ON
-            # the small partition (SM confinement preserved).
-            from sglang.srt.multiplex.pdmux_context import get_spec_streams
-
-            small.wait_stream(get_spec_streams()[0])
+            # M2.5 (step 10): the extend forward now overlaps the other
+            # slot's verify, like the draft phase. The step-7 "extend-forward
+            # || target-forward corrupts the drafter" hazard (tau 3.12 ->
+            # 1.97 at c=2; relayed token 1 fine, draft tokens 2..K collapse)
+            # was ROOT-CAUSED to the process-wide graph static input-buffer
+            # pool (model_executor/input_buffers.py): the target-verify and
+            # draft-extend graph runners registered identically-keyed
+            # statics (input_ids / positions / out_cache_loc / seq_lens /
+            # req_pool_indices / next_token_logits_buffer; both use
+            # num_tokens_per_bs = num_draft_tokens and the same max_bs), so
+            # verify(X)'s load_batch fills on the large stream overwrote the
+            # buffers the concurrently-replaying extend graph was reading
+            # (and its logits output buffer). The pool's own safety premise
+            # ("the forwards that use them are sequential / mutually
+            # exclusive") does not hold under spec-pdmux concurrency; the
+            # draft-side runners now register their statics in a dedicated
+            # pool namespace, so the step-7 exclusion edges (entry
+            # wait_stream(large), exit extend_fwd_done -> next verify) are
+            # gone.
             with dev.stream(small):
                 # Caching-allocator insurance: these tensors' home streams are
                 # the large (verify outputs) / schedule (SB fields) streams;
@@ -1283,9 +1279,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(
                         p["batch"], p["result"]
                     )
-                if st["extend_fwd_done"][s] is None:
-                    st["extend_fwd_done"][s] = dev.Event()
-                st["extend_fwd_done"][s].record(small)
                 if p["on_relay"] is not None:
                     # FutureMap stash on the small stream: the slot's next-tick
                     # gathers follow in the same FIFO; the other slot's stash
@@ -1552,16 +1545,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 # Steady-state key move: launch the OTHER slot's deferred
                 # extend(+stash) now, AFTER this tick's draft is in the small
-                # FIFO and BEFORE this tick's verify is enqueued on large
-                # (the extend's entry wait then covers only the other slot's
-                # verify, not this one).
+                # FIFO and BEFORE this tick's verify is enqueued on large:
+                # the whole small-stream chain [extend(1-X), gathers, draft]
+                # executes under this tick's verify (M2.5: including the
+                # extend forward -- see flush_spec_pdmux_pending).
                 self.flush_spec_pdmux_pending(slot=1 - slot)
-                # This tick's verify must not overlap any in-flight extend
-                # forward (the measured extend||target-forward hazard; see
-                # flush_spec_pdmux_pending).
-                for ev in self._spec_pdmux_state["extend_fwd_done"]:
-                    if ev is not None:
-                        dev.current_stream().wait_event(ev)
             else:
                 # spec-pdmux serialize/kill-switch, non-overlap and idle paths:
                 # M1 strictly-sequential joins.
