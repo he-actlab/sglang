@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -45,6 +46,8 @@ from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -129,13 +132,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Disable parent paths that don't apply to EAGLE.
         self.compile_bs = []  # disables patch_model torch.compile wrapping
         self.enable_pdmux = False
-        # spec-pdmux (M1 step 2): draft graphs also captured on the LARGE
-        # green-ctx stream for now; step 3 flips these to the small stream.
+        # spec-pdmux (M1 step 3): draft graphs are captured on the SMALL
+        # green-ctx stream -- graph SM affinity bakes at CAPTURE time, so a
+        # large-captured graph replayed on the small stream silently escapes
+        # the partition (probe P2 / step-2 finding).
         self.capture_stream_override = None
         if model_runner.server_args.enable_spec_pdmux:
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
-            self.capture_stream_override = get_spec_streams()[0]
+            self.capture_stream_override = get_spec_streams()[1]
+            logger.info(
+                "[spec-pdmux] %s: graph capture on SMALL green-ctx stream",
+                type(self).__name__,
+            )
         self.record_nolora_graph = False
         self.is_dllm = False
 

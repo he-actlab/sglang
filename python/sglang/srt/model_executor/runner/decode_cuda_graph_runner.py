@@ -207,6 +207,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
             self.capture_stream_override = get_spec_streams()[0]
+            logger.info(
+                "[spec-pdmux] %s: graph capture on LARGE green-ctx stream",
+                type(self).__name__,
+            )
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()

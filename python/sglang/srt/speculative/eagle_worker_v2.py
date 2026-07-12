@@ -1113,6 +1113,68 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+    @functools.cached_property
+    def _spec_pdmux_small_stream(self):
+        """spec-pdmux (M1 step 3): the SMALL green-ctx stream the drafter runs
+        on, or None when --enable-spec-pdmux is off. cached_property (not
+        __init__) so StandaloneWorkerV2, which re-implements __init__ without
+        calling super(), inherits it for free. The stream pair already exists
+        by first use: the target ModelRunner creates it in its init."""
+        if not self.server_args.enable_spec_pdmux:
+            return None
+        from sglang.srt.multiplex.pdmux_context import get_spec_streams
+
+        small = get_spec_streams()[1]
+        logger.info(
+            "[spec-pdmux] %s: draft/draft_extend compute -> SMALL green-ctx stream",
+            type(self).__name__,
+        )
+        return small
+
+    @contextlib.contextmanager
+    def _draft_stream_region(self):
+        """spec-pdmux (M1 step 3): run the enclosed drafter phase (draft /
+        draft_extend) on the SMALL green-ctx stream with STRICTLY SEQUENTIAL
+        semantics: the small stream first waits for everything queued on the
+        current (forward = large) stream, and the current stream waits for the
+        small stream before continuing. The exit join is unconditional and must
+        stay so for now -- draft writes directly into the target attn backend's
+        verify buffers (get_verify_buffers_to_fill_after_draft), so the join
+        must dominate verify's consumption. No-op when spec-pdmux is off."""
+        small = self._spec_pdmux_small_stream
+        if small is None:
+            yield
+            return
+        dev = torch.get_device_module(self.device)
+        small.wait_stream(dev.current_stream())
+        try:
+            with dev.stream(small):
+                yield
+        finally:
+            dev.current_stream().wait_stream(small)
+
+    def _record_draft_region_outputs(self, next_draft_input, batch: ScheduleBatch):
+        """spec-pdmux record_stream insurance, mirroring the plan_stream
+        pattern in verify(): draft_extend allocates next_draft_input tensors
+        (and rebinds batch.input_ids / out_cache_loc) on the SMALL stream while
+        the FutureMap relay and the next iteration consume them on the forward
+        stream. The unconditional _draft_stream_region joins already order the
+        reuse; record_stream keeps the caching allocator safe independently
+        (step 4 stress-tests with PYTORCH_NO_CUDA_MEMORY_CACHING=1)."""
+        fwd_stream = torch.get_device_module(self.device).current_stream()
+        if next_draft_input is not None:
+            record_stream_each(
+                (
+                    next_draft_input.topk_p,
+                    next_draft_input.topk_index,
+                    next_draft_input.draft_probs,
+                    next_draft_input.hidden_states,
+                    next_draft_input.bonus_tokens,
+                ),
+                fwd_stream,
+            )
+        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
+
     @property
     def war_fastpath_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
@@ -1207,7 +1269,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
 
             # Draft prefill
+            # spec-pdmux: _draft_stream_region (outermost) runs the drafter on
+            # the SMALL green-ctx stream; sequential joins at entry/exit.
             with (
+                self._draft_stream_region(),
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
                 ),
@@ -1223,7 +1288,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
-                return batch_output
+            if self._spec_pdmux_small_stream is not None:
+                self._record_draft_region_outputs(batch_output.next_draft_input, batch)
+            return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
@@ -1249,7 +1316,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                # spec-pdmux: draft on the SMALL green-ctx stream; the exit
+                # join (back onto the forward stream) precedes the spec_info
+                # rebind and verify below, so verify's reads of the draft-
+                # filled verify buffers are ordered after draft completion.
                 with (
+                    self._draft_stream_region(),
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
                     ),
@@ -1258,6 +1330,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                if self._spec_pdmux_small_stream is not None:
+                    # verify() records the other verify_input fields on the
+                    # forward stream (record_stream_for_v2_verify); draft_probs
+                    # is the one small-stream allocation it does not cover.
+                    record_stream_each(
+                        (verify_input.draft_probs,),
+                        torch.get_device_module(self.device).current_stream(),
+                    )
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
@@ -1270,7 +1350,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
+                # spec-pdmux: draft_extend on the SMALL green-ctx stream; the
+                # exit join precedes the return -- the FutureMap relay reads
+                # next_draft_input's outputs on the forward stream.
                 with (
+                    self._draft_stream_region(),
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
                     ),
@@ -1279,6 +1363,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                if self._spec_pdmux_small_stream is not None:
+                    self._record_draft_region_outputs(
+                        batch_output.next_draft_input, batch
+                    )
 
             return batch_output
 

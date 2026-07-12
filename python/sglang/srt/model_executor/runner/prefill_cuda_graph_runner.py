@@ -133,6 +133,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
             self.capture_stream_override = get_spec_streams()[0]
+            logger.info(
+                "[spec-pdmux] %s: graph capture on LARGE green-ctx stream",
+                type(self).__name__,
+            )
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
