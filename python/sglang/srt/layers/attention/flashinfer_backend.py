@@ -218,9 +218,16 @@ def fast_prefill_plan(
     kv_lens_host: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
+    # spec-pdmux M2.6: pre-packed custom mask (TARGET_VERIFY tree mask). The
+    # caller packs on-device with host-known sizes (segment_packbits_known_size)
+    # so no ``.item()``/D2H happens here; ``packed_mask_indptr`` is the PACKED
+    # per-request byte indptr (what upstream copies into ``_mask_indptr_buf``).
+    packed_custom_mask: Optional[torch.Tensor] = None,
+    packed_mask_indptr: Optional[torch.Tensor] = None,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
-    draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+    draft-extend and (spec-pdmux M2.6) target-verify CUDA graphs (FlashInfer
+    fa2, cuda-graph mode only).
 
     Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
     its host scheduling metadata, a blocking D2H that drains the GPU queue every
@@ -267,6 +274,16 @@ def fast_prefill_plan(
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
 
+    if packed_custom_mask is not None:
+        # Mirror upstream plan()'s cuda-graph mask refresh (prefill.py): copy
+        # the packed mask + packed indptr into the wrapper's reserved buffers.
+        # Buffer existence was validated by the real plan() at capture.
+        self._custom_mask_buf[: len(packed_custom_mask)].copy_(
+            packed_custom_mask,
+            non_blocking=(packed_custom_mask.device == self.device) and non_blocking,
+        )
+        self._mask_indptr_buf.copy_(packed_mask_indptr, non_blocking=non_blocking)
+
     self._cached_q_data_type = q_data_type
     self._cached_kv_data_type = (
         kv_data_type if kv_data_type is not None else q_data_type
@@ -298,6 +315,86 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+def plan_pinned_ws_rotate(wrapper) -> None:
+    """spec-pdmux M2.6: protect flashinfer's per-wrapper pinned int-workspace.
+
+    Every plan() (and fast plan) writes host scheduling metadata into the
+    wrapper's ONE ``_pin_memory_int_workspace_buffer`` and enqueues an async
+    H2D from it on the current stream. Upstream plan()'s blocking D2H
+    (segment_packbits' .item() / qo_indptr.to("cpu")) accidentally drained the
+    device before that CPU write, so the previous same-wrapper H2D could never
+    still be in flight. The M2.6 sync-free plans remove those drains, and
+    under spec-pdmux BOTH slots share each bucket's wrapper (and the CPU runs
+    ~a tick ahead), so plan(slot B)'s CPU write can overwrite the staging
+    bytes plan(slot A)'s queued H2D has not read yet — silent metadata
+    corruption (measured: c=2 fixed-composition tau 3.1206 -> 3.10, cleared
+    by a debug full-sync). Double-buffer the pinned staging per wrapper and,
+    per buffer, wait on the H2D-done event of its PREVIOUS use (two plans
+    back — normally long signaled, so the wait is free).
+
+    Call before the wrapper's plan/begin_forward; pair with
+    plan_pinned_ws_record() right after (records on the stream that got the
+    H2D).
+    """
+    buf = getattr(wrapper, "_pin_memory_int_workspace_buffer", None)
+    if buf is None:
+        return
+    state = getattr(wrapper, "_sgl_pin_ws_state", None)
+    if state is None:
+        state = {
+            "bufs": [
+                buf,
+                torch.empty(buf.shape, dtype=buf.dtype, pin_memory=True),
+            ],
+            "evs": [None, None],
+            "idx": 0,
+        }
+        wrapper._sgl_pin_ws_state = state
+    idx = 1 - state["idx"]
+    state["idx"] = idx
+    ev = state["evs"][idx]
+    if ev is not None:
+        ev.synchronize()
+    wrapper._pin_memory_int_workspace_buffer = state["bufs"][idx]
+
+
+def plan_pinned_ws_record(wrapper) -> None:
+    """Record the H2D-done event for the pinned staging buffer the wrapper's
+    plan just used (see plan_pinned_ws_rotate). No-op if rotate never ran."""
+    state = getattr(wrapper, "_sgl_pin_ws_state", None)
+    if state is None:
+        return
+    idx = state["idx"]
+    if state["evs"][idx] is None:
+        state["evs"][idx] = torch.get_device_module().Event()
+    state["evs"][idx].record()
+
+
+def segment_packbits_known_size(
+    x: torch.Tensor,
+    indptr_dev: torch.Tensor,
+    packed_indptr_dev: torch.Tensor,
+    packed_nnz: int,
+) -> torch.Tensor:
+    """spec-pdmux M2.6: ``flashinfer.quantization.segment_packbits`` without its
+    blocking ``indptr_new[-1].item()`` (a D2H that drains the current stream —
+    measured 4.7-10.8 ms/tick CPU stalls in the verify plan, nsys run
+    20260712T2110). The caller computes the segment layout on the HOST
+    (mask bits per request are a pure function of seq_lens_cpu under spec
+    verify) and passes the packed output size + both indptrs as device
+    tensors; only the pack kernel is launched. bitorder "little" matches
+    upstream plan()'s packbits call. Version-coupled to the pinned image's
+    flashinfer (0.6.x get_quantization_module().segment_packbits signature).
+    """
+    from flashinfer.quantization.packbits import get_quantization_module
+
+    y = torch.empty(packed_nnz, dtype=torch.uint8, device=x.device)
+    get_quantization_module().segment_packbits(
+        x, indptr_dev, packed_indptr_dev, "little", y
+    )
+    return y
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -320,6 +417,8 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         self.enable_mis = model_runner.server_args.enable_mis
+        # spec-pdmux M2.6: gates the sync-free TARGET_VERIFY fast plan install.
+        self.enable_spec_pdmux = model_runner.server_args.enable_spec_pdmux
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -748,6 +847,21 @@ class FlashInferAttnBackend(AttentionBackend):
             # plan() above set up _cached_module (host metadata supplied per-replay
             # in call_begin_forward).
             for w in self.draft_extend_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_prefill_plan, w)
+
+        if (
+            in_capture
+            and forward_mode.is_target_verify()
+            and self.prefill_backend == "fa2"
+            and self.dispatch_reason is None
+            # spec-pdmux M2.6: sync-free verify plan (host-rebuilt qo/kv/mask
+            # layout + pre-packed tree mask; see call_begin_forward). Gated on
+            # spec-pdmux so the stock binary's plan path stays byte-unchanged;
+            # under spec-pdmux the plain plan()'s blocking D2H parks the CPU
+            # behind wait_event(draft_done) for 4.7-10.8 ms per tick.
+            and self.enable_spec_pdmux
+        ):
+            for w in self.prefill_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -1394,6 +1508,10 @@ class FlashInferIndicesUpdaterDecode:
             and wrapper.begin_forward.func == fast_decode_plan
         )
 
+        if self.attn_backend.enable_spec_pdmux:
+            # spec-pdmux M2.6: pinned staging guard (see plan_pinned_ws_rotate)
+            plan_pinned_ws_rotate(wrapper)
+
         if wrapper_uses_fast_decode_plan:
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
             wrapper.begin_forward(
@@ -1431,6 +1549,9 @@ class FlashInferIndicesUpdaterDecode:
                     disable_split_kv if disable_split_kv is not None else False
                 ),
             )
+
+        if self.attn_backend.enable_spec_pdmux:
+            plan_pinned_ws_record(wrapper)
 
         if locally_override:
             global_override_indptr_cpu = None
@@ -1770,6 +1891,8 @@ class FlashInferIndicesUpdaterPrefill:
 
         # extend part
         if use_ragged:
+            if self.attn_backend.enable_spec_pdmux:
+                plan_pinned_ws_rotate(wrapper_ragged)
             wrapper_ragged.begin_forward(
                 qo_indptr,
                 qo_indptr,
@@ -1778,6 +1901,8 @@ class FlashInferIndicesUpdaterPrefill:
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
+            if self.attn_backend.enable_spec_pdmux:
+                plan_pinned_ws_record(wrapper_ragged)
 
         if use_sliding_window_kv_pool:
             assert self._swa_kv_pool is not None
@@ -1814,7 +1939,99 @@ class FlashInferIndicesUpdaterPrefill:
             hasattr(wrapper_paged.begin_forward, "func")
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
-        if uses_fast_prefill:
+        if (
+            uses_fast_prefill
+            and spec_info is not None
+            # EAGLE_VERIFY only: the host layout below replicates
+            # EagleVerifyInput.generate_attn_arg_prefill (dtn-strided qo,
+            # kv = seq + dtn). Other verify types (DFLASH/NGRAM) have their
+            # own layouts and are not spec-pdmux configs anyway.
+            and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+        ):
+            # spec-pdmux M2.6: sync-free TARGET_VERIFY plan. Upstream plan()
+            # costs two full large-stream drains per decode tick (segment_
+            # packbits' .item() + qo/kv_indptr .to("cpu")) — measured 4.7 +
+            # 10.8 ms CPU blocks (nsys 20260712T2110): the sync sits behind
+            # wait_event(draft_done), so the CPU is parked until the OTHER
+            # slot's draft + the in-flight verify finish, and every downstream
+            # launch (verify graph, next tick's gathers/draft) slips. The
+            # whole verify layout is a host-side function of seq_lens_cpu:
+            #   qo per req  = draft_token_num                (constant)
+            #   kv per req  = seq_lens_cpu + draft_token_num (generate_attn_
+            #                 arg_prefill adds dtn before cumsum)
+            #   mask bits   = qo * kv per req  (packed bytes = ceil(bits/8))
+            # so we rebuild it here and pre-pack the tree mask on-device with
+            # host-known sizes. Values are identical to the D2H'd ones; the
+            # _plan_info and mask buffers land byte-identical to plan()'s.
+            assert (
+                seq_lens_cpu is not None
+            ), "fast_prefill_plan verify replay requires host-known seq_lens_cpu"
+            dtn = spec_info.draft_token_num
+            assert dtn is not None and dtn > 0
+            kv_lens_host_i64 = seq_lens_cpu.to(torch.int64) + dtn
+            kv_lens_host = kv_lens_host_i64.to(torch.int32)
+            qo_indptr_host = torch.arange(
+                0, (bs + 1) * dtn, step=dtn, dtype=torch.int32, device="cpu"
+            )
+            kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+            kv_indptr_host[1:] = torch.cumsum(kv_lens_host_i64, dim=0)
+            paged_plan_kwargs = dict(
+                qo_indptr_host=qo_indptr_host,
+                kv_indptr_host=kv_indptr_host,
+                kv_lens_host=kv_lens_host,
+                max_q_len=dtn,
+                max_kv_len=int(kv_lens_host_i64.max()),
+            )
+            if os.environ.get("SGLANG_SPEC_PDMUX_FASTPLAN_DEBUG") == "1":
+                torch.cuda.synchronize()
+                dev_seq = paged_kernel_lens.cpu()
+                host_seq = seq_lens_cpu.to(dev_seq.dtype)
+                dev_qo = qo_indptr.cpu()
+                dev_kvptr = kv_indptr.cpu()
+                if not torch.equal(dev_seq, host_seq):
+                    logger.warning(
+                        "[fastplan-debug] seq_lens mismatch dev=%s host=%s",
+                        dev_seq.tolist(), host_seq.tolist())
+                if not torch.equal(dev_qo, qo_indptr_host.to(dev_qo.dtype)):
+                    logger.warning("[fastplan-debug] qo mismatch dev=%s host=%s",
+                                   dev_qo.tolist(), qo_indptr_host.tolist())
+                if not torch.equal(dev_kvptr, kv_indptr_host.to(dev_kvptr.dtype)):
+                    logger.warning("[fastplan-debug] kvptr mismatch dev=%s host=%s",
+                                   dev_kvptr.tolist(), kv_indptr_host.tolist())
+                if use_custom_mask is not None:
+                    exp_numel = int((kv_lens_host_i64 * dtn).sum())
+                    if use_custom_mask.numel() < exp_numel:
+                        logger.warning(
+                            "[fastplan-debug] mask numel %d < expected %d",
+                            use_custom_mask.numel(), exp_numel)
+            if use_custom_mask is not None:
+                mask_lens = kv_lens_host_i64 * dtn  # bits per request
+                mask_indptr_host = torch.zeros(bs + 1, dtype=torch.int64)
+                mask_indptr_host[1:] = torch.cumsum(mask_lens, dim=0)
+                packed_indptr_host = torch.zeros(bs + 1, dtype=torch.int64)
+                packed_indptr_host[1:] = torch.cumsum((mask_lens + 7) // 8, dim=0)
+                device = use_custom_mask.device
+                # Pageable H2D of two (bs+1)-int32 arrays: the async call
+                # stages and returns; no GPU-queue wait (unlike the D2H way).
+                mask_indptr_dev = mask_indptr_host.to(torch.int32).to(
+                    device, non_blocking=True
+                )
+                packed_indptr_dev = packed_indptr_host.to(torch.int32).to(
+                    device, non_blocking=True
+                )
+                paged_plan_kwargs["packed_custom_mask"] = (
+                    segment_packbits_known_size(
+                        use_custom_mask.contiguous().view(-1),
+                        mask_indptr_dev,
+                        packed_indptr_dev,
+                        int(packed_indptr_host[-1]),
+                    )
+                )
+                paged_plan_kwargs["packed_mask_indptr"] = packed_indptr_dev
+                # The mask is consumed via the packed path; don't hand the raw
+                # bool mask to fast_prefill_plan (it would be ignored anyway).
+                use_custom_mask = None
+        elif uses_fast_prefill:
             assert (
                 seq_lens_cpu is not None
             ), "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
@@ -1839,6 +2056,9 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
+        if self.attn_backend.enable_spec_pdmux:
+            # spec-pdmux M2.6: pinned staging guard (see plan_pinned_ws_rotate)
+            plan_pinned_ws_rotate(wrapper_paged)
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -1859,6 +2079,8 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr=max_item_len_ptr,
             **paged_plan_kwargs,
         )
+        if self.attn_backend.enable_spec_pdmux:
+            plan_pinned_ws_record(wrapper_paged)
 
 
 class FlashInferMultiStepDraftBackend:
@@ -1877,6 +2099,8 @@ class FlashInferMultiStepDraftBackend:
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         self.page_size = model_runner.page_size
+        # spec-pdmux M2.6: gates the host-rebuilt kv_indptr in common_template.
+        self.enable_spec_pdmux = model_runner.server_args.enable_spec_pdmux
 
         max_bs = _cuda_graph_capture_max_bs(
             model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
@@ -1952,7 +2176,34 @@ class FlashInferMultiStepDraftBackend:
         assert forward_batch.spec_info.is_draft_input()
 
         # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
-        indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
+        if self.enable_spec_pdmux and forward_batch.seq_lens_cpu is not None:
+            # spec-pdmux M2.6: rebuild the indptr on the HOST instead of the
+            # 204-byte pageable .cpu() below. That D2H sits on the SMALL
+            # stream FIFO behind the deferred extend, so the async-copy call
+            # parks the scheduler CPU for the whole extend (measured 3.8 ms/
+            # tick, nsys 20260712T2110) and the draft graph launches ~0.7 ms
+            # after the GPU went idle. Replicates generate_draft_decode_kv_
+            # indices' indptr math exactly: for step i (iters = i+1),
+            #   kv_indptr[i][z] = sum(positions[0:z]) + z*(i+1)
+            # with positions = seq_lens.repeat_interleave(topk) (see
+            # prepare_for_draft) and the graph runner padding BOTH the device
+            # positions tail and seq_lens_cpu with seq_len_fill_value, so
+            # host == device on padded rows too.
+            pos_cpu = forward_batch.seq_lens_cpu[:num_seqs].to(torch.int64)
+            if self.topk > 1:
+                pos_cpu = pos_cpu.repeat_interleave(self.topk)
+            base = torch.zeros(bs + 1, dtype=torch.int64)
+            base[1:] = torch.cumsum(pos_cpu, dim=0)
+            z_iters = torch.arange(bs + 1, dtype=torch.int64).unsqueeze(
+                0
+            ) * torch.arange(
+                1, self.speculative_num_steps + 1, dtype=torch.int64
+            ).unsqueeze(
+                1
+            )
+            indptr_cpu_whole = (base.unsqueeze(0) + z_iters).to(torch.int32)
+        else:
+            indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
         global global_override_indptr_cpu
 
         for i in range(self.speculative_num_steps - 1):

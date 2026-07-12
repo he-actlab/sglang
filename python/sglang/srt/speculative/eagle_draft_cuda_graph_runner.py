@@ -609,6 +609,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.batch_size = bs
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
+            if self.model_runner.server_args.enable_spec_pdmux:
+                # spec-pdmux M2.6: the padded-replay reset above zeroes the
+                # positions buffer while the seq_lens buffers (device + cpu
+                # mirror) pad with seq_len_fill_value. generate_draft_decode_
+                # kv_indices derives kv_indptr from POSITIONS, so the host-
+                # rebuilt indptr (FlashInferMultiStepDraftBackend.common_
+                # template, built from seq_lens_cpu) would disagree with the
+                # device kernel by fill_value per padded row. Align the padded
+                # positions tail to the same fill so host == device (also
+                # makes the padded rows' indptr consistent with their kv fill,
+                # which uses seq_lens).
+                buffers.positions[raw_num_token:num_tokens].fill_(
+                    self.seq_len_fill_value
+                )
             forward_batch.positions = buffers.positions[:num_tokens]
             if raw_seq_lens_sum is not None:
                 forward_batch.seq_lens_sum = (
