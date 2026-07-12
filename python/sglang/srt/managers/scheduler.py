@@ -16,6 +16,7 @@
 import copy
 import dataclasses
 import faulthandler
+import functools
 import logging
 import os
 import signal
@@ -978,6 +979,7 @@ class Scheduler(
         # .batch_is_full / .is_empty() are ever read from it. The real
         # forward-facing tensor state lives on the slot batches.
         self.spec_pdmux_slots: Optional[List[ScheduleBatch]] = None
+        self.spec_pdmux_concurrent = False
         if self.server_args.enable_spec_pdmux:
             self.spec_pdmux_slots = [
                 ScheduleBatch(reqs=[], batch_is_full=False),
@@ -985,6 +987,32 @@ class Scheduler(
             ]
             self.spec_pdmux_next_slot = 0  # tick-parity pointer (decode)
             self._spec_pdmux_union_bs = 0  # for the batch_is_full clear-on-shrink
+            # spec-pdmux M2.2 (step 7): event-based concurrency. The scheduler
+            # side routes each decode slot's FutureMap gathers onto the SMALL
+            # green-ctx stream (ordered after the schedule stream and the
+            # slot's own last relay stash) and defers the relay stash to the
+            # worker's flush. SGLANG_SPEC_PDMUX_SERIALIZE=1 restores the M1
+            # strictly-sequential behavior end to end.
+            self.spec_pdmux_concurrent = (
+                self.enable_overlap
+                and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+                # Must mirror EAGLEWorkerV2._spec_pdmux_concurrent: scheduler
+                # (gather routing) and worker (defer/join branch) have to take
+                # the same path every tick.
+                and not self.server_args.speculative_adaptive
+                and self.server_args.speculative_num_steps > 0
+            )
+            # Recorded on the forward (large) stream after an untagged
+            # (prefill) batch's relay stash; each slot's next small-stream
+            # gather waits it once (a new request's first decode reads the
+            # rows that prefill stashed on the large stream).
+            self._spec_pdmux_prefill_relay_ev = None
+            self._spec_pdmux_prefill_relay_pending = [False, False]
+            if self.spec_pdmux_concurrent:
+                logger.info(
+                    "[spec-pdmux] M2.2 concurrent mode ON (per-slot CUDA "
+                    "events; SGLANG_SPEC_PDMUX_SERIALIZE=1 to restore M1 joins)"
+                )
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1539,6 +1567,15 @@ class Scheduler(
             runner.war_fastpath_read_done_event = None
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
+            if self.spec_pdmux_concurrent:
+                # spec-pdmux M2.2: with the M1 joins gone, the forward stream
+                # no longer dominates the SMALL stream's pool readers
+                # (draft / deferred draft_extend); the whole-forward fallback
+                # must fence them explicitly. (The fastpath event needs no
+                # such fix: it is recorded by the draft_extend replay on the
+                # small stream and dominates draft/verify via the
+                # verify_done -> extend event chain.)
+                self.schedule_stream.wait_stream(self._spec_pdmux_small_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1598,6 +1635,16 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            # spec-pdmux M2.2: a deferred draft_extend must be LAUNCHED before
+            # process_batch_result can free (and the next admission recycle)
+            # the rows it reads and stashes. Decode/prefill ticks flush inside
+            # run_batch/the worker; the batch-less and early-process paths
+            # must flush here.
+            if self.spec_pdmux_concurrent and (
+                batch is None or disable_overlap_for_batch
+            ):
+                self.model_worker.flush_spec_pdmux_pending()
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -2732,6 +2779,14 @@ class Scheduler(
 
         return ret
 
+    @functools.cached_property
+    def _spec_pdmux_small_stream(self):
+        """The SMALL green-ctx stream (drafter partition). Exists by event-loop
+        time: the target ModelRunner created the pair in its init."""
+        from sglang.srt.multiplex.pdmux_context import get_spec_streams
+
+        return get_spec_streams()[1]
+
     def _refresh_spec_pdmux_union(self):
         """spec-pdmux M2.0: refresh the reqs-only union facade
         (self.running_batch) from the two slot batches, and clear the
@@ -3455,13 +3510,50 @@ class Scheduler(
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
 
+                spec_pdmux_slot = (
+                    getattr(batch, "spec_pdmux_slot", None)
+                    if self.spec_pdmux_concurrent
+                    else None
+                )
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
-                    resolve_forward_inputs(batch, self.future_map)
+                    if spec_pdmux_slot is not None:
+                        # spec-pdmux M2.2: run this decode slot's FutureMap
+                        # gathers ON THE SMALL STREAM. On the forward (large)
+                        # stream they would queue behind the other slot's
+                        # verify, dragging this slot's draft behind it. True
+                        # producers, in order: the schedule stream (seq_lens
+                        # gather, req_to_token writes), the slot's own last
+                        # relay stash (small-stream FIFO after the same-slot
+                        # flush below) and any prefill stash (large stream,
+                        # relay event).
+                        small = self._spec_pdmux_small_stream
+                        small.wait_stream(self.schedule_stream)
+                        if self._spec_pdmux_prefill_relay_pending[spec_pdmux_slot]:
+                            small.wait_event(self._spec_pdmux_prefill_relay_ev)
+                            self._spec_pdmux_prefill_relay_pending[
+                                spec_pdmux_slot
+                            ] = False
+                        # Same-slot pending extend must precede the gathers
+                        # (only populated when this slot also ran last tick,
+                        # e.g. the other slot is empty).
+                        self.model_worker.flush_spec_pdmux_pending(spec_pdmux_slot)
+                        with self.device_module.stream(small):
+                            resolve_forward_inputs(batch, self.future_map)
+                    else:
+                        resolve_forward_inputs(batch, self.future_map)
+                        if (
+                            self.spec_pdmux_concurrent
+                            and not batch.spec_algorithm.is_none()
+                        ):
+                            # Untagged (prefill) spec batch on the large
+                            # stream: order it after all in-flight
+                            # small-stream stashes (recycled rows).
+                            self.model_worker._spec_pdmux_join_flush_done()
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -3478,6 +3570,12 @@ class Scheduler(
                             if not batch.spec_algorithm.is_none()
                             else {}
                         )
+                        if spec_pdmux_slot is not None:
+                            # The worker defers draft_extend + the relay stash
+                            # to its flush; hand it the stash callback.
+                            fwd_kwargs["on_relay"] = partial(
+                                self._relay_forward_payload, future_indices
+                            )
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
@@ -3495,7 +3593,33 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(future_indices, batch_result)
+                            if not batch_result.spec_pdmux_relay_deferred:
+                                self._relay_forward_payload(
+                                    future_indices, batch_result
+                                )
+                            if (
+                                self.spec_pdmux_concurrent
+                                and spec_pdmux_slot is None
+                                and not batch.spec_algorithm.is_none()
+                                and not batch_result.spec_pdmux_relay_deferred
+                            ):
+                                # Untagged (prefill) relay ran on the large
+                                # stream; each slot's next small-stream gather
+                                # must wait it (rows of the newly admitted
+                                # requests). Re-recording one event is safe:
+                                # a later record dominates earlier prefill
+                                # stashes on the same stream.
+                                if self._spec_pdmux_prefill_relay_ev is None:
+                                    self._spec_pdmux_prefill_relay_ev = (
+                                        self.device_module.Event()
+                                    )
+                                self._spec_pdmux_prefill_relay_ev.record(
+                                    self.forward_stream
+                                )
+                                self._spec_pdmux_prefill_relay_pending = [
+                                    True,
+                                    True,
+                                ]
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.

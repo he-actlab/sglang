@@ -69,6 +69,12 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # spec-pdmux M2.2: the worker deferred draft_extend (and therefore the
+    # FutureMap relay) to its flush at the next tick; the scheduler must NOT
+    # stash this result inline (next_draft_input's spec extras are unfilled
+    # until the deferred extend runs).
+    spec_pdmux_relay_deferred: bool = False
+
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).

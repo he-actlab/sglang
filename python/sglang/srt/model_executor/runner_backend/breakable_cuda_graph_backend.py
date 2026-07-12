@@ -39,8 +39,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
+    get_or_create_spec_pdmux_draft_graph_memory_pool,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -89,7 +91,21 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+            mr = self._model_runner
+            if (
+                getattr(mr, "is_draft_worker", False)
+                and mr.server_args.enable_spec_pdmux
+                and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+            ):
+                # spec-pdmux M2.2: draft-side graphs replay concurrently with
+                # the target's graphs -- see full_cuda_graph_backend.
+                self._pool = get_or_create_spec_pdmux_draft_graph_memory_pool(
+                    self._device_module
+                )
+            else:
+                self._pool = get_or_create_global_graph_memory_pool(
+                    self._device_module
+                )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None

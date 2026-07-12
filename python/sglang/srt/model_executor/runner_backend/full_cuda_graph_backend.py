@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
+import logging
+
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -30,11 +32,15 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
+    get_or_create_spec_pdmux_draft_graph_memory_pool,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -59,6 +65,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
+        self._model_runner = cuda_graph_runner.model_runner
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
@@ -69,7 +76,27 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+            mr = self._model_runner
+            if (
+                getattr(mr, "is_draft_worker", False)
+                and mr.server_args.enable_spec_pdmux
+                and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+            ):
+                # spec-pdmux M2.2: draft-side graphs replay on the SMALL
+                # green-ctx stream CONCURRENTLY with the target's verify graph
+                # on the large stream; they must not share the global pool
+                # (intermediate-buffer aliasing -> illegal memory access).
+                self._pool = get_or_create_spec_pdmux_draft_graph_memory_pool(
+                    self._device_module
+                )
+                logger.info(
+                    "[spec-pdmux] draft-side graphs captured in the DEDICATED "
+                    "draft graph memory pool"
+                )
+            else:
+                self._pool = get_or_create_global_graph_memory_pool(
+                    self._device_module
+                )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:

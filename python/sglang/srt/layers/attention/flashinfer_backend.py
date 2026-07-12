@@ -170,6 +170,16 @@ class PrefillMetadata:
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
+# spec-pdmux M2.2: dedicated float workspace for the DRAFT-side wrappers.
+# Under --enable-spec-pdmux the draft/draft_extend kernels (SMALL green-ctx
+# stream) execute CONCURRENTLY with the target's verify kernels (large
+# stream); sharing the global float workspace (split-KV partial-result
+# scratch) across concurrent wrappers would race. All draft-side wrappers
+# still share this ONE buffer: every draft-phase kernel is serialized on the
+# single small stream. Target-side wrappers keep the global buffer (verify /
+# prefill are serialized on the large stream).
+spec_pdmux_draft_workspace_buffer = None
+
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
@@ -392,6 +402,26 @@ class FlashInferAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
+        elif (
+            model_runner.server_args.enable_spec_pdmux
+            and model_runner.is_draft_worker
+            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+        ):
+            # spec-pdmux M2.2: draft-side wrappers run concurrently with the
+            # target's (see spec_pdmux_draft_workspace_buffer above).
+            global spec_pdmux_draft_workspace_buffer
+            if spec_pdmux_draft_workspace_buffer is None:
+                spec_pdmux_draft_workspace_buffer = torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+                logger.info(
+                    "[spec-pdmux] dedicated flashinfer draft workspace "
+                    "allocated (%d MB)",
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() // (1024 * 1024),
+                )
+            self.workspace_buffer = spec_pdmux_draft_workspace_buffer
         else:
             self.workspace_buffer = global_workspace_buffer
         max_bs = _cuda_graph_capture_max_bs(

@@ -1,6 +1,8 @@
 import contextlib
+import copy
 import logging
 import time
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
@@ -1171,6 +1173,140 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         return small
 
+    @functools.cached_property
+    def _spec_pdmux_concurrent(self):
+        """spec-pdmux M2.2 (step 7): event-based cross-stream ordering instead
+        of the M1 full joins. SGLANG_SPEC_PDMUX_SERIALIZE=1 is the kill-switch
+        back to the strictly-sequential M1 semantics (bisection aid)."""
+        return (
+            self.server_args.enable_spec_pdmux
+            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+            # Scheduler and worker must take the same branch per tick; adaptive
+            # spec can flip speculative_num_steps to 0 at runtime, which the
+            # worker checks but the scheduler's routing cannot see.
+            and not self.server_args.speculative_adaptive
+            and self.server_args.speculative_num_steps > 0
+        )
+
+    @functools.cached_property
+    def _spec_pdmux_state(self):
+        """Mutable per-slot concurrency state (cached_property, not __init__:
+        StandaloneWorkerV2 re-implements __init__ without calling super()).
+
+        - pending[slot]: the DEFERRED draft_extend of that slot's last decode
+          tick (batch shallow-copy + GPU-ref shim + relay callback). Launch is
+          deferred to the next tick so the small stream's FIFO becomes
+          [..., extend(X,n-1), gathers(X,n), draft(X,n), ...] per slot: with
+          alternating slots, slot X's whole draft-phase chain executes while
+          the OTHER slot's verify occupies the large stream. Launching extend
+          in-tick (M1 position) would trap the next tick's draft behind
+          extend's wait on this tick's verify -> zero overlap.
+        - draft_done/verify_done[slot]: reused CUDA events carrying the only
+          two cross-stream true dependencies: verify(X) waits draft(X)-done;
+          deferred extend(X) waits verify(X)-done.
+        - flush_done[slot]: recorded on the small stream after each deferred
+          extend+stash; prefill forwards (whole-batch on the large stream,
+          untagged relay) wait these so their FutureMap/KV writes to possibly
+          recycled rows are ordered after all in-flight small-stream stashes.
+        """
+        dev = torch.get_device_module(self.device)
+        return {
+            "pending": [None, None],
+            "draft_done": [dev.Event(), dev.Event()],
+            "verify_done": [dev.Event(), dev.Event()],
+            "extend_fwd_done": [None, None],  # lazily created on first flush
+            "flush_done": [None, None],  # lazily created on first flush
+        }
+
+    def flush_spec_pdmux_pending(self, slot: Optional[int] = None) -> None:
+        """Launch any deferred draft_extend (+ FutureMap relay stash).
+
+        Call sites and why they suffice:
+        - scheduler run_batch, same slot, BEFORE the tick's FutureMap gathers
+          (degenerate single-populated-slot case: the gathers read the stash);
+        - worker decode tick, OTHER slot, right after this tick's draft is
+          enqueued (steady state: keeps this tick's draft ahead of the other
+          slot's extend in the small stream's FIFO -> the extend+next-draft of
+          one slot execute under the other slot's verify);
+        - worker prefill tick + scheduler idle/early-process paths: both slots,
+          so a pending extend is always launched before the scheduler can free
+          and recycle the rows it reads/stashes (frees happen in
+          process_batch_result, which runs after these points each iteration).
+        """
+        st = self._spec_pdmux_state
+        dev = torch.get_device_module(self.device)
+        small = self._spec_pdmux_small_stream
+        for s in (0, 1) if slot is None else (slot,):
+            p = st["pending"][s]
+            if p is None:
+                continue
+            st["pending"][s] = None
+            # Data dependency of extend(X): verify(X)-done (predict /
+            # accept_lens / hidden_states).
+            small.wait_event(p["verify_done"])
+            # MEASURED HAZARD (M2.2 bisection, c=2 gsm8k): the draft-extend
+            # GRAPH FORWARD racing a concurrent target forward on the large
+            # stream corrupts the drafter state (tau 3.12 -> 1.97; draft
+            # token 1 -- relayed extend output -- stays correct, tokens 2..K
+            # -- draft forwards -- collapse). Isolated by selective joins:
+            # draft-forward || verify is CLEAN (tau identical to fully
+            # serialized), extend-forward || verify is NOT; the stash is
+            # clean. Split flashinfer float workspaces and split CUDA-graph
+            # memory pools did NOT fix it (both landed in this commit for
+            # the crashes they DID fix); the precise shared resource is
+            # still unidentified. Until it is, the extend forward is
+            # excluded from cross-stream overlap in BOTH directions:
+            # - entry: wait everything queued on the LARGE stream (its own
+            #   verify + any prefill in flight);
+            # - exit: extend_fwd_done, waited by the next verify (see
+            #   forward_batch_generation) and by prefills (flush_done).
+            # The draft phase -- the bigger drafter share -- stays fully
+            # concurrent with the other slot's verify; the extend stays ON
+            # the small partition (SM confinement preserved).
+            from sglang.srt.multiplex.pdmux_context import get_spec_streams
+
+            small.wait_stream(get_spec_streams()[0])
+            with dev.stream(small):
+                # Caching-allocator insurance: these tensors' home streams are
+                # the large (verify outputs) / schedule (SB fields) streams;
+                # their Python refs can drop right after this flush while the
+                # small stream still executes the extend.
+                record_stream_each(p["used_tensors"], small)
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft_extend"),
+                ):
+                    self.draft_worker._draft_extend_for_decode(
+                        p["batch"], p["result"]
+                    )
+                if st["extend_fwd_done"][s] is None:
+                    st["extend_fwd_done"][s] = dev.Event()
+                st["extend_fwd_done"][s].record(small)
+                if p["on_relay"] is not None:
+                    # FutureMap stash on the small stream: the slot's next-tick
+                    # gathers follow in the same FIFO; the other slot's stash
+                    # is also small-stream FIFO; prefill stashes (large stream)
+                    # are ordered via flush_done below + the prefill relay
+                    # event on the resolve side.
+                    p["on_relay"](p["result"])
+            if st["flush_done"][s] is None:
+                st["flush_done"][s] = dev.Event()
+            st["flush_done"][s].record(small)
+
+    def _spec_pdmux_join_flush_done(self) -> None:
+        """Make the CURRENT stream wait both slots' last deferred-extend+stash
+        (no-op for never-flushed slots). Used at prefill forwards: their relay
+        stash / KV writes may target rows recycled from retired requests whose
+        stale stash is still in flight on the small stream."""
+        cur = torch.get_device_module(self.device).current_stream()
+        for ev in self._spec_pdmux_state["flush_done"]:
+            if ev is not None:
+                cur.wait_event(ev)
+
     @contextlib.contextmanager
     def _draft_stream_region(self):
         """spec-pdmux (M1 step 3): run the enclosed drafter phase (draft /
@@ -1184,8 +1320,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         correction: draft does NOT write into the target attn backend's
         verify buffers in the supported config -- flashinfer's
         get_verify_buffers_to_fill_after_draft returns [None, None]; the
-        assert in draft() pins that invariant.) No-op when spec-pdmux is
-        off."""
+        assert in draft() pins that invariant.) Step 7 keeps this region for
+        the SGLANG_SPEC_PDMUX_SERIALIZE kill-switch, for prefill draft_extend
+        and for the non-overlap/idle decode paths; the concurrent decode path
+        replaces it with per-slot events (see forward_batch_generation).
+        No-op when spec-pdmux is off."""
         small = self._spec_pdmux_small_stream
         if small is None:
             yield
@@ -1295,8 +1434,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None, on_relay=None
+    ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._spec_pdmux_concurrent:
+                # spec-pdmux M2.2: a prefill runs whole-batch on the LARGE
+                # stream and its relay stash may write FutureMap/KV rows
+                # recycled from retired requests -- order it after every
+                # in-flight small-stream deferred extend+stash.
+                self.flush_spec_pdmux_pending()
+                self._spec_pdmux_join_flush_done()
             # Target prefill
             target_capture_mode = (
                 CaptureHiddenMode.NULL
@@ -1356,16 +1504,67 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
+            # spec-pdmux M2.2: the concurrent decode path. Conditions mirror
+            # the scheduler's (slot-tagged overlap decode): the scheduler has
+            # already run this tick's FutureMap gathers ON THE SMALL STREAM
+            # (ordered after the schedule stream + the slot's own last stash),
+            # so the draft region needs NO entry join here.
+            slot = getattr(batch, "spec_pdmux_slot", None)
+            dev = torch.get_device_module(self.device)
+            concurrent = (
+                self._spec_pdmux_concurrent
+                and slot is not None
+                and batch.enable_overlap
+                and not batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 0
+            )
             if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
+            elif concurrent:
+                # Draft on the SMALL stream. True input producers and their
+                # ordering: gathered spec extras + this slot's draft KV /
+                # graph statics (small-stream FIFO), SB fields + req_to_token
+                # (schedule stream -- the scheduler issued
+                # small.wait_stream(schedule_stream) before the gathers).
+                # NOT waited: the large stream -- the other slot's verify may
+                # still be running there; that concurrency is the point.
+                with (
+                    dev.stream(self._spec_pdmux_small_stream),
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                # verify(X) waits ONLY draft(X)-done (event, not a stream join).
+                draft_done = self._spec_pdmux_state["draft_done"][slot]
+                draft_done.record(self._spec_pdmux_small_stream)
+                dev.current_stream().wait_event(draft_done)
+                # verify() records the other verify_input fields on the
+                # forward stream (record_stream_for_v2_verify); draft_probs
+                # is the one small-stream allocation it does not cover.
+                record_stream_each(
+                    (verify_input.draft_probs,), dev.current_stream()
+                )
+                # Steady-state key move: launch the OTHER slot's deferred
+                # extend(+stash) now, AFTER this tick's draft is in the small
+                # FIFO and BEFORE this tick's verify is enqueued on large
+                # (the extend's entry wait then covers only the other slot's
+                # verify, not this one).
+                self.flush_spec_pdmux_pending(slot=1 - slot)
+                # This tick's verify must not overlap any in-flight extend
+                # forward (the measured extend||target-forward hazard; see
+                # flush_spec_pdmux_pending).
+                for ev in self._spec_pdmux_state["extend_fwd_done"]:
+                    if ev is not None:
+                        dev.current_stream().wait_event(ev)
             else:
-                # spec-pdmux: draft on the SMALL green-ctx stream; the exit
-                # join (back onto the forward stream) precedes the spec_info
-                # rebind and verify below, so verify's reads of the draft-
-                # allocated verify_input tensors are ordered after draft
-                # completion.
+                # spec-pdmux serialize/kill-switch, non-overlap and idle paths:
+                # M1 strictly-sequential joins.
                 with (
                     self._draft_stream_region(),
                     self.draft_worker.draft_tp_context(
@@ -1377,16 +1576,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
                 if self._spec_pdmux_small_stream is not None:
-                    # verify() records the other verify_input fields on the
-                    # forward stream (record_stream_for_v2_verify); draft_probs
-                    # is the one small-stream allocation it does not cover.
                     record_stream_each(
                         (verify_input.draft_probs,),
-                        torch.get_device_module(self.device).current_stream(),
+                        dev.current_stream(),
                     )
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
+            if concurrent:
+                # Recorded on the large stream right after verify's work; the
+                # deferred extend(X) waits exactly this (its only cross-stream
+                # input dependency: predict / accept_lens / hidden_states).
+                verify_done = self._spec_pdmux_state["verify_done"][slot]
+                verify_done.record(dev.current_stream())
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1395,6 +1597,44 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
+            elif concurrent:
+                # DEFER draft_extend (and the FutureMap relay stash) to the
+                # next flush point. Captured state:
+                # - copy.copy(batch): shallow snapshot at exactly the M1 call
+                #   point (post-verify SB mutations included); isolates the
+                #   extend's SB rebinds from the live batch and freezes the
+                #   fields against the scheduler's post-tick mutations /
+                #   _forward_isolation restore.
+                # - SimpleNamespace shim: freezes the GPU refs of the verify
+                #   outputs -- the scheduler's copy_to_cpu REBINDS
+                #   batch_result.next_token_ids / accept_lens (and optionally
+                #   logits_output.hidden_states) to host tensors before the
+                #   flush runs.
+                self._spec_pdmux_state["pending"][slot] = {
+                    "batch": copy.copy(batch),
+                    "result": SimpleNamespace(
+                        logits_output=SimpleNamespace(
+                            hidden_states=batch_output.logits_output.hidden_states
+                        ),
+                        next_token_ids=batch_output.next_token_ids,
+                        accept_lens=batch_output.accept_lens,
+                        next_draft_input=batch_output.next_draft_input,
+                    ),
+                    "on_relay": on_relay,
+                    "verify_done": verify_done,
+                    # record_stream(small) targets at flush: cross-stream
+                    # inputs whose Python refs may drop mid-execution.
+                    "used_tensors": (
+                        batch_output.next_token_ids,
+                        batch_output.accept_lens,
+                        batch_output.logits_output.hidden_states,
+                        batch.seq_lens,
+                        batch.seq_lens_cpu,
+                        batch.req_pool_indices,
+                        batch.out_cache_loc,
+                    ),
+                }
+                batch_output.spec_pdmux_relay_deferred = True
             else:
                 # spec-pdmux: draft_extend on the SMALL green-ctx stream; the
                 # exit join precedes the return -- the FutureMap relay reads

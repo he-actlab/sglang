@@ -39,3 +39,21 @@ def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
     if _global_graph_memory_pool is None:
         _global_graph_memory_pool = device_module.graph_pool_handle()
     return _global_graph_memory_pool
+
+
+# spec-pdmux M2.2: dedicated graph memory pool for the DRAFT-side graphs
+# (draft decode + draft extend, replayed on the SMALL green-ctx stream).
+# The process-wide pool above is only safe because its graphs never replay
+# concurrently; under --enable-spec-pdmux the draft graphs replay WHILE the
+# target's verify graph replays on the large stream — sharing one pool
+# aliases their intermediate buffers (observed as illegal memory access /
+# corruption at c=32). Draft and draft-extend graphs still share this one
+# pool: all draft-phase work is serialized on the single small stream.
+_spec_pdmux_draft_graph_memory_pool: Optional[Any] = None
+
+
+def get_or_create_spec_pdmux_draft_graph_memory_pool(device_module: Any) -> Any:
+    global _spec_pdmux_draft_graph_memory_pool
+    if _spec_pdmux_draft_graph_memory_pool is None:
+        _spec_pdmux_draft_graph_memory_pool = device_module.graph_pool_handle()
+    return _spec_pdmux_draft_graph_memory_pool

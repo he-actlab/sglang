@@ -701,6 +701,11 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
+    # spec-pdmux M2.2 kill-switch: restore the M1 strictly-sequential stream
+    # joins (and in-tick draft_extend + forward-stream FutureMap gathers)
+    # under --enable-spec-pdmux, for bisection of concurrency bugs.
+    SGLANG_SPEC_PDMUX_SERIALIZE = EnvBool(False)
+
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
