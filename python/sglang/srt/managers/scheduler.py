@@ -227,7 +227,11 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    get_alloc_reserve_per_decode,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -987,6 +991,7 @@ class Scheduler(
             ]
             self.spec_pdmux_next_slot = 0  # tick-parity pointer (decode)
             self._spec_pdmux_union_bs = 0  # for the batch_is_full clear-on-shrink
+            self._spec_pdmux_kv_throttled = False  # M2.3 admission-throttle latch (log-only)
             # spec-pdmux M2.2 (step 7): event-based concurrency. The scheduler
             # side routes each decode slot's FutureMap gathers onto the SMALL
             # green-ctx stream (ordered after the schedule stream and the
@@ -2887,13 +2892,66 @@ class Scheduler(
                 slot.merge_batch(parts[t])
         sizes = self._spec_pdmux_slot_sizes()
         logger.info(
-            "[spec-pdmux-sched] tick=%d ADMIT n0=%d n1=%d slot_sizes=%d/%d",
+            "[spec-pdmux-sched] tick=%d ADMIT n0=%d n1=%d slot_sizes=%d/%d "
+            "free_tok=%d evict_tok=%d",
             self.forward_ct + 1,
             len(keep[0]),
             len(keep[1]),
             sizes[0],
             sizes[1],
+            self.token_to_kv_pool_allocator.available_size(),
+            self.tree_cache.evictable_size(),
         )
+
+    def _spec_pdmux_projected_decode_need(self) -> int:
+        """Projected verify-tree top-up (tokens) for BOTH slots' next decode
+        ticks. Both are in flight simultaneously under M2.2, so the union —
+        not one slot — is the amount the pool must be able to back between
+        two free points."""
+        return sum(
+            s.new_tokens_required_next_decode()
+            for s in self.spec_pdmux_slots
+            if not s.is_empty()
+        )
+
+    def _spec_pdmux_kv_admission_ok(self) -> bool:
+        """spec-pdmux M2.3: token-pool admission guard for the ~2x in-flight
+        verify-tree reality. Stock's runtime KV protection is per-batch
+        (check_decode_mem -> retract inside update_running_batch); with two
+        slots in flight a prefill admitted this tick competes with BOTH slots'
+        next verify-tree allocations. Skip prefill admission (re-evaluated
+        fresh every tick — no batch_is_full latch, so recovery is automatic
+        as requests finish) unless free+evictable covers both slots' projected
+        top-ups plus one more full per-request reserve round across the union
+        (early-throttle margin: admission stops ~one slot-tick before the
+        retract path would engage). Count capping needs no colo change:
+        get_num_allocatable_reqs already runs against the union facade."""
+        if not self.waiting_queue or self.chunked_req is not None:
+            # Nothing to admit (guard is moot), or a chunked prefill is mid
+            # flight (must proceed regardless — stock invariant).
+            return True
+        union_bs = len(self.running_batch.reqs)
+        if union_bs == 0:
+            return True  # nothing in flight; PrefillAdder's budget governs
+        reserve = get_alloc_reserve_per_decode(self.server_args)
+        need = self._spec_pdmux_projected_decode_need() + reserve * (union_bs + 1)
+        free = (
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
+        )
+        ok = free >= need
+        if ok == self._spec_pdmux_kv_throttled:  # log state changes only
+            self._spec_pdmux_kv_throttled = not ok
+            logger.info(
+                "[spec-pdmux-sched] tick=%d KV-THROTTLE %s: free+evict=%d "
+                "projected_need=%d union_bs=%d",
+                self.forward_ct + 1,
+                "ENTER" if not ok else "EXIT",
+                free,
+                need,
+                union_bs,
+            )
+        return ok
 
     def _get_next_batch_to_run_spec_pdmux(self) -> Optional[ScheduleBatch]:
         """spec-pdmux M2.0: TWO STATIC SUB-BATCHES, strictly sequential.
@@ -2949,8 +3007,12 @@ class Scheduler(
         self._refresh_spec_pdmux_union()
 
         # Stock prefill admission against the union facade (PrefillAdder and
-        # the running_bs budget only read union.reqs / batch_is_full).
-        new_batch = self.get_new_batch_prefill()
+        # the running_bs budget only read union.reqs / batch_is_full), behind
+        # the M2.3 two-in-flight-verify-tree KV guard.
+        if self._spec_pdmux_kv_admission_ok():
+            new_batch = self.get_new_batch_prefill()
+        else:
+            new_batch = None
 
         if new_batch is not None:
             # Prefill runs as ONE forward; per-request slot routing happens at
@@ -2975,6 +3037,9 @@ class Scheduler(
                 slot = self.spec_pdmux_slots[idx]
                 if slot.is_empty() or slot.is_prefill_only:
                     continue
+                # Tag BEFORE update_running_batch: the M2.3 headroom assert
+                # inside prepare_for_decode's verify-tree alloc reports it.
+                slot.spec_pdmux_slot = idx
                 slot = self.update_running_batch(slot)
                 self.spec_pdmux_slots[idx] = slot
                 self._refresh_spec_pdmux_union()  # update may filter/retract
@@ -2983,12 +3048,14 @@ class Scheduler(
                 slot.spec_pdmux_slot = idx
                 sizes = self._spec_pdmux_slot_sizes()
                 logger.info(
-                    "[spec-pdmux-sched] tick=%d DECODE slot=%d bs=%d slot_sizes=%d/%d",
+                    "[spec-pdmux-sched] tick=%d DECODE slot=%d bs=%d "
+                    "slot_sizes=%d/%d free_tok=%d",
                     self.forward_ct + 1,
                     idx,
                     slot.batch_size(),
                     sizes[0],
                     sizes[1],
+                    self.token_to_kv_pool_allocator.available_size(),
                 )
                 ret = slot
                 break

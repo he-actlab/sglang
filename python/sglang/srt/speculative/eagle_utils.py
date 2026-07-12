@@ -16,6 +16,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
@@ -660,6 +661,29 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
+
+    from sglang.srt.server_args import get_global_server_args
+
+    if get_global_server_args().enable_spec_pdmux:
+        # spec-pdmux M2.3: loud free-page headroom check per slot BEFORE the
+        # kv_allocated_len bookkeeping below mutates. With two sub-batches'
+        # verify trees in flight, an estimate/accounting slip would otherwise
+        # surface as alloc_token_slots' RuntimeError AFTER the loop corrupted
+        # every request's kv_allocated_len — undebuggable mid-run OOM. Same
+        # formula check_decode_mem/retract just enforced ("tight estimate
+        # matching" this function's allocation), so this only fires on a real
+        # invariant break, not on ordinary pool pressure.
+        need_check = batch.new_tokens_required_next_decode()
+        evict_from_tree_cache(batch.tree_cache, need_check)
+        avail_check = batch.token_to_kv_pool_allocator.available_size()
+        if avail_check < need_check:
+            raise RuntimeError(
+                f"[spec-pdmux] free-page headroom violated before verify-tree "
+                f"alloc: slot={getattr(batch, 'spec_pdmux_slot', None)} "
+                f"bs={bs} need={need_check} free={avail_check}. "
+                f"check_decode_mem admitted a decode tick the pool cannot "
+                f"back; failing before kv_allocated_len mutation."
+            )
 
     cur_kv_lens = [0] * bs
     nxt_kv_lens = [0] * bs
