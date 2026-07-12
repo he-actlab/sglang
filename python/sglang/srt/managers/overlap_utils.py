@@ -169,7 +169,32 @@ class FutureMap:
         # Lazy-inited on the first non-empty stash (peeks tensor shapes); non-spec's is a no-op.
         self._forward_buf_initialized = False
 
-        self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
+        # Per-slot publish events (spec-pdmux M2.0: the scheduler alternates
+        # two sub-batch slots through this one FutureMap; each slot's resolve
+        # must wait on ITS OWN publish, not on whichever slot recorded last).
+        # Sequentially a single re-recorded event is safe (all records land on
+        # the one forward stream, so a later record dominates the waiter's own
+        # publish), but per-slot events are what step 7's event-based overlap
+        # requires, and they validate slot state separation now.
+        # active_slot protocol (set by the scheduler per tick):
+        #   int  — decode batch of that slot: publish/resolve slot's event.
+        #   None — untagged batch (prefill under spec-pdmux: its requests may
+        #          be routed to either slot at merge): publish records BOTH
+        #          slots' events; resolve waits on all recorded events.
+        # Non-pdmux never changes active_slot from 0 == stock single-event
+        # behavior. The fwd_prepare_d2h stream and pinned buffer stay
+        # singletons: each resolve fully drains the stream (synchronize
+        # below), and the full-buffer D2H may overlap the OTHER slot's
+        # in-flight publish only on rows this slot never reads (bufs are
+        # req_pool_idx-indexed; slots hold disjoint reqs).
+        self.publish_ready = [None, None]  # lazy device.Event(); spec_v2 only
+        self.active_slot: Optional[int] = 0
+
+    def _active_publish_events(self):
+        if self.active_slot is None:
+            return [e for e in self.publish_ready if e is not None]
+        e = self.publish_ready[self.active_slot]
+        return [e] if e is not None else []
 
     def _lazy_init_forward_buf(self, payload: RelayPayload):
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
@@ -271,12 +296,13 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
-        if self.publish_ready is not None:
+        publish_events = self._active_publish_events()
+        for ev in publish_events:
             if _is_hip:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
-                self.publish_ready.synchronize()
+                ev.synchronize()
             else:
-                self.publish_ready.wait()
+                ev.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
@@ -286,14 +312,15 @@ class FutureMap:
             batch.seq_lens_sum = None
             return
 
-        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+        if self.fwd_prepare_d2h_stream is None or not publish_events:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             return
 
         # Mechanism: don't sync the schedule stream; gate a private stream on the
         # publish event and copy into the static pinned buffer.
-        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+        for ev in publish_events:
+            self.fwd_prepare_d2h_stream.wait_event(ev)
         with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
             self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
         self.fwd_prepare_d2h_stream.synchronize()
@@ -307,11 +334,17 @@ class FutureMap:
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
+        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private
+        # stream. Recorded per active slot; an untagged (None) publish records
+        # BOTH slots' events (see the active_slot protocol in __init__).
         if self.spec_algo.is_some():
-            if self.publish_ready is None:
-                self.publish_ready = torch.get_device_module(self.device).Event()
-            self.publish_ready.record()
+            slots = (0, 1) if self.active_slot is None else (self.active_slot,)
+            for s in slots:
+                if self.publish_ready[s] is None:
+                    self.publish_ready[s] = torch.get_device_module(
+                        self.device
+                    ).Event()
+                self.publish_ready[s].record()
 
     def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
         if self.spec_algo.is_ngram():

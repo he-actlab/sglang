@@ -7046,6 +7046,15 @@ class ServerArgs:
                 self.tp_size == 1
             ), "--enable-spec-pdmux currently requires tp_size=1."
             assert self.device == "cuda", "--enable-spec-pdmux requires CUDA."
+            # M2.0 (two scheduler sub-batch slots): paths not mirrored by the
+            # spec-pdmux scheduler branch must be off.
+            assert (
+                self.disaggregation_mode == "null"
+            ), "--enable-spec-pdmux does not support PD disaggregation."
+            assert self.pp_size == 1, "--enable-spec-pdmux requires pp_size=1."
+            assert (
+                not self.enable_mixed_chunk
+            ), "--enable-spec-pdmux is incompatible with --enable-mixed-chunk."
             if self.spec_pdmux_sm_split is not None:
                 parts = self.spec_pdmux_sm_split.split(",")
                 assert len(parts) == 2 and all(

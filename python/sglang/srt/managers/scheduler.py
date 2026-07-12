@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import copy
 import dataclasses
 import faulthandler
 import logging
@@ -968,6 +969,22 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        # spec-pdmux M2.0: TWO static running-batch sub-batch slots, strictly
+        # sequential (one forward per tick, alternating). self.running_batch
+        # stays as a reqs-only UNION FACADE over the slots: its req list is
+        # refreshed from the slots each tick so every global consumer
+        # (prefill admission budget, idle checks, abort scans, load/logging
+        # lambdas) keeps seeing all running requests; only .reqs /
+        # .batch_is_full / .is_empty() are ever read from it. The real
+        # forward-facing tensor state lives on the slot batches.
+        self.spec_pdmux_slots: Optional[List[ScheduleBatch]] = None
+        if self.server_args.enable_spec_pdmux:
+            self.spec_pdmux_slots = [
+                ScheduleBatch(reqs=[], batch_is_full=False),
+                ScheduleBatch(reqs=[], batch_is_full=False),
+            ]
+            self.spec_pdmux_next_slot = 0  # tick-parity pointer (decode)
+            self._spec_pdmux_union_bs = 0  # for the batch_is_full clear-on-shrink
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1278,7 +1295,13 @@ class Scheduler(
         if not self.enable_overlap:
             return
 
-        self.batch_record_buf = [None] * 2
+        # spec-pdmux M2.0: two alternating sub-batch slots share this ring;
+        # depth 4 gives every record at least the stock 2-tick lifetime per
+        # slot under any prefill/decode interleave (FIFO-4 dominates a
+        # 2-per-slot split, and needs no slot-aware indexing).
+        self.batch_record_buf = [None] * (
+            4 if self.server_args.enable_spec_pdmux else 2
+        )
         self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
@@ -2577,6 +2600,9 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if self.spec_pdmux_slots is not None:
+            return self._get_next_batch_to_run_spec_pdmux()
+
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -2697,6 +2723,226 @@ class Scheduler(
         )
 
         # Handle ngram embedding
+        ret = self._maybe_prepare_ngram_embedding(ret)
+
+        if ret:
+            set_schedule_time_batch(ret)
+            if self.enable_fpm:
+                ret.fpm_start_time = self._fpm_batch_t0
+
+        return ret
+
+    def _refresh_spec_pdmux_union(self):
+        """spec-pdmux M2.0: refresh the reqs-only union facade
+        (self.running_batch) from the two slot batches, and clear the
+        admission latch when requests left the running set (mirrors stock's
+        batch_is_full = False on filter/retract shrink; one tick of latency
+        at most, and admission runs on the same tick as the clear)."""
+        union = self.running_batch
+        union.reqs = self.spec_pdmux_slots[0].reqs + self.spec_pdmux_slots[1].reqs
+        n = len(union.reqs)
+        if n < self._spec_pdmux_union_bs:
+            union.batch_is_full = False
+        self._spec_pdmux_union_bs = n
+
+    def _spec_pdmux_slot_sizes(self) -> List[int]:
+        return [
+            sum(1 for r in s.reqs if not r.finished()) for s in self.spec_pdmux_slots
+        ]
+
+    def _spec_pdmux_can_split(self, batch: ScheduleBatch) -> bool:
+        """Whether a finished prefill batch can be split per-request across the
+        two slots. Requires the overlap relay (spec extras re-gathered from the
+        pool-indexed FutureMap via spec_info.future_indices, so a sliced
+        future_indices is a complete sub-batch spec state) and plain sampling
+        (the split half gets a REBUILT SamplingBatchInfo; that is lossless only
+        when no penalizer holds accumulated state and there are no custom
+        processors / logit biases / grammars)."""
+        if not batch.enable_overlap:
+            return False
+        si = batch.spec_info
+        if si is not None and getattr(si, "future_indices", None) is None:
+            return False
+        s = batch.sampling_info
+        if s is None or s.has_custom_logit_processor or s.logit_bias is not None:
+            return False
+        if batch.has_grammar or self.model_config.is_encoder_decoder:
+            return False
+        for r in batch.reqs:
+            p = r.sampling_params
+            if (
+                p.frequency_penalty != 0.0
+                or p.presence_penalty != 0.0
+                or p.repetition_penalty != 1.0
+                or getattr(p, "min_new_tokens", 0) > 0
+            ):
+                return False
+        return True
+
+    def _spec_pdmux_admit(self, batch: ScheduleBatch) -> None:
+        """Route a finished (non-empty, filtered) prefill batch's requests
+        into the two slots, size-balanced (greedy: each request to the
+        currently smaller slot). Splits the batch per-request when safe;
+        otherwise routes it whole to the smaller slot. Assignments are sticky:
+        requests never migrate between slots afterwards."""
+        sizes = self._spec_pdmux_slot_sizes()
+        keep = ([], [])
+        for i in range(batch.batch_size()):
+            t = 0 if sizes[0] <= sizes[1] else 1
+            keep[t].append(i)
+            sizes[t] += 1
+
+        parts: List[Optional[ScheduleBatch]] = [None, None]
+        if not keep[0] or not keep[1]:
+            parts[0 if keep[0] else 1] = batch
+        elif not self._spec_pdmux_can_split(batch):
+            base = self._spec_pdmux_slot_sizes()
+            tgt = 0 if base[0] <= base[1] else 1
+            parts[tgt] = batch
+            logger.info(
+                "[spec-pdmux-sched] unsplittable prefill batch bs=%d -> slot=%d whole",
+                batch.batch_size(),
+                tgt,
+            )
+        else:
+            # Shallow-copy the batch, give the copy its OWN sampling_info
+            # (rebuilt; guarded by _spec_pdmux_can_split) and its own
+            # spec_info shell (filter under overlap only slices
+            # future_indices), then filter both objects to disjoint halves.
+            # ScheduleBatch.filter_batch only REBINDS fields (list/tensor
+            # slicing), so the pre-filter tensors shared by the shallow copy
+            # are never mutated.
+            half = copy.copy(batch)
+            half.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                half, self.model_config.vocab_size
+            )
+            if batch.spec_info is not None:
+                half.spec_info = copy.copy(batch.spec_info)
+            half.filter_batch(keep_indices=keep[1])
+            batch.filter_batch(keep_indices=keep[0])
+            parts[0], parts[1] = batch, half
+
+        for t in (0, 1):
+            if parts[t] is None:
+                continue
+            slot = self.spec_pdmux_slots[t]
+            if slot.is_empty():
+                self.spec_pdmux_slots[t] = parts[t]
+            else:
+                slot.merge_batch(parts[t])
+        sizes = self._spec_pdmux_slot_sizes()
+        logger.info(
+            "[spec-pdmux-sched] tick=%d ADMIT n0=%d n1=%d slot_sizes=%d/%d",
+            self.forward_ct + 1,
+            len(keep[0]),
+            len(keep[1]),
+            sizes[0],
+            sizes[1],
+        )
+
+    def _get_next_batch_to_run_spec_pdmux(self) -> Optional[ScheduleBatch]:
+        """spec-pdmux M2.0: TWO STATIC SUB-BATCHES, strictly sequential.
+
+        Mirrors get_next_batch_to_run for the spec-pdmux config (the
+        server_args guard excludes pdmux / disagg / pp>1 / mixed-chunk; dllm
+        and hisparse are model/flag paths a spec-decode config never takes),
+        with three deltas:
+          1. the last prefill batch's requests are routed into the slots at
+             merge time, size-balanced per request (_spec_pdmux_admit);
+             assignments are sticky (no migration);
+          2. prefill admission runs against the union facade, so budgets see
+             both slots exactly as stock sees one running_batch;
+          3. decode runs ONE slot per tick, alternating by tick parity,
+             skipping empty slots.
+        All M1 stream joins stay; this is pure bookkeeping (zero added
+        concurrency) to validate sub-batch state separation.
+        """
+        self.process_pending_chunked_abort()
+
+        if self.enable_fpm:
+            self._fpm_batch_t0 = time.monotonic()
+        self._abort_on_waiting_timeout()
+        self._refresh_spec_pdmux_union()
+        self._abort_on_running_timeout()  # scans the union facade
+
+        # Merge the last prefill batch into its assigned slot (stock lines,
+        # with the slot as merge target instead of running_batch).
+        chunked_req_to_exclude = set()
+        if self.chunked_req is not None:
+            chunked_req_to_exclude.add(self.chunked_req)
+            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+                self.stash_chunked_request(self.chunked_req)
+
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.last_batch.chunked_req is not None:
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
+                self.running_batch.batch_is_full = False
+            if not self.last_batch.is_empty():
+                self._spec_pdmux_admit(self.last_batch)
+                self._refresh_spec_pdmux_union()
+
+        # Prefill-only requests never reach a decode tick; filter them out of
+        # the slots so they don't linger (stock's is_prefill_only block).
+        for s in self.spec_pdmux_slots:
+            if not s.is_empty() and s.is_prefill_only:
+                s.filter_batch()
+        self._refresh_spec_pdmux_union()
+
+        # Stock prefill admission against the union facade (PrefillAdder and
+        # the running_bs budget only read union.reqs / batch_is_full).
+        new_batch = self.get_new_batch_prefill()
+
+        if new_batch is not None:
+            # Prefill runs as ONE forward; per-request slot routing happens at
+            # merge time next tick (_spec_pdmux_admit). No slot tag here: an
+            # untagged batch publishes to BOTH slots' FutureMap events, since
+            # its requests may land in either slot.
+            sizes = self._spec_pdmux_slot_sizes()
+            logger.info(
+                "[spec-pdmux-sched] tick=%d PREFILL bs=%d slot_sizes=%d/%d",
+                self.forward_ct + 1,
+                new_batch.batch_size(),
+                sizes[0],
+                sizes[1],
+            )
+            ret = new_batch
+        else:
+            # Decode: one slot per tick, alternating; skip empty slots.
+            ret = None
+            for _ in range(2):
+                idx = self.spec_pdmux_next_slot
+                self.spec_pdmux_next_slot ^= 1
+                slot = self.spec_pdmux_slots[idx]
+                if slot.is_empty() or slot.is_prefill_only:
+                    continue
+                slot = self.update_running_batch(slot)
+                self.spec_pdmux_slots[idx] = slot
+                self._refresh_spec_pdmux_union()  # update may filter/retract
+                if slot.is_empty():
+                    continue
+                slot.spec_pdmux_slot = idx
+                sizes = self._spec_pdmux_slot_sizes()
+                logger.info(
+                    "[spec-pdmux-sched] tick=%d DECODE slot=%d bs=%d slot_sizes=%d/%d",
+                    self.forward_ct + 1,
+                    idx,
+                    slot.batch_size(),
+                    sizes[0],
+                    sizes[1],
+                )
+                ret = slot
+                break
+
+        # Stock tail (require_mlp_sync is False under the spec-pdmux guard:
+        # tp=1, no DP attention — both calls are pass-throughs kept for parity).
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            ret, need_sync=self.require_mlp_sync
+        )
         ret = self._maybe_prepare_ngram_embedding(ret)
 
         if ret:
@@ -3116,7 +3362,7 @@ class Scheduler(
         attr_snapshot = [
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
-        self.batch_record_ct = (self.batch_record_ct + 1) % 2
+        self.batch_record_ct = (self.batch_record_ct + 1) % len(self.batch_record_buf)
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
@@ -3174,6 +3420,15 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+
+        if self.spec_pdmux_slots is not None:
+            # spec-pdmux M2.0: route this tick's FutureMap publish/resolve to
+            # the batch's slot BEFORE resolve_seq_lens_cpu reads the slot's
+            # publish event. Decode batches carry their slot tag; prefill
+            # batches are untagged (None): their requests may be routed to
+            # either slot at merge time, so their publish must record BOTH
+            # slots' events.
+            self.future_map.active_slot = getattr(batch, "spec_pdmux_slot", None)
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
