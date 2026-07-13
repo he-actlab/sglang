@@ -241,6 +241,32 @@ class FutureMap:
                 device=self.device,
             )
 
+        if self.need_topk:
+            from sglang.srt.server_args import get_global_server_args
+
+            _ga = get_global_server_args()
+            if _ga.enable_spec_pdmux and _ga.tp_size > 1:
+                # spec-pdmux M3 step 2 (same invariant as spec_utils.
+                # warmup_scheduler_thread_triton_kernels): _resolve_spec_extras
+                # launches gather_spec_extras on the SCHEDULER thread, and its
+                # `indices` tensor's base offset varies at runtime, so both
+                # 16B-alignment pointer specializations of the triton kernel
+                # occur -- each first use is a lazy cuModuleLoad, which on the
+                # scheduler thread deadlocks against in-flight spinning
+                # collectives (see the warmup helper's docstring). This lazy
+                # buffer init is a lockstep-consistent point (the first
+                # stash), so pre-load both variants here.
+                hb = self.hidden_states_buf if self.need_hidden_states else None
+                _idx = torch.zeros(3, dtype=torch.int64, device=self.device)
+                for _indices in (_idx[:1], _idx[1:2]):
+                    gather_spec_extras(
+                        _indices,
+                        self.topk_p_buf,
+                        self.topk_index_buf,
+                        self.output_tokens_buf,
+                        hb,
+                    )
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.

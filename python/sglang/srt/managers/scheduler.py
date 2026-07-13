@@ -985,20 +985,24 @@ class Scheduler(
         self.spec_pdmux_slots: Optional[List[ScheduleBatch]] = None
         self.spec_pdmux_concurrent = False
         if self.server_args.enable_spec_pdmux:
-            # M3 step 1: TP>1 runs the single-communicator path, which is
-            # only safe while the M1 serialized joins keep the large/small
-            # streams from issuing NCCL work concurrently. Concurrency at
-            # TP>1 is impossible-by-construction until step 2.
-            if (
-                self.server_args.tp_size > 1
-                and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
-            ):
-                raise RuntimeError(
-                    "[spec-pdmux] M3 step 2 pending: TP>1 requires "
-                    "SGLANG_SPEC_PDMUX_SERIALIZE=1 (M1 serialized joins keep "
-                    "the single NCCL communicator safe) until the dedicated "
-                    "draft communicator lands."
-                )
+            # M3 step 2: TP>1 concurrency is allowed because the draft side
+            # runs on a DEDICATED communicator (the duplicate TP group; see
+            # spec_utils.draft_dup_tp_context) -- draft collectives on the
+            # SMALL green-ctx stream never share an NCCL/custom-AR
+            # communicator with verify collectives on the LARGE stream.
+            # Collective-order safety: each rank's serial scheduler thread
+            # enqueues the IDENTICAL tick sequence (step-1 lockstep proof:
+            # every ADMIT line 4-way exact over 12080 lines), and within a
+            # tick all draft-side collectives go to the draft comm in small-
+            # stream FIFO order while all verify-side collectives go to the
+            # verify comm in large-stream order -- so each communicator sees
+            # one consistent cross-rank issue order. Cross-comm progress
+            # cannot deadlock: the green-ctx SM partitions let both comms'
+            # kernels run simultaneously (probe: dual-communicator stable,
+            # draft ARs confined to the small partition), and the per-slot
+            # draft_done/verify_done event edges are identical on all ranks.
+            # SYNC_TOKEN_IDS_ACROSS_TP=1 remains available as a bring-up
+            # tripwire for rank desync (off in normal operation).
             self.spec_pdmux_slots = [
                 ScheduleBatch(reqs=[], batch_is_full=False),
                 ScheduleBatch(reqs=[], batch_is_full=False),
@@ -1040,6 +1044,25 @@ class Scheduler(
                     "[spec-pdmux r%d] M2.2 concurrent mode ON (per-slot CUDA "
                     "events; SGLANG_SPEC_PDMUX_SERIALIZE=1 to restore M1 joins)",
                     self.ps.tp_rank,
+                )
+            if self.server_args.tp_size > 1:
+                # M3 step 2: the scheduler thread must never trigger a lazy
+                # cuModuleLoad at runtime -- its implicit context sync
+                # deadlocks symmetrically across ranks against spinning
+                # collective kernels (measured: TP2 concurrent wedged forever
+                # in triton _init_handles at the first bs=8 tick). Pre-load
+                # all scheduler-thread triton kernel specializations now,
+                # while the device is quiescent.
+                from sglang.srt.speculative.spec_utils import (
+                    warmup_scheduler_thread_triton_kernels,
+                )
+
+                warmup_scheduler_thread_triton_kernels(
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    getattr(self, "max_running_requests", None)
+                    or self.server_args.max_running_requests,
+                    self.device,
                 )
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
@@ -3130,6 +3153,16 @@ class Scheduler(
             # prefill-only batches (their relay is never consumed).
             new_batch.spec_pdmux_defer_prefill = (
                 self.spec_pdmux_concurrent
+                # M3 step 2 bring-up restriction (see environ.py): the
+                # deferral's wrapper re-plan between stash and flush is
+                # unsafe under TP>1 concurrency until fixed -- OFF at tp>1
+                # (SGLANG_SPEC_PDMUX_DEFER_PREFILL=1 forces it back on for
+                # debugging). TP1 keeps the M2.7 behavior unchanged.
+                and (
+                    self.server_args.tp_size == 1
+                    or envs.SGLANG_SPEC_PDMUX_DEFER_PREFILL.is_set()
+                    and envs.SGLANG_SPEC_PDMUX_DEFER_PREFILL.get()
+                )
                 and self.chunked_req is None
                 and new_batch.chunked_req is None
                 and not new_batch.is_prefill_only

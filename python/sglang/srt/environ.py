@@ -705,6 +705,15 @@ class Envs:
     # joins (and in-tick draft_extend + forward-stream FutureMap gathers)
     # under --enable-spec-pdmux, for bisection of concurrency bugs.
     SGLANG_SPEC_PDMUX_SERIALIZE = EnvBool(False)
+    # M3 step 2 bring-up restriction: the M2.7 deferred prefill draft-extend
+    # re-plans shared flashinfer wrappers between stash and flush; at TP>1
+    # concurrency this was caught mismatching plan vs batch (q.shape[0] 143
+    # vs qo_indptr[-1] 281 -> ValueError at c=32 TP4; size-compatible cases
+    # corrupt silently). The scheduler therefore keeps the deferral ON at
+    # tp_size==1 (M2.7 behavior unchanged) and OFF at tp>1 (synchronous
+    # M1-position prefill extend) unless this env is explicitly set =1
+    # (debugging the wrapper-plan lifetime fix).
+    SGLANG_SPEC_PDMUX_DEFER_PREFILL = EnvBool(True)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
