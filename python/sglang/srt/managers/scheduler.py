@@ -993,6 +993,13 @@ class Scheduler(
             self._spec_pdmux_union_bs = 0  # for the batch_is_full clear-on-shrink
             self._spec_pdmux_kv_throttled = False  # M2.3 admission-throttle latch (log-only)
             self._spec_pdmux_defer_ticks = 0  # M2.6 admission-pacing deferral counter
+            # M2.7 held admissions: finished prefill batches whose deferred
+            # draft prefill-extend the worker has not launched yet. Their
+            # requests join the slots one tick later, once the extend+relay
+            # stash are in the small stream's FIFO (so their first decode
+            # tick's gathers are ordered after the stash). Part of the union
+            # facade below (budgets/aborts must see them).
+            self._spec_pdmux_held_prefill: List[ScheduleBatch] = []
             # spec-pdmux M2.2 (step 7): event-based concurrency. The scheduler
             # side routes each decode slot's FutureMap gathers onto the SMALL
             # green-ctx stream (ordered after the schedule stream and the
@@ -2801,6 +2808,10 @@ class Scheduler(
         at most, and admission runs on the same tick as the clear)."""
         union = self.running_batch
         union.reqs = self.spec_pdmux_slots[0].reqs + self.spec_pdmux_slots[1].reqs
+        for hb in self._spec_pdmux_held_prefill:
+            # M2.7: held (not-yet-slotted) admissions are running requests —
+            # budgets, abort scans and idle checks must see them.
+            union.reqs.extend(hb.reqs)
         n = len(union.reqs)
         if n < self._spec_pdmux_union_bs:
             union.batch_is_full = False
@@ -3018,6 +3029,19 @@ class Scheduler(
         self._refresh_spec_pdmux_union()
         self._abort_on_running_timeout()  # scans the union facade
 
+        # M2.7: release held admissions once the worker has LAUNCHED their
+        # deferred draft prefill-extend (+ relay stash) — from then on the
+        # newcomers' first-tick gathers are small-stream FIFO-ordered after
+        # the stash. The flush runs inside run_batch, so the earliest release
+        # is the tick after the hold (one-tick deferral by construction).
+        if self._spec_pdmux_held_prefill and not (
+            self.model_worker.spec_pdmux_has_prefill_pending()
+        ):
+            for hb in self._spec_pdmux_held_prefill:
+                self._spec_pdmux_admit(hb)
+            self._spec_pdmux_held_prefill.clear()
+            self._refresh_spec_pdmux_union()
+
         # Merge the last prefill batch into its assigned slot (stock lines,
         # with the slot as merge target instead of running_batch).
         chunked_req_to_exclude = set()
@@ -3036,8 +3060,23 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
             if not self.last_batch.is_empty():
-                self._spec_pdmux_admit(self.last_batch)
-                self._refresh_spec_pdmux_union()
+                if getattr(
+                    self.last_batch, "spec_pdmux_defer_prefill", False
+                ) and self.model_worker.spec_pdmux_has_prefill_pending():
+                    # M2.7: the draft prefill-extend of this batch is still
+                    # pending on the worker — hold the requests out of the
+                    # slots until the flush launches it (release above).
+                    self._spec_pdmux_held_prefill.append(self.last_batch)
+                    self._refresh_spec_pdmux_union()
+                    logger.info(
+                        "[spec-pdmux-sched] tick=%d HOLD bs=%d (deferred "
+                        "prefill extend pending)",
+                        self.forward_ct + 1,
+                        self.last_batch.batch_size(),
+                    )
+                else:
+                    self._spec_pdmux_admit(self.last_batch)
+                    self._refresh_spec_pdmux_union()
 
         # Prefill-only requests never reach a decode tick; filter them out of
         # the slots so they don't linger (stock's is_prefill_only block).
@@ -3061,6 +3100,22 @@ class Scheduler(
             # merge time next tick (_spec_pdmux_admit). No slot tag here: an
             # untagged batch publishes to BOTH slots' FutureMap events, since
             # its requests may land in either slot.
+            #
+            # M2.7: defer the eager draft prefill-extend off this admission
+            # tick when there is decode work to hide its CPU launch cost
+            # under: some slot must hold an unfinished request (both slots
+            # empty -> nothing to overlap with; the synchronous fallback also
+            # keeps c=1 parity byte-identical and cannot deadlock). Chunked
+            # prefills keep the synchronous path (chunk bookkeeping is
+            # mutated between ticks; gsm8k-class prompts never chunk), as do
+            # prefill-only batches (their relay is never consumed).
+            new_batch.spec_pdmux_defer_prefill = (
+                self.spec_pdmux_concurrent
+                and self.chunked_req is None
+                and new_batch.chunked_req is None
+                and not new_batch.is_prefill_only
+                and sum(self._spec_pdmux_slot_sizes()) > 0
+            )
             sizes = self._spec_pdmux_slot_sizes()
             logger.info(
                 "[spec-pdmux-sched] tick=%d PREFILL bs=%d slot_sizes=%d/%d",
@@ -3703,9 +3758,14 @@ class Scheduler(
                             if not batch.spec_algorithm.is_none()
                             else {}
                         )
-                        if spec_pdmux_slot is not None:
+                        if spec_pdmux_slot is not None or (
+                            self.spec_pdmux_concurrent
+                            and getattr(batch, "spec_pdmux_defer_prefill", False)
+                        ):
                             # The worker defers draft_extend + the relay stash
-                            # to its flush; hand it the stash callback.
+                            # to its flush; hand it the stash callback. M2.7:
+                            # deferred-prefill batches (untagged) use the same
+                            # mechanism for their prefill-extend relay.
                             fwd_kwargs["on_relay"] = partial(
                                 self._relay_forward_payload, future_indices
                             )

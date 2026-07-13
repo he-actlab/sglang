@@ -1285,6 +1285,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
           extend+stash; prefill forwards (whole-batch on the large stream,
           untagged relay) wait these so their FutureMap/KV writes to possibly
           recycled rows are ordered after all in-flight small-stream stashes.
+        - prefill_pending (M2.7): the DEFERRED eager draft prefill-extends of
+          admitted prefill batches (FIFO list; multiple chunks / consecutive
+          prefills preserve draft-KV write order). The extend's ~26 ms of
+          eager CPU launches (prompt shapes vary -> no graph) stalled BOTH
+          partitions at the admission tick; deferring it to after the next
+          decode tick's verify is enqueued hides that CPU time under verify's
+          GPU execution. The scheduler holds the newcomers out of the slots
+          until the flush has LAUNCHED the extend+stash (spec-pdmux-sched
+          held admission), so their first FutureMap gathers are small-stream
+          FIFO-ordered after the relay stash.
+        - prefill_flush_done: recorded on the small stream after each
+          prefill_pending flush; joined by _spec_pdmux_join_flush_done.
         """
         dev = torch.get_device_module(self.device)
         return {
@@ -1292,7 +1304,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             "draft_done": [dev.Event(), dev.Event()],
             "verify_done": [dev.Event(), dev.Event()],
             "flush_done": [None, None],  # lazily created on first flush
+            "prefill_pending": [],  # M2.7 deferred prefill draft-extends
+            "prefill_flush_done": None,  # lazily created on first flush
         }
+
+    def spec_pdmux_has_prefill_pending(self) -> bool:
+        """M2.7: whether any admitted prefill's draft extend (+ relay stash)
+        has not been launched yet. The scheduler keeps the corresponding
+        requests OUT of the decode slots while this holds (their first
+        decode tick's FutureMap gathers must be enqueued after the stash)."""
+        if not self.server_args.enable_spec_pdmux:
+            return False
+        return bool(self._spec_pdmux_state["prefill_pending"])
 
     def flush_spec_pdmux_pending(self, slot: Optional[int] = None) -> None:
         """Launch any deferred draft_extend (+ FutureMap relay stash).
@@ -1308,6 +1331,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
           so a pending extend is always launched before the scheduler can free
           and recycle the rows it reads/stashes (frees happen in
           process_batch_result, which runs after these points each iteration).
+
+        slot=None (the both-slot call sites above) also flushes the deferred
+        PREFILL extends (M2.7) — same launched-before-free invariant. The
+        per-slot decode-tick call (slot=int) deliberately does NOT: the
+        prefill extend's ~26 ms of eager CPU launches must land AFTER the
+        tick's verify is enqueued (see forward_batch_generation), not before
+        the gathers.
         """
         st = self._spec_pdmux_state
         dev = torch.get_device_module(self.device)
@@ -1366,14 +1396,65 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if st["flush_done"][s] is None:
                 st["flush_done"][s] = dev.Event()
             st["flush_done"][s].record(small)
+        if slot is None:
+            self._flush_spec_pdmux_prefill_pending()
+
+    def _flush_spec_pdmux_prefill_pending(self) -> None:
+        """M2.7: launch the deferred eager draft prefill-extends (+ relay
+        stash) on the SMALL stream. Data dependency: the target prefill's
+        outputs (next_token_ids / hidden_states) and its in-place input_ids
+        rotation source — carried by the per-admission prefill_done event
+        recorded on the large stream right after the target forward+publish.
+        The relay stash runs here on the small stream, so the newcomers'
+        first-tick gathers (also small-stream) are FIFO-ordered after it;
+        the scheduler's held admission guarantees those gathers are ENQUEUED
+        after this flush."""
+        st = self._spec_pdmux_state
+        pending = st["prefill_pending"]
+        if not pending:
+            return
+        dev = torch.get_device_module(self.device)
+        small = self._spec_pdmux_small_stream
+        while pending:
+            p = pending.pop(0)
+            small.wait_event(p["prefill_done"])
+            with dev.stream(small):
+                # Caching-allocator insurance (same rationale as the decode
+                # pending flush): these tensors' home streams are the large /
+                # schedule streams; their Python refs can drop right after
+                # this flush while the small stream still executes the extend.
+                record_stream_each(p["used_tensors"], small)
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft_extend"),
+                ):
+                    next_draft_input = self.draft_worker._draft_extend_for_prefill(
+                        p["batch"],
+                        p["hidden_states"],
+                        p["next_token_ids"],
+                        p["mm_input_embeds"],
+                    )
+                # FutureMap stash on the small stream (extend outputs:
+                # topk_p/topk_index/bonus/hidden). The scheduler-side shell
+                # spec_info is filled by the newcomers' first-tick gathers.
+                p["on_relay"](SimpleNamespace(next_draft_input=next_draft_input))
+        if st["prefill_flush_done"] is None:
+            st["prefill_flush_done"] = dev.Event()
+        st["prefill_flush_done"].record(small)
 
     def _spec_pdmux_join_flush_done(self) -> None:
         """Make the CURRENT stream wait both slots' last deferred-extend+stash
-        (no-op for never-flushed slots). Used at prefill forwards: their relay
-        stash / KV writes may target rows recycled from retired requests whose
-        stale stash is still in flight on the small stream."""
+        and the last deferred prefill-extend flush (no-op for never-flushed
+        slots). Used at prefill forwards: their relay stash / KV writes may
+        target rows recycled from retired requests whose stale stash is still
+        in flight on the small stream."""
         cur = torch.get_device_module(self.device).current_stream()
-        for ev in self._spec_pdmux_state["flush_done"]:
+        st = self._spec_pdmux_state
+        for ev in st["flush_done"] + [st["prefill_flush_done"]]:
             if ev is not None:
                 cur.wait_event(ev)
 
@@ -1530,6 +1611,73 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+
+            # spec-pdmux M2.7: DEFER the eager draft prefill-extend off the
+            # admission tick. Its ~26 ms of CPU launches (prompt shapes vary,
+            # so no CUDA graph) used to stall both partitions here — nothing
+            # else was enqueued behind the 14 ms target prefill. Stash it;
+            # the next decode tick flushes it AFTER its verify is enqueued,
+            # so the launch cost hides under verify's GPU execution. The
+            # scheduler only sets spec_pdmux_defer_prefill when there are
+            # running requests to overlap with (both slots empty -> the
+            # synchronous path below, byte-identical to before; also keeps
+            # c=1 parity trivially) and holds these requests out of the
+            # slots until the flush has launched the extend+stash.
+            if (
+                self._spec_pdmux_concurrent
+                and on_relay is not None
+                and getattr(batch, "spec_pdmux_defer_prefill", False)
+                and not batch.forward_mode.is_idle()
+            ):
+                dev = torch.get_device_module(self.device)
+                prefill_done = dev.Event()
+                prefill_done.record(dev.current_stream())
+                self._spec_pdmux_state["prefill_pending"].append(
+                    {
+                        # copy.copy at exactly the sync call point: isolates
+                        # the extend's SB rebinds/in-place input_ids rotation
+                        # source set from the scheduler's post-tick mutations
+                        # / _forward_isolation restore (same pattern as the
+                        # deferred decode extend).
+                        "batch": copy.copy(batch),
+                        # GPU refs frozen before the scheduler's copy_to_cpu
+                        # rebinds next_token_ids (and optionally
+                        # logits_output.hidden_states) to host tensors.
+                        "hidden_states": batch_output.logits_output.hidden_states,
+                        "next_token_ids": batch_output.next_token_ids,
+                        "mm_input_embeds": batch_output.logits_output.mm_input_embeds,
+                        "on_relay": on_relay,
+                        "prefill_done": prefill_done,
+                        "used_tensors": (
+                            batch.input_ids,
+                            batch_output.next_token_ids,
+                            batch_output.logits_output.hidden_states,
+                            batch.seq_lens,
+                            batch.seq_lens_cpu,
+                            batch.req_pool_indices,
+                            batch.out_cache_loc,
+                        ),
+                    }
+                )
+                # Shell next_draft_input: under the overlap relay the tensor
+                # fields are REBOUND by the first-tick FutureMap gathers
+                # (_resolve_spec_extras) and filter/merge only touch
+                # future_indices (set by run_batch right after return); only
+                # the metadata must match the real extend's return. The
+                # draft_probs sentinel keeps the gather's rebind condition
+                # (`draft_input.draft_probs is not None`) true under
+                # rejection sampling.
+                batch_output.next_draft_input = EagleDraftInput(
+                    draft_probs=(
+                        torch.empty((0,), device=self.device)
+                        if self.server_args.speculative_use_rejection_sampling
+                        else None
+                    ),
+                    num_tokens_per_req=1,
+                    num_tokens_for_logprob_per_req=1,
+                )
+                batch_output.spec_pdmux_relay_deferred = True
+                return batch_output
 
             # Draft prefill
             # spec-pdmux: _draft_stream_region (outermost) runs the drafter on
@@ -1700,6 +1848,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 }
                 batch_output.spec_pdmux_relay_deferred = True
+                # M2.7: launch any deferred prefill draft-extend NOW — this
+                # tick's verify is already enqueued on the large stream, so
+                # the extend's ~26 ms of eager CPU launches (onto the small
+                # stream) execute under verify's GPU time instead of holding
+                # both partitions idle at the admission tick.
+                self._flush_spec_pdmux_prefill_pending()
             else:
                 # spec-pdmux: draft_extend on the SMALL green-ctx stream; the
                 # exit join precedes the return -- the FutureMap relay reads
