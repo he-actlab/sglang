@@ -1245,7 +1245,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         small = get_spec_streams()[1]
         logger.info(
-            "[spec-pdmux] %s: draft/draft_extend compute -> SMALL green-ctx stream",
+            "[spec-pdmux r%d] %s: draft/draft_extend compute -> SMALL green-ctx stream",
+            self.tp_rank,
             type(self).__name__,
         )
         return small

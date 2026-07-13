@@ -7054,9 +7054,14 @@ class ServerArgs:
             assert (
                 self.speculative_algorithm is not None
             ), "--enable-spec-pdmux requires a speculative algorithm."
-            assert (
-                self.tp_size == 1
-            ), "--enable-spec-pdmux currently requires tp_size=1."
+            # M3 step 1: TP{2,4} allowed; the scheduler init additionally
+            # refuses tp_size>1 without SGLANG_SPEC_PDMUX_SERIALIZE=1 until
+            # the dedicated draft communicator lands (M3 step 2).
+            assert self.tp_size in (
+                1,
+                2,
+                4,
+            ), "--enable-spec-pdmux supports tp_size in {1, 2, 4}."
             assert self.device == "cuda", "--enable-spec-pdmux requires CUDA."
             # M2.0 (two scheduler sub-batch slots): paths not mirrored by the
             # spec-pdmux scheduler branch must be off.

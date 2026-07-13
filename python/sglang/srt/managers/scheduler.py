@@ -985,6 +985,20 @@ class Scheduler(
         self.spec_pdmux_slots: Optional[List[ScheduleBatch]] = None
         self.spec_pdmux_concurrent = False
         if self.server_args.enable_spec_pdmux:
+            # M3 step 1: TP>1 runs the single-communicator path, which is
+            # only safe while the M1 serialized joins keep the large/small
+            # streams from issuing NCCL work concurrently. Concurrency at
+            # TP>1 is impossible-by-construction until step 2.
+            if (
+                self.server_args.tp_size > 1
+                and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+            ):
+                raise RuntimeError(
+                    "[spec-pdmux] M3 step 2 pending: TP>1 requires "
+                    "SGLANG_SPEC_PDMUX_SERIALIZE=1 (M1 serialized joins keep "
+                    "the single NCCL communicator safe) until the dedicated "
+                    "draft communicator lands."
+                )
             self.spec_pdmux_slots = [
                 ScheduleBatch(reqs=[], batch_is_full=False),
                 ScheduleBatch(reqs=[], batch_is_full=False),
@@ -1023,8 +1037,9 @@ class Scheduler(
             self._spec_pdmux_prefill_relay_pending = [False, False]
             if self.spec_pdmux_concurrent:
                 logger.info(
-                    "[spec-pdmux] M2.2 concurrent mode ON (per-slot CUDA "
-                    "events; SGLANG_SPEC_PDMUX_SERIALIZE=1 to restore M1 joins)"
+                    "[spec-pdmux r%d] M2.2 concurrent mode ON (per-slot CUDA "
+                    "events; SGLANG_SPEC_PDMUX_SERIALIZE=1 to restore M1 joins)",
+                    self.ps.tp_rank,
                 )
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
@@ -2872,7 +2887,8 @@ class Scheduler(
             tgt = 0 if base[0] <= base[1] else 1
             parts[tgt] = batch
             logger.info(
-                "[spec-pdmux-sched] unsplittable prefill batch bs=%d -> slot=%d whole",
+                "[spec-pdmux-sched r%d] unsplittable prefill batch bs=%d -> slot=%d whole",
+                self.ps.tp_rank,
                 batch.batch_size(),
                 tgt,
             )
@@ -2904,8 +2920,9 @@ class Scheduler(
                 slot.merge_batch(parts[t])
         sizes = self._spec_pdmux_slot_sizes()
         logger.info(
-            "[spec-pdmux-sched] tick=%d ADMIT n0=%d n1=%d slot_sizes=%d/%d "
+            "[spec-pdmux-sched r%d] tick=%d ADMIT n0=%d n1=%d slot_sizes=%d/%d "
             "free_tok=%d evict_tok=%d",
+            self.ps.tp_rank,
             self.forward_ct + 1,
             len(keep[0]),
             len(keep[1]),
@@ -2994,8 +3011,9 @@ class Scheduler(
         if ok == self._spec_pdmux_kv_throttled:  # log state changes only
             self._spec_pdmux_kv_throttled = not ok
             logger.info(
-                "[spec-pdmux-sched] tick=%d KV-THROTTLE %s: free+evict=%d "
+                "[spec-pdmux-sched r%d] tick=%d KV-THROTTLE %s: free+evict=%d "
                 "projected_need=%d union_bs=%d",
+                self.ps.tp_rank,
                 self.forward_ct + 1,
                 "ENTER" if not ok else "EXIT",
                 free,
@@ -3069,8 +3087,9 @@ class Scheduler(
                     self._spec_pdmux_held_prefill.append(self.last_batch)
                     self._refresh_spec_pdmux_union()
                     logger.info(
-                        "[spec-pdmux-sched] tick=%d HOLD bs=%d (deferred "
+                        "[spec-pdmux-sched r%d] tick=%d HOLD bs=%d (deferred "
                         "prefill extend pending)",
+                        self.ps.tp_rank,
                         self.forward_ct + 1,
                         self.last_batch.batch_size(),
                     )
@@ -3118,7 +3137,8 @@ class Scheduler(
             )
             sizes = self._spec_pdmux_slot_sizes()
             logger.info(
-                "[spec-pdmux-sched] tick=%d PREFILL bs=%d slot_sizes=%d/%d",
+                "[spec-pdmux-sched r%d] tick=%d PREFILL bs=%d slot_sizes=%d/%d",
+                self.ps.tp_rank,
                 self.forward_ct + 1,
                 new_batch.batch_size(),
                 sizes[0],
@@ -3145,8 +3165,9 @@ class Scheduler(
                 slot.spec_pdmux_slot = idx
                 sizes = self._spec_pdmux_slot_sizes()
                 logger.info(
-                    "[spec-pdmux-sched] tick=%d DECODE slot=%d bs=%d "
+                    "[spec-pdmux-sched r%d] tick=%d DECODE slot=%d bs=%d "
                     "slot_sizes=%d/%d free_tok=%d",
+                    self.ps.tp_rank,
                     self.forward_ct + 1,
                     idx,
                     slot.batch_size(),

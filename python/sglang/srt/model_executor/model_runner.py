@@ -566,8 +566,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )[0]
             logger.info(
                 "[spec-pdmux] forward_stream -> LARGE green-ctx stream "
-                "(%d SMs; is_draft_worker=%s)",
+                "(%d SMs; gpu=%d tp_rank=%d is_draft_worker=%s)",
                 large_sm,
+                self.gpu_id,
+                self.tp_rank,
                 self.is_draft_worker,
             )
         else:
