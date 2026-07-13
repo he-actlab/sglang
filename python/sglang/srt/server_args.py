@@ -2421,6 +2421,18 @@ class ServerArgs:
         Optional[str],
         "SM split for --enable-spec-pdmux as 'LARGE,SMALL' (e.g. '92,16'). Default: SMALL=16 rounded up to the arch granularity, LARGE=the rest (92,16 on a 108-SM A100).",
     ] = None
+    spec_pdmux_admit_min_new: A[
+        int,
+        "spec-pdmux M2.6 admission pacing: defer prefill admission until this many requests are waiting (amortizes the per-prefill-tick fixed cost — the eager, CPU-launch-bound draft prefill-extend and the two-slot pipeline drain — over several admissions). 1 disables pacing (admit as stock does). Only active while the union running bs >= --spec-pdmux-admit-pace-floor, so low-concurrency workloads and ramp-up/drain admit immediately.",
+    ] = 4
+    spec_pdmux_admit_pace_floor: A[
+        int,
+        "spec-pdmux M2.6 admission pacing: pacing is active only while the union running bs is at least this (below it, an idle slot costs more than a prefill stall; also keeps c=1 parity byte-exact).",
+    ] = 16
+    spec_pdmux_admit_max_defer_ticks: A[
+        int,
+        "spec-pdmux M2.6 admission pacing: hard bound on how many scheduler ticks a waiting request may be deferred (bounds the TTFT cost; ~20-25 ms per decode tick at slot-bs 16).",
+    ] = 16
 
     # -------------------------------------------------------------------------
     # Model weight update and weight loading

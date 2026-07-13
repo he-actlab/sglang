@@ -992,6 +992,7 @@ class Scheduler(
             self.spec_pdmux_next_slot = 0  # tick-parity pointer (decode)
             self._spec_pdmux_union_bs = 0  # for the batch_is_full clear-on-shrink
             self._spec_pdmux_kv_throttled = False  # M2.3 admission-throttle latch (log-only)
+            self._spec_pdmux_defer_ticks = 0  # M2.6 admission-pacing deferral counter
             # spec-pdmux M2.2 (step 7): event-based concurrency. The scheduler
             # side routes each decode slot's FutureMap gathers onto the SMALL
             # green-ctx stream (ordered after the schedule stream and the
@@ -2914,6 +2915,45 @@ class Scheduler(
             if not s.is_empty()
         )
 
+    def _spec_pdmux_admit_pacing_ok(self) -> bool:
+        """spec-pdmux M2.6: admission pacing — batch prefill admissions.
+
+        Measured (nsys 20260712T2110, c=32 @76,32, uncapped): admissions
+        arrive ~one per retirement and EACH prefill tick freezes the decode
+        pipeline for ~51 ms mean (183 stalls = 30% of steady wall):
+        ~14 ms of real target-prefill compute, ~26 ms of eager, CPU-launch-
+        bound draft prefill-extend (3.5 ms GPU-busy in a 25.9 ms span — the
+        kernel COUNT is per-forward, not per-request), plus the two-slot
+        pipeline drain/refill. The per-tick fixed cost is amortized by
+        admitting several waiting requests in ONE prefill tick: defer
+        admission until spec_pdmux_admit_min_new are waiting, bounded by
+        spec_pdmux_admit_max_defer_ticks (TTFT bound), and only while the
+        union bs >= spec_pdmux_admit_pace_floor (an idle slot at low
+        concurrency costs more than a stall; also keeps c=1 parity exact —
+        pacing never activates there).
+
+        A mid-chunk prefill (self.chunked_req) is never deferred: the chunk
+        must finish before its KV/state can progress.
+        """
+        n_min = self.server_args.spec_pdmux_admit_min_new
+        if n_min <= 1 or self.chunked_req is not None:
+            return True
+        if not self.waiting_queue:
+            self._spec_pdmux_defer_ticks = 0
+            return True  # nothing to admit; keep the counter cold
+        union_bs = sum(self._spec_pdmux_slot_sizes())
+        if (
+            union_bs < self.server_args.spec_pdmux_admit_pace_floor
+            or len(self.waiting_queue) >= n_min
+        ):
+            self._spec_pdmux_defer_ticks = 0
+            return True
+        self._spec_pdmux_defer_ticks = getattr(self, "_spec_pdmux_defer_ticks", 0) + 1
+        if self._spec_pdmux_defer_ticks >= self.server_args.spec_pdmux_admit_max_defer_ticks:
+            self._spec_pdmux_defer_ticks = 0
+            return True
+        return False
+
     def _spec_pdmux_kv_admission_ok(self) -> bool:
         """spec-pdmux M2.3: token-pool admission guard for the ~2x in-flight
         verify-tree reality. Stock's runtime KV protection is per-batch
@@ -3008,8 +3048,10 @@ class Scheduler(
 
         # Stock prefill admission against the union facade (PrefillAdder and
         # the running_bs budget only read union.reqs / batch_is_full), behind
-        # the M2.3 two-in-flight-verify-tree KV guard.
-        if self._spec_pdmux_kv_admission_ok():
+        # the M2.3 two-in-flight-verify-tree KV guard and the M2.6 admission
+        # pacing (batch admissions to amortize the per-prefill-tick fixed
+        # cost; see _spec_pdmux_admit_pacing_ok).
+        if self._spec_pdmux_kv_admission_ok() and self._spec_pdmux_admit_pacing_ok():
             new_batch = self.get_new_batch_prefill()
         else:
             new_batch = None
