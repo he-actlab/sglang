@@ -79,6 +79,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
+    draft_dup_tp_context,
     draft_tp_context,
     fast_sample,
     generate_token_bitmask,
@@ -389,6 +390,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        if server_args.enable_spec_pdmux and server_args.tp_size > 1:
+            # spec-pdmux M3 step 2: every draft-side collective region (draft,
+            # draft_extend incl. the deferred flushes, and the draft/extend
+            # graph captures) already wraps itself in self.draft_tp_context --
+            # swap in the dedicated-draft-communicator context so those
+            # regions issue on the DUPLICATE TP group instead of sharing
+            # verify's communicator. See spec_utils.draft_dup_tp_context.
+            self.draft_tp_context = draft_dup_tp_context
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)

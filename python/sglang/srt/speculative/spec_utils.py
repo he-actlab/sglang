@@ -11,7 +11,9 @@ from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_pdmux_status,
     patch_tensor_parallel_group,
+    set_pdmux_status,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
@@ -514,6 +516,120 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
+
+
+def warmup_scheduler_thread_triton_kernels(
+    req_to_token_pool,
+    token_to_kv_pool_allocator,
+    max_running_requests: Optional[int],
+    device,
+) -> None:
+    """spec-pdmux M3 step 2: pre-load every specialization of the SCHEDULER-
+    thread triton kernels while the device is quiescent (init time).
+
+    Why (measured deadlock, TP2 concurrent, first 8/8 tick): under overlap
+    scheduling the scheduler thread and the forward thread both issue CUDA
+    work. eagle_prepare_for_decode's assign_req_to_token_pool JIT-specializes
+    on bs_upper = next_power_of_2(bs), so the first tick at a new pow2 bucket
+    triggers a cuModuleLoad ON THE SCHEDULER THREAD at an arbitrary point
+    relative to the forward thread's collective enqueue. The load's implicit
+    context synchronization then cannot complete while a collective kernel is
+    resident spinning for its peer, and the peer rank is wedged the same
+    symmetric way -> cross-rank deadlock (both schedulers stuck forever in
+    triton _init_handles, GPUs pinned at 100%, forward threads' later
+    launches never execute). TP1 never deadlocks (no spinning collectives:
+    the sync just drains); forward-THREAD lazy loads are also safe (every
+    rank's forward thread hits the same first-use at the same logical point
+    in the identical enqueue sequence, so the in-flight prefix is pairwise
+    matched and drains). The invariant this function maintains: THE SCHEDULER
+    THREAD MUST NEVER LAZY-LOAD A MODULE AT RUNTIME when spec-pdmux runs
+    concurrently at tp>1.
+
+    Coverage: assign_req_to_token_pool over (a) all pow2 bs_upper buckets up
+    to max_running_requests and (b) both 16B-alignment classes of
+    out_cache_loc (the runtime tensor is an allocator free-list slice whose
+    base offset varies, and triton specializes pointers on divisibility by
+    16). All other args keep their runtime dtype/alignment classes: the pool
+    tensors themselves and fresh (hence 16B-aligned) int tensors.
+    gather_spec_extras (the other scheduler-thread triton kernel) is warmed
+    at FutureMap buffer init instead -- its buffer shapes/dtypes only exist
+    there (see overlap_utils)."""
+    from sglang.srt.utils import next_power_of_2
+
+    req_to_token = req_to_token_pool.req_to_token
+    free_slots = getattr(token_to_kv_pool_allocator, "free_slots", None)
+    cache_loc_dtype = (
+        free_slots.dtype if isinstance(free_slots, torch.Tensor) else torch.int64
+    )
+    req_pool_indices = torch.zeros(1, dtype=torch.int64, device=device)
+    # runtime start/end = cur/nxt_kv_lens_cpu (int32) .to(device): fresh, aligned
+    kv_lens = torch.zeros(1, dtype=torch.int32, device=device)
+    out_buf = torch.zeros(64, dtype=cache_loc_dtype, device=device)
+    top = next_power_of_2(max(1, max_running_requests or 256))
+    n = 0
+    bs_upper = 1
+    while bs_upper <= top:
+        for out_cache_loc in (out_buf, out_buf[1:]):
+            # grid=(1,), kv_start == kv_end == 0 -> the kernel body copies
+            # nothing; this only forces compile + cuModuleLoad of the variant.
+            assign_req_to_token_pool[(1,)](
+                req_pool_indices,
+                req_to_token,
+                kv_lens,
+                kv_lens,
+                out_cache_loc,
+                req_to_token.shape[1],
+                bs_upper,
+            )
+            n += 1
+        bs_upper *= 2
+    torch.get_device_module(device).synchronize()
+    logger.info(
+        "[spec-pdmux] scheduler-thread triton warmup: assign_req_to_token_pool "
+        "pre-loaded (%d variants, bs_upper<=%d, both out_cache_loc alignments)",
+        n,
+        top,
+    )
+
+
+@contextmanager
+def draft_dup_tp_context(tp_group: Optional[GroupCoordinator] = None):
+    """spec-pdmux M3 step 2: the DEDICATED DRAFT COMMUNICATOR region.
+
+    While active, get_tp_group() resolves to the DUPLICATE TP group
+    (_PDMUX_PREFILL_TP_GROUP: its own NCCL communicator + per-group custom-AR
+    IPC buffers, created by initialize_model_parallel(duplicate_tp_group=True)
+    -- the same substrate pdmux uses for its prefill TP group). Every
+    collective the enclosed draft-side region issues (per-layer all-reduces,
+    the embed all-reduce, the logits all-gather -- all call-time resolved via
+    get_tp_group()) therefore lands on the draft communicator, so draft
+    collectives on the SMALL green-ctx stream never share an NCCL/custom-AR
+    communicator with verify collectives on the LARGE stream. Concurrent
+    collective issue across the two partitions becomes safe (probe evidence:
+    dev-env/greenctx_nccl_probe.py -- dual-communicator stable, ARs confined
+    to the small partition).
+
+    Installed as the draft worker's ``draft_tp_context`` when
+    --enable-spec-pdmux runs at tp_size>1, so it scopes exactly the regions
+    the existing wrappers cover: draft(), draft_extend (deferred decode flush
+    + prefill-extend path) and the draft/extend CUDA-graph CAPTURES
+    (init_cuda_graphs wraps _capture_cuda_graphs; graph_capture(stream=)
+    resolves get_tp_group() at capture time, so the captured kernels embed
+    the duplicate communicator). The ``tp_group`` argument is accepted for
+    call-site compatibility with draft_tp_context and ignored -- the target
+    group is always the duplicate group.
+
+    Reentrant (save/restore, unlike patch_tensor_parallel_group's
+    no-nesting assert): StandaloneDraftWorker.init_cuda_graphs wraps
+    super().init_cuda_graphs(), which wraps again. Binding happens at CPU
+    enqueue time on the serial scheduler thread, so scoping is race-free.
+    """
+    prev = get_pdmux_status()
+    set_pdmux_status(True)
+    try:
+        yield
+    finally:
+        set_pdmux_status(prev)
 
 
 def spec_stage_span(name: str):

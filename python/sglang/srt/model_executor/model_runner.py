@@ -1308,10 +1308,58 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 decode_context_parallel_size=self.dcp_size,
-                duplicate_tp_group=self.server_args.enable_pdmux,
+                # spec-pdmux M3 step 2: at tp_size>1 the drafter is TP-sharded
+                # and issues collectives from the SMALL green-ctx stream while
+                # verify issues from the LARGE one -- concurrent issue on one
+                # communicator is unsafe, so the draft side gets the DUPLICATE
+                # TP group (own pynccl comm + custom-AR IPC buffers) as a
+                # dedicated draft communicator (spec_utils.draft_dup_tp_context
+                # scopes it over the draft regions + graph captures).
+                duplicate_tp_group=self.server_args.enable_pdmux
+                or (self.server_args.enable_spec_pdmux and self.tp_size > 1),
                 enable_symm_mem=self.server_args.enable_symm_mem,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
             )
+            if self.server_args.enable_spec_pdmux and self.tp_size > 1:
+                from sglang.srt.distributed import parallel_state as _ps
+
+                _dup = _ps._PDMUX_PREFILL_TP_GROUP
+                # M3 step 2 deviation (measured deadlock): the sgl-kernel
+                # custom-AR V2 one-shot PUSH protocol (2-epoch push buffers,
+                # spin-poll kernels, full-device-sized grids) wedges once
+                # draft and verify collectives run CONCURRENTLY on the two
+                # green-ctx partitions (first 1/1 concurrent tick at TP2:
+                # cuda-gdb coredumps show all_reduce_one_shot_push_kernel
+                # pairs resident forever, GPUs pinned at 100%; reproduced
+                # with the dup group's CA already off -- both stuck kernels
+                # then belong to the _TP CA object, i.e. the hazard is the
+                # CA-V2 protocol under concurrent multi-stream issue, not
+                # which group owns the object). Concurrent CA+CA was never
+                # probe-validated (greenctx_nccl_probe's occupant was a
+                # GEMM). Under spec-pdmux at tp>1, route ALL TP all-reduces
+                # (draft comm AND verify comm) over pynccl: probe-measured
+                # 15-27us in the relevant size band (vs 14-19us custom AR),
+                # and NCCL's protocol is multi-comm-safe by design. Stock
+                # servers (no --enable-spec-pdmux) are unaffected.
+                _dup.ca_comm = None
+                _ps._TP.ca_comm = None
+                logger.info(
+                    "[spec-pdmux r%d] dedicated DRAFT communicator ready: "
+                    "dup group '%s' pynccl=%s(enabled=%s) custom_ar=%s(%s) "
+                    "mscclpp=%s symm_mem=%s",
+                    self.tp_rank,
+                    _dup.unique_name,
+                    _dup.pynccl_comm is not None,
+                    _dup.pynccl_comm is not None and not _dup.pynccl_comm.disabled,
+                    _dup.ca_comm is not None,
+                    (
+                        "off"
+                        if _dup.ca_comm is None
+                        else ("disabled" if _dup.ca_comm.disabled else "enabled")
+                    ),
+                    _dup.pymscclpp_comm is not None,
+                    _dup.torch_symm_mem_comm is not None,
+                )
             initialize_dp_attention(
                 server_args=self.server_args,
                 model_config=self.model_config,

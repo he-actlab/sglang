@@ -1681,6 +1681,15 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
 
 
+def get_pdmux_status() -> bool:
+    """Whether get_tp_group() currently resolves to the duplicate TP group.
+
+    spec-pdmux (M3 step 2) uses this for reentrant save/restore around the
+    draft-side regions it routes to the duplicate group (see
+    spec_utils.draft_dup_tp_context)."""
+    return _ENABLE_PDMUX_P_TP
+
+
 def get_tp_group() -> GroupCoordinator:
     if _ENABLE_PDMUX_P_TP:
         assert (

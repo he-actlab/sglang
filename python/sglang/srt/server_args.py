@@ -7054,14 +7054,24 @@ class ServerArgs:
             assert (
                 self.speculative_algorithm is not None
             ), "--enable-spec-pdmux requires a speculative algorithm."
-            # M3 step 1: TP{2,4} allowed; the scheduler init additionally
-            # refuses tp_size>1 without SGLANG_SPEC_PDMUX_SERIALIZE=1 until
-            # the dedicated draft communicator lands (M3 step 2).
+            # M3 step 2: TP{2,4} run concurrently on the dedicated draft
+            # communicator (duplicate TP group; model_runner passes
+            # duplicate_tp_group at tp_size>1, spec_utils.draft_dup_tp_context
+            # scopes it over the draft-side regions + graph captures).
             assert self.tp_size in (
                 1,
                 2,
                 4,
             ), "--enable-spec-pdmux supports tp_size in {1, 2, 4}."
+            # The duplicate group must not carry mscclpp/symm-mem communicators
+            # (unvalidated as a SECOND comm set beside verify's; the probe
+            # covered pynccl + custom one-shot AR only).
+            assert (
+                not self.enable_symm_mem and not self.enable_mscclpp
+            ), "--enable-spec-pdmux: mscclpp/symm-mem all-reduce must stay off."
+            assert (
+                not self.enable_dp_attention
+            ), "--enable-spec-pdmux is incompatible with --enable-dp-attention."
             assert self.device == "cuda", "--enable-spec-pdmux requires CUDA."
             # M2.0 (two scheduler sub-batch slots): paths not mirrored by the
             # spec-pdmux scheduler branch must be off.
