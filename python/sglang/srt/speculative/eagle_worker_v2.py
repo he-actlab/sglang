@@ -669,8 +669,255 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    @functools.cached_property
+    def _spec_pdmux_input_parallel(self) -> bool:
+        """spec-pdmux Design-InputParallel: full (unsharded) drafter per rank,
+        each rank drafts only its deterministic 1/tp_size of the batch, ONE
+        draft-token all-gather per decode iteration. cached_property so
+        StandaloneDraftWorker (super-less __init__) inherits it; both
+        __init__s set server_args before first use."""
+        return (
+            self.server_args.enable_spec_pdmux
+            and self.server_args.tp_size > 1
+            and self.server_args.spec_pdmux_draft_mode == "input-parallel"
+        )
+
+    def _ip_partition(self, batch: ScheduleBatch) -> List[List[int]]:
+        """Batch positions owned by each rank: req_pool_idx % tp_size.
+
+        Deterministic and rank-identical (computed from lockstep host state:
+        every rank's scheduler holds the same reqs in the same order with the
+        same pool indices — the proven M3 lockstep invariant), and STICKY per
+        request for its lifetime (the pool index never changes while the
+        request runs), so a request's draft KV always lives on the rank that
+        drafts it.
+
+        Reads the SNAPSHOT `_spec_pdmux_ip_pool_idx` when present (attached
+        to the deferred-extend batch copy at stash time): by flush time a
+        finished request's live `req.req_pool_idx` may already be cleared to
+        None by process_batch_result — the same reason the deferral freezes
+        GPU refs. Live batches (draft path, in-tick extend) read the reqs."""
+        idxs = getattr(batch, "_spec_pdmux_ip_pool_idx", None)
+        if idxs is None:
+            idxs = [r.req_pool_idx for r in batch.reqs]
+        tp = self.server_args.tp_size
+        pos_by_rank: List[List[int]] = [[] for _ in range(tp)]
+        for i, idx in enumerate(idxs):
+            pos_by_rank[idx % tp].append(i)
+        return pos_by_rank
+
+    @functools.cached_property
+    def _ip_h2d_bufs(self):
+        """Design-InputParallel pinned H2D staging, keyed by call site.
+
+        `torch.tensor(list, device='cuda')` stages through a TEMPORARY
+        pageable host buffer, so torch must run the copy SYNCHRONOUSLY —
+        on the (busy) small stream that parks the CPU until every queued
+        draft/extend kernel drains (measured: extend cpu-enq p50 19.0 ms,
+        draft 5.4 ms at 32B-TP4 c=32). Persistent pinned staging + a
+        non_blocking copy removes the sync. Double-buffered per key with an
+        H2D-done event, mirroring flashinfer's plan_pinned_ws_rotate (M2.6
+        hazard fix 2): the NEXT tick's CPU write must not overwrite pinned
+        bytes a still-queued H2D hasn't read."""
+        return {}
+
+    def _ip_stage_i64(self, key: str, values: List[int]) -> torch.Tensor:
+        n = len(values)
+        bufs = self._ip_h2d_bufs
+        ent = bufs.get(key)
+        if ent is None or ent[0][0][0].shape[0] < n:
+            cap = max(64, 2 * n)
+            ent = (
+                [
+                    (
+                        torch.empty(cap, dtype=torch.int64, pin_memory=True),
+                        torch.empty(cap, dtype=torch.int64, device=self.device),
+                        torch.get_device_module(self.device).Event(),
+                    )
+                    for _ in range(2)
+                ],
+                [0],
+            )
+            bufs[key] = ent
+        pair, turn = ent
+        pinned, gpu, ev = pair[turn[0]]
+        turn[0] ^= 1
+        ev.synchronize()  # prior H2D from THIS pinned buffer has been read
+        pinned[:n].copy_(torch.tensor(values, dtype=torch.int64))
+        gpu[:n].copy_(pinned[:n], non_blocking=True)  # current (small) stream
+        ev.record(torch.get_device_module(self.device).current_stream())
+        return gpu[:n]
+
+    def _ip_local_batch_view(
+        self, batch: ScheduleBatch, my_pos: List[int], key: str
+    ):
+        """Shallow local view of `batch` restricted to this rank's owned rows.
+        Returns (local_batch, owned_idx_gpu). Only the fields the draft-side
+        prepare/forward paths consume are re-sliced; everything else is
+        shared by reference (the copy isolates rebinds from the caller)."""
+        owned_idx = self._ip_stage_i64(key, my_pos)
+        local = copy.copy(batch)
+        local.reqs = [batch.reqs[i] for i in my_pos]
+        local.seq_lens = batch.seq_lens[owned_idx]
+        local.req_pool_indices = batch.req_pool_indices[owned_idx]
+        if batch.seq_lens_cpu is not None:
+            local.seq_lens_cpu = batch.seq_lens_cpu[torch.tensor(my_pos)]
+            local.seq_lens_sum = int(local.seq_lens_cpu.sum())
+        else:
+            local.seq_lens_cpu = None
+            local.seq_lens_sum = None
+        return local, owned_idx
+
+    def _draft_input_parallel(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        """Design-InputParallel decode draft.
+
+        This rank runs prepare+the K-1 draft forwards ONLY for its owned rows
+        (graph runner pads the local bs to its bucket); ONE all-gather on the
+        dedicated draft communicator distributes every rank's chain tokens
+        (bs_local x num_steps int64, zero-padded to the rank-max count); the
+        full-batch verify tree is then built IDENTICALLY on every rank —
+        bonus_tokens / seq_lens are already full-batch and rank-identical,
+        and for topk=1 chain drafting parent_list / top_scores_index are
+        runtime constants. Verify's inputs are therefore byte-identical
+        across ranks by construction (the gathered bytes are the same).
+
+        The all-gather is issued on the CURRENT stream (= the SMALL green-ctx
+        stream in both the concurrent path and the serialized region) via the
+        dup comm's pynccl with an explicit stream, so it is small-stream-FIFO
+        ordered after the local draft kernels and covered by the existing
+        draft_done[slot] event; verify's communicator ordering is untouched.
+        Requires topk==1 and no rejection sampling (server_args validation).
+        """
+        draft_input: EagleDraftInput = batch.spec_info
+        bs = len(batch.seq_lens)
+        num_steps = self.speculative_num_steps
+        device = batch.device
+        tp = self.server_args.tp_size
+
+        pos_by_rank = self._ip_partition(batch)
+        my_pos = pos_by_rank[self.tp_rank]
+        max_cnt = max(len(p) for p in pos_by_rank)
+
+        # --- local draft forward over the owned rows ---------------------
+        draft_tokens_local = None
+        if my_pos:
+            local_batch, owned_idx = self._ip_local_batch_view(
+                batch, my_pos, "draft_owned"
+            )
+            local_batch.input_ids = None
+            local_input = EagleDraftInput(
+                topk_p=draft_input.topk_p[owned_idx],
+                topk_index=draft_input.topk_index[owned_idx],
+                bonus_tokens=draft_input.bonus_tokens[owned_idx],
+                capture_hidden_mode=draft_input.capture_hidden_mode,
+            )
+            local_batch.spec_info = local_input
+            forward_batch, can_cuda_graph = self.prepare_for_draft(
+                local_input,
+                self.req_to_token_pool,
+                local_batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                num_steps,
+            )
+            if can_cuda_graph:
+                _, _, draft_tokens_local, _ = self.cuda_graph_runner.execute(
+                    forward_batch
+                )
+            else:
+                if num_steps > 1:
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                    forward_batch.mark_forward_metadata_ready()
+                _, _, draft_tokens_local, _ = self.draft_forward(forward_batch)
+
+        # --- THE all-gather (one collective per decode iteration) --------
+        send = torch.zeros((max_cnt, num_steps), dtype=torch.int64, device=device)
+        if draft_tokens_local is not None:
+            send[: len(my_pos)].copy_(draft_tokens_local.view(-1, num_steps))
+        recv = torch.empty(
+            (tp * max_cnt, num_steps), dtype=torch.int64, device=device
+        )
+        from sglang.srt.distributed import parallel_state as _ps
+
+        dup = _ps._PDMUX_PREFILL_TP_GROUP
+        dup.pynccl_comm.cp_all_gather_into_tensor(
+            recv,
+            send,
+            stream=torch.get_device_module(self.device).current_stream(),
+        )
+        # Reassemble batch order: request at position pos_by_rank[j][k] came
+        # from rank j's padded row k.
+        perm = [0] * bs
+        for j, plist in enumerate(pos_by_rank):
+            base = j * max_cnt
+            for k, i in enumerate(plist):
+                perm[i] = base + k
+        draft_tokens = recv[self._ip_stage_i64("draft_perm", perm)]
+
+        # --- full-batch tree build (identical on every rank) -------------
+        tree_mask_buf, position_buf = (
+            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+        )
+        # Same invariant as draft(): flashinfer exposes no fill-after-draft
+        # buffers; a buffer-exposing backend would need per-slot staging.
+        assert tree_mask_buf is None and position_buf is None, (
+            "--spec-pdmux-draft-mode input-parallel: target attention backend "
+            f"{type(self.target_worker.model_runner.attn_backend).__name__} "
+            "exposes verify buffers to fill after draft (unsupported under "
+            "two-slot spec-pdmux operation)."
+        )
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            seq_lens_sum = (
+                bs * self.target_worker.model_runner.attn_backend.max_context_len
+            )
+        # topk=1 chain topology: runtime-invariant constants (same tensors
+        # draft_forward's fast path uses), full-batch rows.
+        parent_list = self._topk1_parents_prealloc[:bs]
+        top_scores_index = self._topk1_score_indices_prealloc[:bs]
+        (
+            tree_mask,
+            position,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            draft_input.bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            seq_lens_sum,
+            self.topk,
+            num_steps,
+            self.speculative_num_draft_tokens,
+            self.tree_mask_mode,
+            None,
+            None,
+        )
+        return EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=num_steps,
+            topk=self.topk,
+            draft_token_num=self.speculative_num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+            draft_probs=None,
+        )
+
     @_profile_phase("draft")
     def draft(self, batch: ScheduleBatch):
+        if self._spec_pdmux_input_parallel and not batch.forward_mode.is_idle():
+            return self._draft_input_parallel(batch)
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = self.prepare_for_draft(
             draft_input,
@@ -1040,6 +1287,66 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     @_profile_phase("draft_extend")
     def _draft_extend_for_decode(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ):
+        if self._spec_pdmux_input_parallel and not batch.forward_mode.is_idle():
+            return self._draft_extend_for_decode_input_parallel(batch, batch_result)
+        return self._draft_extend_for_decode_impl(batch, batch_result)
+
+    def _draft_extend_for_decode_input_parallel(
+        self, batch: ScheduleBatch, batch_result
+    ):
+        """Design-InputParallel draft_extend: owned rows only.
+
+        draft_extend feeds the NEXT draft (topk_p/topk_index = the root draft
+        proposal, plus draft KV for the accepted tokens) — per-rank state for
+        owned requests only. Non-owned rows of next_draft_input are
+        zero-filled: they flow through the FutureMap stash/gather unchanged
+        but are never consumed (this rank's next draft slices its owned rows;
+        bonus_tokens/seq_lens stay full-batch via the existing verify publish
+        path). No collective here: the draft-token all-gather at the next
+        draft covers everything verify needs."""
+        ndt = self.speculative_num_draft_tokens
+        bs = len(batch.seq_lens)
+        device = self.device
+        next_draft_input: EagleDraftInput = batch_result.next_draft_input
+        assert batch_result.next_token_ids.numel() == bs * ndt, (
+            f"input-parallel extend: predict numel "
+            f"{batch_result.next_token_ids.numel()} != bs*ndt {bs}*{ndt}"
+        )
+
+        pos_by_rank = self._ip_partition(batch)
+        my_pos = pos_by_rank[self.tp_rank]
+        full_topk_p = torch.zeros(
+            (bs, self.topk), dtype=torch.float32, device=device
+        )
+        full_topk_index = torch.zeros(
+            (bs, self.topk), dtype=torch.int64, device=device
+        )
+        if my_pos:
+            local_batch, owned_idx = self._ip_local_batch_view(
+                batch, my_pos, "ext_owned"
+            )
+            # Per-req blocks of the verify tree: predict tokens + the tree's
+            # cache locations (the extend's write targets), ndt per request.
+            local_batch.out_cache_loc = (
+                batch.out_cache_loc.view(bs, ndt)[owned_idx].reshape(-1)
+            )
+            local_result = SimpleNamespace(
+                logits_output=SimpleNamespace(hidden_states=None),
+                next_token_ids=batch_result.next_token_ids.view(bs, ndt)[
+                    owned_idx
+                ].reshape(-1),
+                accept_lens=batch_result.accept_lens[owned_idx],
+                next_draft_input=EagleDraftInput(),
+            )
+            self._draft_extend_for_decode_impl(local_batch, local_result)
+            full_topk_p[owned_idx] = local_result.next_draft_input.topk_p
+            full_topk_index[owned_idx] = local_result.next_draft_input.topk_index
+        next_draft_input.topk_p = full_topk_p
+        next_draft_input.topk_index = full_topk_index
+
+    def _draft_extend_for_decode_impl(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
@@ -1833,8 +2140,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 #   batch_result.next_token_ids / accept_lens (and optionally
                 #   logits_output.hidden_states) to host tensors before the
                 #   flush runs.
+                pending_batch = copy.copy(batch)
+                if self.draft_worker._spec_pdmux_input_parallel:
+                    # Design-InputParallel: freeze the ownership partition
+                    # inputs with the same snapshot discipline as the GPU
+                    # refs below — by flush time a finished request's live
+                    # req.req_pool_idx may already be None.
+                    pending_batch._spec_pdmux_ip_pool_idx = [
+                        r.req_pool_idx for r in batch.reqs
+                    ]
                 self._spec_pdmux_state["pending"][slot] = {
-                    "batch": copy.copy(batch),
+                    "batch": pending_batch,
                     "result": SimpleNamespace(
                         logits_output=SimpleNamespace(
                             hidden_states=batch_output.logits_output.hidden_states
