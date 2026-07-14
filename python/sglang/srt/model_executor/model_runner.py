@@ -572,6 +572,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_rank,
                 self.is_draft_worker,
             )
+            if server_args.spec_pdmux_phased_bw:
+                # Design-PhasedBandwidth: one device state per process (flag + wait
+                # budget + stats) shared by the target and draft model runners. Built
+                # here, BEFORE any graph capture — the hooks it installs on the models
+                # are what put the announce / gate nodes into those graphs.
+                from sglang.srt.multiplex import phased_bw
+
+                phased_bw.init(self.gpu_id)
         else:
             self.forward_stream = torch.get_device_module(self.device).Stream()
 
@@ -1705,6 +1713,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if dumper.may_enable:
             dumper.apply_source_patches()
             dumper.register_non_intrusive_dumper(self.model)
+
+        # Design-PhasedBandwidth: install the forward hooks on this model's
+        # weight-streaming Linears. The TARGET announces its bandwidth phase (it is
+        # the one whose GEMMs saturate DRAM); the DRAFT gates its own weight loads on
+        # that announcement. The hooks emit nothing until ARMED around the relevant
+        # CUDA-graph capture, so prefill and every eager path stay byte-unchanged.
+        if (
+            self.server_args.enable_spec_pdmux
+            and self.server_args.spec_pdmux_phased_bw
+        ):
+            from sglang.srt.multiplex import phased_bw
+
+            phased_bw.init(self.gpu_id)
+            if self.is_draft_worker:
+                phased_bw.install_gate_hooks(self.model)
+            else:
+                phased_bw.install_announce_hooks(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(

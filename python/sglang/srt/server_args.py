@@ -2452,6 +2452,25 @@ class ServerArgs:
         ),
     ] = "shard"
 
+    spec_pdmux_phased_bw: A[
+        bool,
+        Arg(
+            help=(
+                "Design-PhasedBandwidth: interleave the co-located drafter's DRAM "
+                "requests into the verifier's low-bandwidth valleys. Verify raises a "
+                "device flag while each of its weight-streaming Linears runs (the "
+                "flag writes are forked off verify's critical path inside its CUDA "
+                "graph, ~0.4% cost); before each of its own Linears the drafter "
+                "spin-waits on that flag with a BOUNDED deadline (a per-gate cap and "
+                "a per-graph slack budget) so the draft chain can never overrun "
+                "verify. Attacks the measured bandwidth-contention component of the "
+                "verify tax (+20.4pp at 8B-TP1 bs16). Requires --enable-spec-pdmux. "
+                "Tuning: SGLANG_PBW_SLACK_US / _GATE_CAP_US / _GATE_EVERY / "
+                "_ANNOUNCE_EVERY / _NO_GATE."
+            ),
+        ),
+    ] = False
+
     def spec_pdmux_draft_unsharded(self) -> bool:
         """True when the spec-pdmux drafter loads FULL (tp=1-style) weights on
         every rank (Design-FullReplicate / Design-InputParallel)."""
@@ -7109,6 +7128,13 @@ class ServerArgs:
             assert (
                 not self.enable_mixed_chunk
             ), "--enable-spec-pdmux is incompatible with --enable-mixed-chunk."
+            if self.spec_pdmux_phased_bw:
+                assert not self.disable_cuda_graph, (
+                    "--spec-pdmux-phased-bw needs CUDA graphs: the announce nodes are "
+                    "forked off verify's critical path INSIDE the verify graph (that "
+                    "fork is what makes them ~free), and the drafter's bounded gates "
+                    "are captured into the draft graph."
+                )
             if self.spec_pdmux_sm_split is not None:
                 parts = self.spec_pdmux_sm_split.split(",")
                 assert len(parts) == 2 and all(
@@ -7141,6 +7167,11 @@ class ServerArgs:
                         "--speculative-use-rejection-sampling (per-step draft_probs "
                         "of shape (bs, steps, vocab) are not all-gathered)."
                     )
+        elif self.spec_pdmux_phased_bw:
+            raise AssertionError(
+                "--spec-pdmux-phased-bw requires --enable-spec-pdmux (it schedules the "
+                "CO-LOCATED drafter against the verifier's bandwidth phase)."
+            )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"

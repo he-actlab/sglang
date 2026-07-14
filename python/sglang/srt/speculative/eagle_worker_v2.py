@@ -137,6 +137,15 @@ import json
 import os
 
 _NVTX_PROFILE = os.environ.get("SGLANG_NVTX_PROFILE", "0") == "1"
+# SGLANG_NVTX_SYNC=0 — NVTX ranges WITHOUT the range-end synchronize. The sync is
+# what makes counter runs attribute correctly in a SEQUENTIAL pipeline, but under
+# spec-pdmux concurrency it also serializes draft against verify — i.e. it destroys
+# the very overlap a concurrent counter run is meant to measure. With sync off the
+# CPU-side range still brackets the phase's kernel LAUNCHES, so nsys can attribute
+# kernels to phases through correlationId (launch-API-inside-range), and the two
+# green-context streams keep running concurrently. Wall-clock is still not a timing
+# number (the profiler is attached); only phase attribution is claimed.
+_NVTX_SYNC = os.environ.get("SGLANG_NVTX_SYNC", "1") == "1"
 _PHASE_EVENTS = (
     os.environ.get("SGLANG_PHASE_EVENTS", "0") == "1" and not _NVTX_PROFILE
 )
@@ -277,7 +286,8 @@ def _profile_phase(name):
                 try:
                     return fn(*args, **kwargs)
                 finally:
-                    torch.cuda.synchronize()
+                    if _NVTX_SYNC:
+                        torch.cuda.synchronize()
                     torch.cuda.nvtx.range_pop()
 
             return nvtx_wrapper

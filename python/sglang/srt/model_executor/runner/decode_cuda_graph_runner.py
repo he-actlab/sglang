@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.multiplex import phased_bw
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
@@ -203,6 +204,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # captured SM affinity matches the forward/replay stream. None => stock
         # behavior (graph_capture allocates its own stream).
         self.capture_stream_override = None
+        # Design-PhasedBandwidth: under spec decode the TARGET's decode graph is the
+        # verify graph, so this runner is where verify announces its bandwidth phase.
+        # The EAGLE draft runners subclass us but build their own __init__, and set
+        # _pbw_mode = "gate" for themselves.
+        self._pbw_mode = None
         if model_runner.server_args.enable_spec_pdmux:
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
@@ -211,6 +217,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "[spec-pdmux] %s: graph capture on LARGE green-ctx stream",
                 type(self).__name__,
             )
+            if (
+                model_runner.server_args.spec_pdmux_phased_bw
+                and not model_runner.is_draft_worker
+            ):
+                self._pbw_mode = "announce"
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -853,9 +864,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                # spec-pdmux Design-PhasedBandwidth: this is the TARGET's decode graph,
+                # which under spec decode IS the verify graph -> arm the announce hooks
+                # so the burst flag's set/clear nodes are captured into it (forked onto
+                # a side stream, off verify's critical path). No-op unless
+                # --spec-pdmux-phased-bw; getattr because the EAGLE draft runners
+                # subclass us without calling our __init__.
                 self.backend.capture_one(
                     shape_key,
-                    run_once,
+                    phased_bw.wrap_capture_body(
+                        getattr(self, "_pbw_mode", None), run_once
+                    ),
                     dummies=None,
                     post_warmup_hook=getattr(
                         self.model_runner.attn_backend,

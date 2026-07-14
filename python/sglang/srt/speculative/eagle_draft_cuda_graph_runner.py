@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.multiplex import phased_bw
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -145,6 +146,17 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 "[spec-pdmux] %s: graph capture on SMALL green-ctx stream",
                 type(self).__name__,
             )
+        # Design-PhasedBandwidth: this is a DRAFT-side graph -> capture the bounded
+        # spin-gates in front of the drafter's weight-streaming Linears, so its DRAM
+        # requests wait out verify's bursts (bounded by the chain's slack).
+        self._pbw_mode = (
+            "gate"
+            if (
+                model_runner.server_args.enable_spec_pdmux
+                and model_runner.server_args.spec_pdmux_phased_bw
+            )
+            else None
+        )
         self.record_nolora_graph = False
         self.is_dllm = False
 
@@ -473,9 +485,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
             shape_key = self._make_graph_key(num_seqs)
+            # Design-PhasedBandwidth: capture the bounded gates + the budget-reset node
+            # into the draft graph (no-op unless --spec-pdmux-phased-bw).
             self.backend.capture_one(
                 shape_key,
-                run_once,
+                phased_bw.wrap_capture_body(getattr(self, "_pbw_mode", None), run_once),
                 dummies=None,
                 post_warmup_hook=getattr(
                     self.draft_attn_backend, "on_after_cuda_graph_warmup", None
