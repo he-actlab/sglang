@@ -725,6 +725,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
+        # spec-pdmux verify-tax prototype: L2 evict-first on the TARGET's
+        # linear weight streams (multiplex/l2_policy.py). Env-gated, off by
+        # default; target worker only (the drafter's weights stay Normal).
+        if (
+            self.server_args.enable_spec_pdmux
+            and not self.is_draft_worker
+            and envs.SGLANG_SPEC_PDMUX_L2_EVICT_FIRST.get()
+        ):
+            from sglang.srt.multiplex.l2_policy import install_l2_evict_first_hooks
+
+            install_l2_evict_first_hooks(
+                self.model, rows_max=envs.SGLANG_SPEC_PDMUX_L2_ROWS_MAX.get()
+            )
+
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
         if self.is_draft_worker:

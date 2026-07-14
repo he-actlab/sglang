@@ -714,6 +714,15 @@ class Envs:
     # M1-position prefill extend) unless this env is explicitly set =1
     # (debugging the wrapper-plan lifetime fix).
     SGLANG_SPEC_PDMUX_DEFER_PREFILL = EnvBool(True)
+    # verify-tax optimization prototype (zero-overhead memo item 5): mark the
+    # TARGET model's linear weight reads L2 evict-first
+    # (cudaAccessPropertyStreaming) via per-linear forward_pre_hooks, so the
+    # verify weight stream stops evicting the co-located drafter's L2 lines.
+    # See multiplex/l2_policy.py. Default off; no stock-path effect.
+    SGLANG_SPEC_PDMUX_L2_EVICT_FIRST = EnvBool(False)
+    # Input rows above which the hook resets the window to Normal (prefill-
+    # shaped forwards reuse weight tiles in L2; streaming them regresses).
+    SGLANG_SPEC_PDMUX_L2_ROWS_MAX = EnvInt(512)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
