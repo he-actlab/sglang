@@ -14,7 +14,11 @@ from sglang.srt.speculative.adaptive_runtime_state import (
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import draft_dup_tp_context, draft_tp_context
+from sglang.srt.speculative.spec_utils import (
+    draft_dup_tp_context,
+    draft_solo_tp_context,
+    draft_tp_context,
+)
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
@@ -83,7 +87,15 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
 
         # Load draft model weights only.
-        with empty_context():
+        # spec-pdmux Design-FullReplicate/InputParallel: build the drafter as a
+        # tp=1 world (full unsharded weights per rank) -- the solo context makes
+        # get_tp_group()/get_attn_tp_group() resolve to a single-rank group for
+        # the whole construction (layer sharding, weight load, ModelRunner's
+        # cached tp_group/attention_tp_group), and TpModelWorker passes
+        # tp_rank=0/tp_size=1 to the draft ModelRunner under the same gate.
+        _draft_unsharded = server_args.spec_pdmux_draft_unsharded()
+        build_ctx = draft_solo_tp_context if _draft_unsharded else empty_context
+        with build_ctx():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -103,11 +115,25 @@ class StandaloneDraftWorker(EagleDraftWorker):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
         if server_args.enable_spec_pdmux and server_args.tp_size > 1:
-            # spec-pdmux M3 step 2: route the draft-side collective regions
-            # (draft / draft_extend / graph captures -- all already wrapped in
-            # self.draft_tp_context) to the dedicated draft communicator (the
-            # duplicate TP group). See spec_utils.draft_dup_tp_context.
-            self.draft_tp_context = draft_dup_tp_context
+            if _draft_unsharded:
+                # Design-FullReplicate/InputParallel: every draft-side region
+                # (draft / draft_extend / graph captures / backend init -- all
+                # already wrapped in self.draft_tp_context) runs under tp=1
+                # semantics; draft forwards issue ZERO collectives. The
+                # tp_group argument the call sites pass (draft_runner.tp_group
+                # == the solo group) is ignored.
+                self.draft_tp_context = draft_solo_tp_context
+                logger.info(
+                    "[spec-pdmux r%d] drafter mode '%s': FULL (unsharded) draft "
+                    "weights per rank; draft regions under the solo TP group",
+                    tp_rank,
+                    server_args.spec_pdmux_draft_mode,
+                )
+            else:
+                # spec-pdmux M3 step 2 (Design-Shard): route the draft-side
+                # collective regions to the dedicated draft communicator (the
+                # duplicate TP group). See spec_utils.draft_dup_tp_context.
+                self.draft_tp_context = draft_dup_tp_context
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
         # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
@@ -129,11 +155,20 @@ class StandaloneDraftWorker(EagleDraftWorker):
         """Standalone: allocate pools without sharing embeddings."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        # Unsharded drafter: the draft KV pool sizes its head count via
+        # get_attention_tp_size() at creation -- it must see the solo group
+        # (full kv heads per rank), like every other draft-side init region.
+        alloc_ctx = (
+            draft_solo_tp_context
+            if self.server_args.spec_pdmux_draft_unsharded()
+            else empty_context
         )
+        with alloc_ctx():
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
         self.init_token_map()
         self.init_lm_head()
 

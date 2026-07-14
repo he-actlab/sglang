@@ -2433,6 +2433,33 @@ class ServerArgs:
         int,
         "spec-pdmux M2.6 admission pacing: hard bound on how many scheduler ticks a waiting request may be deferred (bounds the TTFT cost; ~20-25 ms per decode tick at slot-bs 16).",
     ] = 16
+    spec_pdmux_draft_mode: A[
+        str,
+        Arg(
+            help=(
+                "spec-pdmux drafter placement at tp_size>1. 'shard' (Design-Shard, "
+                "default): the drafter is TP-sharded like the target; its per-layer "
+                "collectives run on the dedicated draft communicator. 'replicate' "
+                "(Design-FullReplicate): every rank loads the FULL (unsharded) "
+                "drafter and drafts the whole batch on its small partition -- zero "
+                "draft-side collectives, deterministic replicated compute. "
+                "'input-parallel' (Design-InputParallel): full drafter per rank, "
+                "each rank drafts only its deterministic 1/tp_size of the batch, "
+                "one draft-token all-gather per decode iteration. STANDALONE only "
+                "(EAGLE shares the target's TP-sharded embed/head)."
+            ),
+            choices=["shard", "replicate", "input-parallel"],
+        ),
+    ] = "shard"
+
+    def spec_pdmux_draft_unsharded(self) -> bool:
+        """True when the spec-pdmux drafter loads FULL (tp=1-style) weights on
+        every rank (Design-FullReplicate / Design-InputParallel)."""
+        return (
+            self.enable_spec_pdmux
+            and self.tp_size > 1
+            and self.spec_pdmux_draft_mode != "shard"
+        )
 
     # -------------------------------------------------------------------------
     # Model weight update and weight loading
@@ -7087,6 +7114,33 @@ class ServerArgs:
                 assert len(parts) == 2 and all(
                     p.strip().isdigit() for p in parts
                 ), "--spec-pdmux-sm-split must be 'LARGE,SMALL' (two integers)."
+            # Design-FullReplicate / Design-InputParallel (unsharded drafter).
+            if self.spec_pdmux_draft_mode != "shard":
+                assert self.tp_size > 1, (
+                    "--spec-pdmux-draft-mode replicate/input-parallel is a tp_size>1 "
+                    "arm (at tp_size=1 the drafter is already unsharded; use 'shard')."
+                )
+                assert (
+                    self.speculative_algorithm is not None
+                    and self.speculative_algorithm.upper() == "STANDALONE"
+                ), (
+                    "--spec-pdmux-draft-mode replicate/input-parallel requires "
+                    "STANDALONE speculative decoding: EAGLE-style drafters share "
+                    "the target's TP-SHARDED embed/lm_head, which an unsharded "
+                    "draft build cannot consume."
+                )
+                if self.spec_pdmux_draft_mode == "input-parallel":
+                    assert self.speculative_eagle_topk == 1, (
+                        "--spec-pdmux-draft-mode input-parallel currently supports "
+                        "topk=1 chain drafting only (the per-rank draft-token "
+                        "all-gather carries the chain tokens; topk>1 tree scores/"
+                        "parents are not gathered)."
+                    )
+                    assert not self.speculative_use_rejection_sampling, (
+                        "--spec-pdmux-draft-mode input-parallel does not support "
+                        "--speculative-use-rejection-sampling (per-step draft_probs "
+                        "of shape (bs, steps, vocab) are not all-gathered)."
+                    )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"

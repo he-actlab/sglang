@@ -592,6 +592,80 @@ def warmup_scheduler_thread_triton_kernels(
     )
 
 
+# Design-FullReplicate / Design-InputParallel: process-wide single-rank "TP"
+# group the UNSHARDED drafter builds and runs under. Lazily created, but only
+# at rank-lockstep call points (draft-worker construction): new_group() inside
+# GroupCoordinator is collective over the world.
+_SPEC_PDMUX_SOLO_TP_GROUP: Optional[GroupCoordinator] = None
+
+
+def get_spec_pdmux_solo_tp_group() -> GroupCoordinator:
+    """The single-rank GroupCoordinator for the unsharded drafter.
+
+    world_size == 1, rank_in_group == 0 on every rank: parallel layers built
+    while it is installed shard nothing (tp=1 semantics for weight loading,
+    head partitioning and the logits all-gather decision), and every
+    call-time-resolved collective is a world_size-1 no-op. No pynccl /
+    custom-AR / mscclpp communicators are created for it.
+    """
+    global _SPEC_PDMUX_SOLO_TP_GROUP
+    if _SPEC_PDMUX_SOLO_TP_GROUP is None:
+        from sglang.srt.distributed.parallel_state import (
+            get_world_group,
+            init_model_parallel_group,
+        )
+
+        world = get_world_group()
+        _SPEC_PDMUX_SOLO_TP_GROUP = init_model_parallel_group(
+            group_ranks=[[r] for r in range(torch.distributed.get_world_size())],
+            local_rank=world.local_rank,
+            backend=torch.distributed.get_backend(world.device_group),
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            use_mscclpp_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            group_name="spec_pdmux_solo_draft",
+        )
+        logger.info(
+            "[spec-pdmux] solo draft TP group created (unsharded drafter): %s",
+            _SPEC_PDMUX_SOLO_TP_GROUP.unique_name,
+        )
+    return _SPEC_PDMUX_SOLO_TP_GROUP
+
+
+@contextmanager
+def draft_solo_tp_context(tp_group: Optional[GroupCoordinator] = None):
+    """Design-FullReplicate / Design-InputParallel: the UNSHARDED-drafter region.
+
+    While active, BOTH get_tp_group() and get_attn_tp_group() resolve to the
+    single-rank solo group (patching _TP alone is not enough: attention layers
+    size their heads via get_parallel().attn_tp_size -> _ATTN_TP, and the KV
+    pool / attention backends size kv heads via dp_attention's
+    get_attention_tp_size() -> _ATTN_TP). Installed as the draft worker's
+    ``draft_tp_context`` so it scopes exactly the regions the existing
+    wrappers cover: TpModelWorker construction (model build + weight load),
+    alloc_memory_pool (draft KV pool head count), init_attention_backends,
+    draft()/draft_extend at runtime, and the draft/extend CUDA-graph captures.
+
+    Reentrant (save/restore, like draft_dup_tp_context; unlike
+    patch_tensor_parallel_group's no-nesting assert): StandaloneDraftWorker.
+    init_cuda_graphs wraps super().init_cuda_graphs(), which wraps again.
+    Binding happens at CPU enqueue time on the serial scheduler thread, so
+    scoping is race-free. The ``tp_group`` argument is accepted for call-site
+    compatibility with draft_tp_context and ignored.
+    """
+    from sglang.srt.distributed import parallel_state as _ps
+
+    solo = get_spec_pdmux_solo_tp_group()
+    prev_tp, prev_attn = _ps._TP, _ps._ATTN_TP
+    _ps._TP = solo
+    _ps._ATTN_TP = solo
+    try:
+        yield
+    finally:
+        _ps._TP, _ps._ATTN_TP = prev_tp, prev_attn
+
+
 @contextmanager
 def draft_dup_tp_context(tp_group: Optional[GroupCoordinator] = None):
     """spec-pdmux M3 step 2: the DEDICATED DRAFT COMMUNICATOR region.

@@ -149,10 +149,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
-                )
+                draft_ratio = int(eagle_draft_num_layers) / int(num_layers)
+                if mr.server_args.spec_pdmux_draft_unsharded():
+                    # spec-pdmux Design-FullReplicate/InputParallel: the drafter
+                    # is UNSHARDED per rank, so its per-token KV bytes are
+                    # attn_tp_size x the sharded assumption above (same
+                    # per-layer KV size as the target still assumed).
+                    draft_ratio *= get_attention_tp_size()
+                self._cell_size = int(self._cell_size * (1 + draft_ratio))
 
         # DFLASH: scale cell_size to account for draft model KV cache
         if mr.spec_algorithm.is_dflash() and not mr.is_draft_worker:
@@ -325,6 +329,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             draft_layers = getattr(mr, "eagle_draft_num_layers", None)
             if draft_layers is not None and int(draft_layers) > 0:
                 self._draft_full_layers_num = int(draft_layers)
+                if mr.server_args.spec_pdmux_draft_unsharded():
+                    # Unsharded drafter (see DefaultPoolConfigurator): budget
+                    # attn_tp_size x the sharded per-token draft KV bytes.
+                    self._draft_full_layers_num *= get_attention_tp_size()
 
         # Bytes per token of max_total_num_tokens.
         #

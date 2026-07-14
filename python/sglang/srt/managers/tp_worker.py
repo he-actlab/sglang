@@ -375,12 +375,23 @@ class TpModelWorker(BaseTpWorker):
     def _init_model_runner(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
+        # spec-pdmux Design-FullReplicate/InputParallel: the drafter loads FULL
+        # (unsharded) weights on every rank -- its ModelRunner is a tp=1 world
+        # living inside the rank's process. The caller (StandaloneDraftWorker)
+        # wraps this construction in draft_solo_tp_context, so get_tp_group()/
+        # get_attn_tp_group() already resolve to the single-rank solo group;
+        # the explicit tp_rank/tp_size args must match it. The WORKER keeps the
+        # real tp_rank (its world-group broadcast below depends on it).
+        tp_rank, tp_size = self.tp_rank, self.tp_size
+        if self.is_draft_worker and self.server_args.spec_pdmux_draft_unsharded():
+            tp_rank, tp_size = 0, 1
+
         self._model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             moe_ep_rank=self.moe_ep_rank,
             moe_ep_size=self.ep_size,
             pp_rank=self.pp_rank,
