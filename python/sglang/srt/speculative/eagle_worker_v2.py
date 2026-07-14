@@ -916,6 +916,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     @_profile_phase("draft")
     def draft(self, batch: ScheduleBatch):
+        return self._draft_one(batch)
+
+    def _draft_one(self, batch: ScheduleBatch):
         if self._spec_pdmux_input_parallel and not batch.forward_mode.is_idle():
             return self._draft_input_parallel(batch)
         raw = self._draft_raw(batch)
@@ -927,6 +930,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
         return self._build_verify_input(batch, batch.spec_info, *raw)
 
+    @_profile_phase("draft")
     def spec_pdmux_fused_draft(self, pool: List[ScheduleBatch]):
         """Design-DraftPool: draft SEVERAL sub-batch slots in ONE draft forward.
 
@@ -946,7 +950,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         bonus tokens. Verify is untouched: full slot batch, one slot per tick.
         """
         if len(pool) == 1:
-            return [self.draft(pool[0])]
+            return [self._draft_one(pool[0])]
         assert not self._spec_pdmux_input_parallel, (
             "Design-DraftPool x Design-InputParallel is not implemented "
             "(the fused draft would have to be partitioned across ranks too)."
@@ -1050,6 +1054,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
+        if (
+            self.server_args.enable_spec_pdmux
+            and not can_cuda_graph
+            and not batch.forward_mode.is_idle()
+            and not getattr(self, "_spec_pdmux_eager_warned", False)
+        ):
+            # Tripwire: an eager draft is CPU-launch-bound and destroys the
+            # co-location economics. Under Design-DraftPool the fused draft's bs
+            # is the SUM of the pooled slots' -- if the draft graph's buckets do
+            # not reach it, EVERY fused draft lands here.
+            self._spec_pdmux_eager_warned = True
+            logger.warning(
+                "[spec-pdmux] draft forward is running EAGER (bs=%d, draft graph "
+                "max bs=%s) -- the drafter is now CPU-launch-bound. Under "
+                "--spec-pdmux-slots > 2 the fused draft's bs is the sum of the "
+                "pooled slots'; raise --cuda-graph-max-bs or --max-running-requests "
+                "so the buckets cover it.",
+                batch.batch_size(),
+                getattr(self.cuda_graph_runner, "max_bs", None),
+            )
         with canary_outside_ctx:
             # Run draft
             if can_cuda_graph:
