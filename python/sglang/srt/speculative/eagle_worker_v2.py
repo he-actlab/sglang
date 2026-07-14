@@ -1977,11 +1977,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return bool(self._spec_pdmux_state["prefill_pending"])
 
     # ---- chain instrumentation (SGLANG_PHASE_EVENTS=1; no-op otherwise) -------
-    # The tick's SMALL-partition work is [gathers(X), draft(X), extend(Y), stash(Y)]
-    # but only draft/extend were ever timed. `chain` spans the whole thing on the
-    # small stream (gathers-start -> stash-end), so it also captures the EAGER SEAMS
-    # between the phases — the quantity the zero-overhead memo's items 1-3 target.
-    # chain - (gathers+draft+extend+stash) = seams + the extend's verify_done wait.
+    # `chain` spans ONE tick's small-stream work, begin/end paired on the SAME
+    # tick, so it also captures the EAGER SEAMS between the phases — the quantity
+    # the zero-overhead memo's items 1-3 target. What a tick's chain covers
+    # depends on the cadence:
+    # - Design-PingPong cadence (S=2: every tick drafts AND fires the extends):
+    #   [gathers(X), draft(X), verify_wait, extend(Y), stash(Y)], gathers-start
+    #   -> stash-end. chain - (gathers+draft+extend+stash) = seams + verify_wait.
+    # - Design-DraftPool cadence (S>2): the extends fire on the tick BEFORE the
+    #   draft-fire tick, so a draft-fire tick's chain is [gathers x pool, fused
+    #   draft] only, gathers-start -> draft-end. The extend-fire tick's
+    #   [verify_wait, extend, stash] belongs to NO chain record (those phases
+    #   are still individually timed).
+    # Begin fires iff the tick has a draft pool (scheduler, before the gathers);
+    # the end closes it on that same tick in forward_batch_generation, after the
+    # fire_extends flush. Never pair across ticks: a cross-tick pair silently
+    # folds full verify windows into "chain".
     def spec_phase_span(self, name):
         """Event-pair around small-stream work the scheduler enqueues."""
         return _phase_span(name)
@@ -2007,17 +2018,37 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Called on the small stream, just before the tick's gathers."""
         if not _PHASE_EVENTS:
             return
+        if getattr(self, "_spec_chain_span", None) is not None:
+            # A begin from an earlier tick is still open: that tick never
+            # reached its end (should be impossible — the end is emitted on
+            # the draft-fire tick itself; conceivable only on a path that
+            # bails out of the concurrent branch mid-tick, e.g.
+            # speculative_num_steps dropping to 0). NEVER pair it with a
+            # later tick's end — that would silently fold full verify
+            # windows into one "chain" record. Drop it and say so once.
+            self._spec_chain_span = None
+            if not getattr(self, "_spec_chain_span_drop_warned", False):
+                self._spec_chain_span_drop_warned = True
+                logger.warning(
+                    "spec-pdmux chain instrumentation: dropped a dangling "
+                    "chain-span begin (its tick never emitted the end). "
+                    "'chain' records stay same-tick-paired; that tick's "
+                    "chain is lost. This warning is emitted once."
+                )
         s = torch.cuda.Event(enable_timing=True)
         s.record()
         self._spec_chain_span = (s, time.perf_counter())
 
     def spec_chain_span_end(self) -> None:
-        """Called on the small stream, just after the tick's last relay stash."""
+        """Called on the small stream at the end of the tick's small-stream
+        chain: after the last relay stash when this tick also fired the
+        extends (Design-PingPong cadence), else right after the fused draft
+        (Design-DraftPool cadence — see forward_batch_generation)."""
         if not _PHASE_EVENTS:
             return
         pair = getattr(self, "_spec_chain_span", None)
         if pair is None:
-            return  # tick with no gathers (non-fire tick at S>2): not a chain
+            return  # no begin this tick (no draft pool): nothing to close
         self._spec_chain_span = None
         s, t0 = pair
         e = torch.cuda.Event(enable_timing=True)
@@ -2119,9 +2150,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                             # stashes (large stream) are ordered via flush_done
                             # below + the prefill relay event on the resolve side.
                             p["on_relay"](p["result"])
-                if decode_only:
-                    # End of the tick's small-stream chain (see spec_chain_span_*).
-                    self.spec_chain_span_end()
+                # NOTE: the chain-span end deliberately does NOT live here.
+                # This flush also runs on ticks that never began a span (at
+                # S>2 the extend-fire tick and the draft-fire tick are
+                # DIFFERENT ticks — Design-DraftPool), and an end emitted on
+                # such a tick would pair with a STALE begin from an earlier
+                # draft-fire tick, silently folding full verify windows into
+                # "chain". The end is emitted by forward_batch_generation on
+                # the tick that began the span (see spec_chain_span_*).
             for s, _ in pend:
                 if st["flush_done"][s] is None:
                     st["flush_done"][s] = dev.Event()
@@ -2547,6 +2583,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # flush(1-slot), unchanged.
                 if getattr(batch, "_spec_pdmux_fire_extends", True):
                     self.flush_spec_pdmux_pending(decode_only=True)
+                if pool and _PHASE_EVENTS:
+                    # Close THIS tick's chain span (begun by the scheduler
+                    # before the gathers) on the SAME tick, at the point where
+                    # the tick's small-stream work is fully enqueued:
+                    # - Design-PingPong cadence (fire_extends with pending
+                    #   extends — S=2 every tick): the flush above enqueued
+                    #   [verify_wait, extend, stash], so the end lands at
+                    #   stash-end, as before.
+                    # - Design-DraftPool cadence (S>2 draft-fire tick): the
+                    #   extends fired on an EARLIER tick, the flush enqueued
+                    #   nothing (or was skipped), and the end lands right
+                    #   after the fused draft.
+                    # The old placement (inside the flush, decode_only) let a
+                    # draft-fire tick's begin dangle at S>2 and pair with a
+                    # LATER tick's stash-end — "chain" then silently included
+                    # 1..S-2 full verify windows.
+                    with dev.stream(self._spec_pdmux_small_stream):
+                        self.spec_chain_span_end()
             else:
                 # spec-pdmux serialize/kill-switch, non-overlap and idle paths:
                 # M1 strictly-sequential joins.
