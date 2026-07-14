@@ -36,6 +36,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
+from sglang.srt.multiplex import phased_bw
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     is_hip,
@@ -133,6 +134,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 "[spec-pdmux] %s: graph capture on SMALL green-ctx stream",
                 type(self).__name__,
             )
+        # Design-PhasedBandwidth: this is a DRAFT-side graph -> capture the bounded
+        # spin-gates in front of the drafter's weight-streaming Linears, so its DRAM
+        # requests wait out verify's bursts (bounded by the chain's slack).
+        self._pbw_mode = (
+            "gate"
+            if (
+                model_runner.server_args.enable_spec_pdmux
+                and model_runner.server_args.spec_pdmux_phased_bw
+            )
+            else None
+        )
         self.record_nolora_graph = False
         self.is_dllm = False
 
@@ -481,9 +493,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs)
+                # Design-PhasedBandwidth: same gates on the draft-extend graph — it is
+                # 4.6 ms of the 11.7 ms chain and streams the same draft weights.
                 self.backend.capture_one(
                     shape_key,
-                    run_once,
+                    phased_bw.wrap_capture_body(
+                        getattr(self, "_pbw_mode", None), run_once
+                    ),
                     dummies=None,
                     post_warmup_hook=getattr(
                         self.draft_extend_attn_backend,
