@@ -1523,22 +1523,40 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             p = pendings[0]
             self._draft_extend_one(p["batch"], p["result"])
             return
-        if self._spec_pdmux_state["n_slots"] <= 2:
+        # n_slots comes from server_args, NOT self._spec_pdmux_state: that
+        # cached_property lives on EAGLEWorkerV2, and this method runs on the
+        # DRAFT worker (`EAGLEWorkerV2._draft_worker` — EagleDraftWorker /
+        # StandaloneDraftWorker, composition siblings, no shared state), so
+        # reading the state here raised AttributeError on the first S>=4
+        # multi-pending flush. server_args is set by both draft-worker
+        # __init__s (the _spec_pdmux_input_parallel idiom) and is the exact
+        # value EAGLEWorkerV2's state caches as "n_slots".
+        if self.server_args.spec_pdmux_slots <= 2:
             # Design-PingPong (S=2): extend fusion is NOT part of the design here
             # (the fusable pool is S-2 = 0 slots). Unlike the draft pool, more than
-            # one pending extend at S=2 is LEGITIMATE — both slots can hold a
-            # deferred extend at a slot=None flush — and pre-DraftPool PingPong
-            # launched them one forward per slot (`for s in (0, 1)`). Keep exactly
-            # that: fusing here would (a) silently change the S=2 baseline and
-            # (b) trip the input-parallel assert below on the 32B-TP4 config.
+            # one pending extend at S=2 is LEGITIMATE at the system level — both
+            # slots can hold a deferred extend at a slot=None flush — and
+            # pre-DraftPool Design-PingPong launched them one forward per slot
+            # (`for s in (0, 1)`). Since the spec-colo merge,
+            # flush_spec_pdmux_pending itself splits per-slot at S<=2, so every
+            # S<=2 call arrives here as len(pendings) == 1 and returns above;
+            # keep this branch as the defensive fallback so a flush-contract
+            # change can never silently fuse at S<=2: fusing would (a) change
+            # the S=2 baseline and (b) hit the Design-InputParallel raise below
+            # on the 32B-TP4 config.
             for p in pendings:
                 self._draft_extend_one(p["batch"], p["result"])
             return
-        assert not self._spec_pdmux_input_parallel, (
-            "Design-DraftPool fused extend x Design-InputParallel is not "
-            "implemented (the fused extend would have to be partitioned across "
-            "ranks too)."
-        )
+        if self._spec_pdmux_input_parallel:
+            # Explicit raise, not assert: python -O strips asserts (and
+            # multiprocessing children inherit the flag), and this guards a
+            # launchable config — server-args validation does not reject
+            # S>2 x Design-InputParallel.
+            raise NotImplementedError(
+                "Design-DraftPool fused extend x Design-InputParallel is not "
+                "implemented (the fused extend would have to be partitioned "
+                "across ranks too)."
+            )
         merged_batch, merged_result, sizes = self._spec_pdmux_merge_for_extend(
             pendings
         )
