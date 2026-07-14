@@ -156,38 +156,18 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-        _sa = model_runner.server_args
-        if _sa.enable_spec_pdmux and _sa.spec_pdmux_slots > 2:
-            # Design-DraftPool: ONE draft forward carries the pooled slots'
-            # token batches CONCATENATED, so its batch size is the SUM of theirs
-            # -- up to (S-1)/S of the union running bs. get_batch_sizes_to_capture
-            # buckets by the PER-BATCH decode size (max_bs 32 by default), which
-            # the fused draft overshoots; can_run_graph then fails and the fused
-            # draft runs EAGER, making the drafter CPU-launch-bound and throwing
-            # away everything the design saves (measured before this fix: fused
-            # bs48 eager = 1565 tok/s vs 2013 for the 2-slot build).
-            hi = int(_sa.max_running_requests or 0)
-            if hi <= 0:
-                pool = getattr(model_runner, "req_to_token_pool", None)
-                hi = int(getattr(pool, "size", 0) or 0)
-            # The fused draft can never exceed the union running bs; cap the
-            # capture cost anyway (each bucket is one graph of a small drafter).
-            hi = min(hi, 4 * max(self.capture_bs), 256)
-            step = 8
-            lo = max(self.capture_bs)
-            extra = list(range(lo + step, hi + 1, step))
-            if hi > lo and (not extra or extra[-1] < hi):
-                extra.append(hi)
-            if extra:
-                self.capture_bs = sorted(set(self.capture_bs) | set(extra))
-                logger.info(
-                    "[spec-pdmux] Design-DraftPool (S=%d): draft decode graph "
-                    "buckets extended %d -> %d (+%d) to cover the fused draft",
-                    _sa.spec_pdmux_slots,
-                    lo,
-                    max(self.capture_bs),
-                    len(extra),
-                )
+        from sglang.srt.speculative.spec_utils import spec_pdmux_extend_capture_bs
+
+        _bs0 = max(self.capture_bs)
+        self.capture_bs = spec_pdmux_extend_capture_bs(model_runner, self.capture_bs)
+        if max(self.capture_bs) != _bs0:
+            logger.info(
+                "[spec-pdmux] Design-DraftPool (S=%d): draft decode graph buckets "
+                "extended %d -> %d to cover the FUSED draft",
+                model_runner.server_args.spec_pdmux_slots,
+                _bs0,
+                max(self.capture_bs),
+            )
         self.num_tokens_per_bs = self.topk
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs

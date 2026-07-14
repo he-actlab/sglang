@@ -706,6 +706,38 @@ def draft_dup_tp_context(tp_group: Optional[GroupCoordinator] = None):
         set_pdmux_status(prev)
 
 
+def spec_pdmux_extend_capture_bs(model_runner, capture_bs):
+    """Design-DraftPool: widen a DRAFT-SIDE graph runner's capture buckets.
+
+    Both fused forwards (draft and draft-extend) carry the pooled slots' token
+    batches CONCATENATED, so their batch size is the SUM of the pooled slots' --
+    up to (S-1)/S of the union running bs. get_batch_sizes_to_capture buckets by
+    the PER-BATCH decode size (max_bs 32 by default), which the fused forwards
+    overshoot; can_run_graph then fails and the fused forward runs EAGER, making
+    the drafter CPU-launch-bound and throwing away everything the design saves
+    (measured on the fused draft before this fix: bs48 eager = 1565 tok/s vs 2013
+    for the 2-slot build).
+    """
+    sa = model_runner.server_args
+    if not sa.enable_spec_pdmux or sa.spec_pdmux_slots <= 2:
+        return capture_bs
+    hi = int(sa.max_running_requests or 0)
+    if hi <= 0:
+        pool = getattr(model_runner, "req_to_token_pool", None)
+        hi = int(getattr(pool, "size", 0) or 0)
+    # A fused forward can never exceed the union running bs; cap the capture
+    # cost anyway (each bucket is one graph of a small drafter).
+    hi = min(hi, 4 * max(capture_bs), 256)
+    step = 8
+    lo = max(capture_bs)
+    extra = list(range(lo + step, hi + 1, step))
+    if hi > lo and (not extra or extra[-1] < hi):
+        extra.append(hi)
+    if not extra:
+        return capture_bs
+    return sorted(set(capture_bs) | set(extra))
+
+
 def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).

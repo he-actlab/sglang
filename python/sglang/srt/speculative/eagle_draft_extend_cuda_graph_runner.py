@@ -142,6 +142,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+        from sglang.srt.speculative.spec_utils import spec_pdmux_extend_capture_bs
+
+        _bs0 = max(self.capture_bs)
+        self.capture_bs = spec_pdmux_extend_capture_bs(model_runner, self.capture_bs)
+        if max(self.capture_bs) != _bs0:
+            logger.info(
+                "[spec-pdmux] Design-DraftPool (S=%d): draft-extend graph buckets "
+                "extended %d -> %d to cover the FUSED extend",
+                model_runner.server_args.spec_pdmux_slots,
+                _bs0,
+                max(self.capture_bs),
+            )
         self.padded_static_len = -1
 
         # Size cuda-graph buffers by num_draft_tokens (full tree width), not

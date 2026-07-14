@@ -3106,6 +3106,16 @@ class Scheduler(
             return self.forward_ct  # non-overlap: results settle synchronously
         return self.forward_ct - len(rq)
 
+    def _spec_pdmux_next_verifier(self) -> Optional[int]:
+        """The slot that will verify NEXT tick (round-robin, skipping empties)."""
+        n = self.spec_pdmux_n_slots
+        for k in range(n):
+            idx = (self.spec_pdmux_next_slot + k) % n
+            sb = self.spec_pdmux_slots[idx]
+            if not sb.is_empty() and not sb.is_prefill_only:
+                return idx
+        return None
+
     def _spec_pdmux_draftable(self, idx: int) -> bool:
         """Whether slot idx may be (re)prepared and pooled into THIS tick's fused
         draft. Two conditions, and between them they are what caps the pool:
@@ -3355,10 +3365,26 @@ class Scheduler(
                 self._spec_pdmux_draft_pool.sort(key=lambda b: b.spec_pdmux_slot)
 
             if ret is not None:
+                # Fire the FUSED EXTEND exactly one tick before the next fused
+                # draft. At that moment the pending extends are precisely the
+                # slots that draft will pool, so one fused extend forward feeds
+                # it -- and the extends stay OFF the ticks in between, leaving
+                # the small partition (and the memory bus) idle for verify.
+                # A draft fires next tick iff the next verifier has no parked
+                # draft and is not getting one from THIS tick's pool.
+                nv = self._spec_pdmux_next_verifier()
+                pooled = {b.spec_pdmux_slot for b in self._spec_pdmux_draft_pool}
+                ret._spec_pdmux_fire_extends = (
+                    nv is None
+                    or (
+                        nv not in pooled
+                        and not self.model_worker.spec_pdmux_has_ready_draft(nv)
+                    )
+                )
                 sizes = self._spec_pdmux_slot_sizes()
                 logger.info(
                     "[spec-pdmux-sched r%d] tick=%d DECODE slot=%d bs=%d "
-                    "draft_pool=%s pool_bs=%d slot_sizes=%s free_tok=%d",
+                    "draft_pool=%s pool_bs=%d ext_fire=%d slot_sizes=%s free_tok=%d",
                     self.ps.tp_rank,
                     self.forward_ct + 1,
                     ret.spec_pdmux_slot,
@@ -3368,6 +3394,7 @@ class Scheduler(
                     )
                     or "-",
                     sum(b.batch_size() for b in self._spec_pdmux_draft_pool),
+                    int(ret._spec_pdmux_fire_extends),
                     "/".join(str(s) for s in sizes),
                     self.token_to_kv_pool_allocator.available_size(),
                 )

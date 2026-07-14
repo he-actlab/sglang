@@ -1431,9 +1431,109 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        return self._draft_extend_one(batch, batch_result)
+
+    def _draft_extend_one(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ):
         if self._spec_pdmux_input_parallel and not batch.forward_mode.is_idle():
             return self._draft_extend_for_decode_input_parallel(batch, batch_result)
         return self._draft_extend_for_decode_impl(batch, batch_result)
+
+    @_profile_phase("draft_extend")
+    def spec_pdmux_fused_extend(self, pendings: List[dict]) -> None:
+        """Design-DraftPool: run SEVERAL slots' deferred draft-extends as ONE forward.
+
+        The draft-extend is the drafter's prompt-ingestion pass over the tokens
+        verify just accepted -- one forward per verify, streaming the drafter's
+        FULL weights every single tick. With the drafts fused it became the
+        dominant chain cost (62% at 8B-TP1, 52% at 8B-TP4) and the floor under
+        the contention drop: it, not the draft, was what kept the drafter on the
+        memory bus every tick.
+
+        It has slack, though: extend(X) is only needed before draft(X), and
+        draft(X) is not needed until slot X comes round to verify again S ticks
+        later. So the extends can be deferred and fused exactly as the drafts
+        are -- one forward for all pending slots, streaming the drafter's weights
+        ONCE instead of once per slot.
+
+        Every input is ROW-BLOCKED by request (bs blocks of num_draft_tokens
+        tokens: input_ids/predict, out_cache_loc, target hidden_states; plus one
+        entry per request in accept_lens/seq_lens), so the merge is a
+        concatenation and the split is a row slice -- the same seam the fused
+        draft uses. Each slot's live EagleDraftInput is filled with its own rows
+        and then relayed with its own future_indices, so the per-slot
+        spec_info/FutureMap discipline is untouched.
+        """
+        if len(pendings) == 1:
+            p = pendings[0]
+            self._draft_extend_one(p["batch"], p["result"])
+            return
+        assert not self._spec_pdmux_input_parallel, (
+            "Design-DraftPool fused extend x Design-InputParallel is not "
+            "implemented (the fused extend would have to be partitioned across "
+            "ranks too)."
+        )
+        merged_batch, merged_result, sizes = self._spec_pdmux_merge_for_extend(
+            pendings
+        )
+        self._draft_extend_for_decode_impl(merged_batch, merged_result)
+        # Split the merged next-draft state back into each slot's OWN live
+        # EagleDraftInput (the object the slot's spec_info already points at and
+        # that its on_relay stashes under its own future_indices).
+        nd = merged_result.next_draft_input
+        off = 0
+        for p, n in zip(pendings, sizes):
+            tgt = p["result"].next_draft_input
+            tgt.topk_p = nd.topk_p[off : off + n]
+            tgt.topk_index = nd.topk_index[off : off + n]
+            tgt.hidden_states = (
+                None if nd.hidden_states is None else nd.hidden_states[off : off + n]
+            )
+            if nd.draft_probs is not None:
+                tgt.draft_probs = nd.draft_probs[off : off + n]
+            off += n
+        assert off == len(merged_batch.seq_lens), (off, len(merged_batch.seq_lens))
+
+    def _spec_pdmux_merge_for_extend(self, pendings: List[dict]):
+        """Throw-away (merged batch, merged result) for the fused draft-extend.
+        Shallow-copied off the first pending's batch snapshot, with every
+        per-request field rebound to a concatenation -- the pending batches are
+        themselves post-verify snapshots and are discarded after the flush, so
+        nothing live is mutated."""
+        batches = [p["batch"] for p in pendings]
+        results = [p["result"] for p in pendings]
+        sizes = [len(b.seq_lens) for b in batches]
+
+        m = copy.copy(batches[0])
+        m.reqs = [r for b in batches for r in b.reqs]
+        m.req_pool_indices = torch.cat([b.req_pool_indices for b in batches])
+        m.seq_lens = torch.cat([b.seq_lens for b in batches])
+        if all(b.seq_lens_cpu is not None for b in batches):
+            m.seq_lens_cpu = torch.cat([b.seq_lens_cpu for b in batches])
+            m.seq_lens_sum = int(m.seq_lens_cpu.sum())
+        else:
+            m.seq_lens_cpu = None
+            m.seq_lens_sum = None
+        # The verify tree's KV slots -- num_draft_tokens per request, the draft
+        # KV write targets of the extend forward.
+        m.out_cache_loc = torch.cat([b.out_cache_loc for b in batches])
+        m.input_ids = None  # prepare_for_draft_extend installs `predict`
+        m.sampling_info = copy.copy(batches[0].sampling_info)
+        m.return_logprob = False
+        m.top_logprobs_nums = None
+        m.token_ids_logprobs = None
+
+        hs = [r.logits_output.hidden_states for r in results]
+        merged = SimpleNamespace(
+            logits_output=SimpleNamespace(
+                hidden_states=(None if hs[0] is None else torch.cat(hs))
+            ),
+            next_token_ids=torch.cat([r.next_token_ids for r in results]),
+            accept_lens=torch.cat([r.accept_lens for r in results]),
+            next_draft_input=EagleDraftInput(),
+        )
+        return m, merged, sizes
 
     def _draft_extend_for_decode_input_parallel(
         self, batch: ScheduleBatch, batch_result
@@ -1538,6 +1638,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
+        if (
+            self.server_args.enable_spec_pdmux
+            and not can_cuda_graph
+            and not batch.forward_mode.is_idle()
+            and not getattr(self, "_spec_pdmux_eager_ext_warned", False)
+        ):
+            # Same tripwire as the draft path: an eager draft-extend is
+            # CPU-launch-bound. Under Design-DraftPool the FUSED extend's bs is
+            # the sum of the pooled slots' -- if the draft-extend graph's buckets
+            # do not reach it, every fused extend lands here.
+            self._spec_pdmux_eager_ext_warned = True
+            logger.warning(
+                "[spec-pdmux] draft-extend is running EAGER (bs=%d, extend graph "
+                "max bs=%s) -- the drafter is now CPU-launch-bound. Under "
+                "--spec-pdmux-slots > 2 the fused extend's bs is the sum of the "
+                "pooled slots'; raise --cuda-graph-max-bs or --max-running-requests "
+                "so the buckets cover it.",
+                len(batch.seq_lens),
+                getattr(self.cuda_graph_runner_for_draft_extend, "max_bs", None),
+            )
 
         canary_ctx = (
             context_tuple(
@@ -1816,7 +1936,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return False
         return bool(self._spec_pdmux_state["prefill_pending"])
 
-    def flush_spec_pdmux_pending(self, slot: Optional[int] = None) -> None:
+    def flush_spec_pdmux_pending(
+        self, slot: Optional[int] = None, decode_only: bool = False
+    ) -> None:
         """Launch any deferred draft_extend (+ FutureMap relay stash).
 
         Call sites and why they suffice:
@@ -1841,14 +1963,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
         st = self._spec_pdmux_state
         dev = torch.get_device_module(self.device)
         small = self._spec_pdmux_small_stream
-        for s in range(st["n_slots"]) if slot is None else (slot,):
-            p = st["pending"][s]
-            if p is None:
-                continue
-            st["pending"][s] = None
+        # Design-DraftPool: FUSE the pending extends. Every slot flushed in this
+        # call goes through ONE draft-extend forward (their token batches
+        # concatenated), so the drafter streams its weights once for all of them
+        # instead of once per slot. With S=2 there is never more than one pending
+        # here, so the fused path is the single-extend path, unchanged.
+        pend = [
+            (s, st["pending"][s])
+            for s in (range(st["n_slots"]) if slot is None else (slot,))
+            if st["pending"][s] is not None
+        ]
+        if pend:
+            for s, _ in pend:
+                st["pending"][s] = None
             # Data dependency of extend(X): verify(X)-done (predict /
-            # accept_lens / hidden_states).
-            small.wait_event(p["verify_done"])
+            # accept_lens / hidden_states). The fused forward waits EVERY
+            # covered slot's verify.
+            for _, p in pend:
+                small.wait_event(p["verify_done"])
             # M2.5 (step 10): the extend forward now overlaps the other
             # slot's verify, like the draft phase. The step-7 "extend-forward
             # || target-forward corrupts the drafter" hazard (tau 3.12 ->
@@ -1873,7 +2005,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # the large (verify outputs) / schedule (SB fields) streams;
                 # their Python refs can drop right after this flush while the
                 # small stream still executes the extend.
-                record_stream_each(p["used_tensors"], small)
+                for _, p in pend:
+                    record_stream_each(p["used_tensors"], small)
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
@@ -1882,20 +2015,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    self.draft_worker._draft_extend_for_decode(
-                        p["batch"], p["result"]
-                    )
-                if p["on_relay"] is not None:
-                    # FutureMap stash on the small stream: the slot's next-tick
-                    # gathers follow in the same FIFO; the other slot's stash
-                    # is also small-stream FIFO; prefill stashes (large stream)
-                    # are ordered via flush_done below + the prefill relay
-                    # event on the resolve side.
-                    p["on_relay"](p["result"])
-            if st["flush_done"][s] is None:
-                st["flush_done"][s] = dev.Event()
-            st["flush_done"][s].record(small)
-        if slot is None:
+                    self.draft_worker.spec_pdmux_fused_extend([p for _, p in pend])
+                for _, p in pend:
+                    if p["on_relay"] is not None:
+                        # FutureMap stash on the small stream, per slot (its own
+                        # future_indices, its own rows): the slot's next-tick
+                        # gathers follow in the same FIFO; prefill stashes (large
+                        # stream) are ordered via flush_done below + the prefill
+                        # relay event on the resolve side.
+                        p["on_relay"](p["result"])
+            for s, _ in pend:
+                if st["flush_done"][s] is None:
+                    st["flush_done"][s] = dev.Event()
+                st["flush_done"][s].record(small)
+        if slot is None and not decode_only:
             self._flush_spec_pdmux_prefill_pending()
 
     def _flush_spec_pdmux_prefill_pending(self) -> None:
@@ -2299,18 +2432,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 record_stream_each(
                     (verify_input.draft_probs,), dev.current_stream()
                 )
-                # Steady-state key move: launch the OTHER slots' deferred
-                # extends(+stash) now, AFTER this tick's draft is in the small
-                # FIFO and BEFORE this tick's verify is enqueued on large: the
-                # whole small-stream chain [extends, gathers, fused draft]
-                # executes under this tick's verify (M2.5: including the extend
-                # forward -- see flush_spec_pdmux_pending). Only the slot that
-                # verified LAST tick can have a pending extend here (the pooled
-                # slots' were flushed before their gathers); at S=2 this is
-                # exactly the old flush(1-slot).
-                for other in range(st["n_slots"]):
-                    if other != slot:
-                        self.flush_spec_pdmux_pending(slot=other)
+                # Steady-state key move: launch the deferred extends(+stash)
+                # now, AFTER this tick's draft is in the small FIFO and BEFORE
+                # this tick's verify is enqueued on large, so the whole
+                # small-stream chain executes under this tick's verify (M2.5:
+                # including the extend forward -- see flush_spec_pdmux_pending).
+                #
+                # WHICH ticks fire: the scheduler sets _spec_pdmux_fire_extends
+                # on exactly the tick BEFORE the next fused draft, and at that
+                # point the pending extends are PRECISELY the slots that draft
+                # will pool -- so they go out as ONE fused extend forward. On the
+                # other ticks nothing drafts and nothing extends: the small
+                # partition is idle and verify has the memory bus to itself.
+                # At S=2 the next verifier never holds a parked draft, so this
+                # fires every tick with exactly one pending == the old
+                # flush(1-slot), unchanged.
+                if getattr(batch, "_spec_pdmux_fire_extends", True):
+                    self.flush_spec_pdmux_pending(decode_only=True)
             else:
                 # spec-pdmux serialize/kill-switch, non-overlap and idle paths:
                 # M1 strictly-sequential joins.
