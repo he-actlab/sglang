@@ -5,6 +5,11 @@ G2  sink+window : both kernels match a numpy reference of [0,SINK) U [L-tail, L)
 G3  indptr      : the draft-decode kernel's kv_indptr matches the host mirror
                   (FlashInferMultiStepDraftBackend rebuilds it on the host under
                   spec-pdmux; a mismatch makes flashinfer plan over garbage).
+G4  fast-plan   : the SHIPPED host mirror (fast_prefill_extend_host_plan_args,
+                  called by the backend's `elif uses_fast_prefill` branch) ==
+                  the device-truth indptr from the real truncated kv_indices
+                  (EagleDraftExtendInput.generate_attn_arg_prefill). Deleting
+                  the shipped clamp makes this gate FAIL.
 """
 import numpy as np
 import torch
@@ -143,36 +148,74 @@ print("    topk=2: OK")
 # the kernel walks off the end of the list into stale memory. The indices are perfectly
 # correct and the drafter still reads garbage -- tau collapsed 3.03 -> 1.13 and it looked
 # exactly like "windowing just doesn't work".
+#
+# This gate executes the SHIPPED code on BOTH sides -- no reimplementation:
+#   device truth = the real EagleDraftExtendInput.generate_attn_arg_prefill (actual
+#                  truncated kv_indices + the indptr the extend kernel consumes),
+#                  anchored to the independent numpy oracle ref_retained;
+#   host mirror  = the real fast_prefill_extend_host_plan_args, the function the
+#                  backend's `elif uses_fast_prefill` branch calls on every replay.
+# Deleting the clamp in fast_prefill_extend_host_plan_args makes this gate FAIL.
 # --------------------------------------------------------------------------------------
 print("\n=== G4: host kv-layout mirror == device kv_indptr (the fast_prefill_plan trap) ===")
-from sglang.srt.speculative.spec_utils import draft_kv_window_cfg, retained_kv_lens
+from sglang.srt.layers.attention.flashinfer_backend import (
+    fast_prefill_extend_host_plan_args,
+)
+from sglang.srt.server_args import set_global_server_args_for_scheduler
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.spec_utils import draft_kv_window_cfg
 
 
-class _SA:  # stand-in for ServerArgs
+class _SA:  # stand-in for ServerArgs (only the two window knobs are read)
     def __init__(self, w, s):
         self.spec_pdmux_draft_kv_window, self.spec_pdmux_draft_kv_sink = w, s
 
 
+NTPR = 3  # num_tokens_per_req of the draft-extend qo layout (padded accept length)
+BS = len(SEQ)
 for w, s in [(0, 4), (512, 4), (128, 0)]:
     sink, window, cap = draft_kv_window_cfg(_SA(w, s))
+    # generate_attn_arg_prefill reads the window cfg off the global server args.
+    set_global_server_args_for_scheduler(_SA(w, s))
     lens = torch.tensor(SEQ, dtype=torch.int32, device=DEV)
 
-    # DEVICE: what EagleDraftExtendInput.generate_attn_arg_prefill writes
-    dev_indptr = torch.zeros(len(SEQ) + 1, dtype=torch.int32, device=DEV)
-    dev_indptr[1:] = torch.cumsum(retained_kv_lens(lens, cap), dim=0)
-
-    # HOST: what the fixed fast_prefill_plan branch rebuilds from seq_lens_cpu
-    host_lens = torch.tensor(SEQ, dtype=torch.int32)
-    if cap:
-        host_lens = torch.clamp(host_lens, max=cap)
-    host_indptr = torch.zeros(len(SEQ) + 1, dtype=torch.int32)
-    host_indptr[1:] = torch.cumsum(host_lens, dim=0)
-
-    assert torch.equal(dev_indptr.cpu(), host_indptr), (
-        f"HOST/DEVICE KV-LAYOUT MISMATCH at W={w}: flashinfer would read past the end of "
-        f"kv_indices\n  device={dev_indptr.tolist()}\n  host  ={host_indptr.tolist()}"
+    # DEVICE TRUTH: the real producer -> actual truncated kv_indices + the indptr
+    # the extend kernel consumes ...
+    spec = EagleDraftExtendInput(
+        num_correct_drafts=torch.zeros(BS, dtype=torch.int32, device=DEV),
+        num_tokens_per_req=NTPR,
     )
-    print(f"    W={w:<5} sink={s}  cap={cap:<4} host indptr == device indptr  OK "
-          f"(max kv_len {int(host_lens.max())})")
+    kv_indices, dev_indptr, dev_qo, _ = spec.generate_attn_arg_prefill(
+        torch.arange(BS, dtype=torch.int32, device=DEV), lens, sum(SEQ), req_to_token
+    )
+    # ... anchored to the independent numpy oracle (so the two shipped sides
+    # cannot drift together unnoticed):
+    exp = np.concatenate(
+        [ref_retained(req_to_token[r].cpu().numpy(), SEQ[r], sink, window) for r in range(BS)]
+    )
+    n_valid = len(exp)  # entries the kernel actually wrote; past this = stale memory
+    assert int(dev_indptr[-1]) == n_valid, "device indptr disagrees with the numpy oracle"
+    assert np.array_equal(kv_indices[:n_valid].cpu().numpy(), exp), "device kv_indices != oracle"
+
+    # HOST MIRROR: the SHIPPED function the backend's `elif uses_fast_prefill`
+    # branch calls (seq_lens_cpu arrives as int64 in the real flow).
+    plan_args = fast_prefill_extend_host_plan_args(
+        torch.tensor(SEQ, dtype=torch.int64), NTPR, BS, cap
+    )
+    host_indptr = plan_args["kv_indptr_host"]
+    assert int(host_indptr[-1]) <= n_valid, (
+        f"HOST PLANS PAST THE END OF kv_indices at W={w}: host kv end {int(host_indptr[-1])} "
+        f"> {n_valid} valid entries -- flashinfer would read stale memory"
+    )
+    assert torch.equal(dev_indptr.cpu(), host_indptr), (
+        f"HOST/DEVICE KV-LAYOUT MISMATCH at W={w}: flashinfer would plan over garbage\n"
+        f"  device={dev_indptr.tolist()}\n  host  ={host_indptr.tolist()}"
+    )
+    assert torch.equal(dev_qo.cpu(), plan_args["qo_indptr_host"]), "qo_indptr mismatch"
+    assert plan_args["max_kv_len"] == int((dev_indptr[1:] - dev_indptr[:-1]).max().item()), (
+        "max_kv_len disagrees with the device indptr"
+    )
+    print(f"    W={w:<5} sink={s}  cap={cap:<4} SHIPPED host mirror == device truth  OK "
+          f"(retained {n_valid} / {sum(SEQ)} KV entries, max kv_len {plan_args['max_kv_len']})")
 
 print("\nALL KERNEL GATES PASS")

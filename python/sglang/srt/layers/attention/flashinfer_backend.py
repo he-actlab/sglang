@@ -317,6 +317,52 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+def fast_prefill_extend_host_plan_args(
+    seq_lens_cpu: torch.Tensor,
+    num_tokens_per_req: int,
+    bs: int,
+    draft_kv_cap: int,
+) -> dict:
+    """Host-side qo/kv layout fast_prefill_plan consumes on the (draft-)extend
+    replay path — THE shipped mirror of the device kv layout that
+    EagleDraftExtendInput.generate_attn_arg_prefill produces. fast_prefill_plan
+    is sync-free: it IGNORES the device kv_indptr handed to begin_forward and
+    plans from this layout alone, so this function must stay in lockstep with
+    the device-side kv_indices producer.
+
+    Design-BoundedKV: generate_attn_arg_prefill truncates the DEVICE
+    kv_indices/kv_indptr to the retained window (``draft_kv_cap`` = sink +
+    window; 0 = unbounded). Without the clamp below, the plan covers the FULL
+    seq_len while kv_indices holds only ``cap`` valid entries per request, so
+    the kernel walks off the end of the list into stale memory and the drafter
+    reads garbage KV (tau collapses to ~1.1 with the indices themselves
+    perfectly correct). Host must mirror device.
+
+    Guards: test/manual/spec/test_bounded_kv_drafter.py G4 executes THIS
+    function against the device-truth indptr from the real truncated
+    kv_indices; SGLANG_SPEC_PDMUX_FASTPLAN_DEBUG=1 re-checks it at runtime.
+    """
+    seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+    if draft_kv_cap:
+        seq_lens_cpu_i32 = torch.clamp(seq_lens_cpu_i32, max=draft_kv_cap)
+    qo_indptr_host = torch.arange(
+        0,
+        (bs + 1) * num_tokens_per_req,
+        step=num_tokens_per_req,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+    kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+    return dict(
+        qo_indptr_host=qo_indptr_host,
+        kv_indptr_host=kv_indptr_host,
+        kv_lens_host=seq_lens_cpu_i32,
+        max_q_len=num_tokens_per_req,
+        max_kv_len=int(seq_lens_cpu_i32.max()),
+    )
+
+
 def plan_pinned_ws_rotate(wrapper) -> None:
     """spec-pdmux M2.6: protect flashinfer's per-wrapper pinned int-workspace.
 
@@ -2040,37 +2086,42 @@ class FlashInferIndicesUpdaterPrefill:
             assert (
                 num_tokens_per_req is not None and num_tokens_per_req > 0
             ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
-            seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
-            # BOUNDED-KV DRAFTER: EagleDraftExtendInput.generate_attn_arg_prefill already
-            # truncated the DEVICE kv_indices/kv_indptr to the retained window. fast_prefill_plan
-            # is sync-free -- it rebuilds the layout on the HOST from seq_lens_cpu and IGNORES
-            # the kv_indptr passed below. Without this clamp it plans for the FULL seq_len while
-            # kv_indices holds only `cap` valid entries per request, so the kernel walks off the
-            # end of the list into stale memory and the drafter reads garbage KV (tau collapses
-            # to ~1.1 with the indices themselves perfectly correct). Host must mirror device.
+            # Design-BoundedKV: the cap applies only to the DRAFT model's extend
+            # (EagleDraftExtendInput is only ever the draft's spec input). The host
+            # mirror must clamp in lockstep with the device kv_indices — the why and
+            # the layout math live in fast_prefill_extend_host_plan_args.
+            _cap = 0
             if (
                 spec_info is not None
                 and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
             ):
                 _cap = draft_kv_window_cfg(get_global_server_args())[2]
-                if _cap:
-                    seq_lens_cpu_i32 = torch.clamp(seq_lens_cpu_i32, max=_cap)
-            qo_indptr_host = torch.arange(
-                0,
-                (bs + 1) * num_tokens_per_req,
-                step=num_tokens_per_req,
-                dtype=torch.int32,
-                device="cpu",
+            paged_plan_kwargs = fast_prefill_extend_host_plan_args(
+                seq_lens_cpu, num_tokens_per_req, bs, _cap
             )
-            kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
-            kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
-            paged_plan_kwargs = dict(
-                qo_indptr_host=qo_indptr_host,
-                kv_indptr_host=kv_indptr_host,
-                kv_lens_host=seq_lens_cpu_i32,
-                max_q_len=num_tokens_per_req,
-                max_kv_len=int(seq_lens_cpu_i32.max()),
-            )
+            if os.environ.get("SGLANG_SPEC_PDMUX_FASTPLAN_DEBUG") == "1":
+                # Draft-extend twin of the verify-branch check above, for the same
+                # hazard class: the host plan IGNORES the device kv_indptr, so a
+                # host/device divergence (e.g. an unclamped mirror under
+                # Design-BoundedKV) makes flashinfer walk kv_indices out of bounds
+                # and the drafter silently reads garbage KV. Raise, not assert
+                # (python -O strips asserts). Default-off, zero cost when unset.
+                torch.cuda.synchronize()
+                dev_qo = qo_indptr.cpu()
+                dev_kvptr = kv_indptr.cpu()
+                host_qo = paged_plan_kwargs["qo_indptr_host"].to(dev_qo.dtype)
+                host_kvptr = paged_plan_kwargs["kv_indptr_host"].to(dev_kvptr.dtype)
+                if not torch.equal(dev_kvptr, host_kvptr):
+                    raise RuntimeError(
+                        "[fastplan-debug] draft-extend kv_indptr host/device mismatch"
+                        f" (cap={_cap}): the host plan would walk kv_indices out of"
+                        f" bounds\n  dev ={dev_kvptr.tolist()}\n  host={host_kvptr.tolist()}"
+                    )
+                if not torch.equal(dev_qo, host_qo):
+                    raise RuntimeError(
+                        "[fastplan-debug] draft-extend qo_indptr host/device mismatch"
+                        f"\n  dev ={dev_qo.tolist()}\n  host={host_qo.tolist()}"
+                    )
 
         if self.attn_backend.enable_spec_pdmux:
             # spec-pdmux M2.6: pinned staging guard (see plan_pinned_ws_rotate)
