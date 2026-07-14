@@ -276,6 +276,32 @@ class _AcceptHistLog:
 _ACCEPT_HIST_LOG = _AcceptHistLog(_ACCEPT_HIST_OUT) if _ACCEPT_HIST else None
 
 
+@contextlib.contextmanager
+def _phase_span(name, stream=None):
+    """Event-pair timing for small-stream work enqueued OUTSIDE a @_profile_phase
+    call. Used here for the extend's verify_done wait: the small stream reaches
+    that point after [gathers, draft] and then BLOCKS until its slot's verify
+    retires on the large partition. That stall IS the drafter's idle inside the
+    verify window -- i.e. exactly the budget Design-PhasedBandwidth spends -- so
+    it must be measured directly rather than inferred as (verify - chain_work).
+    `stream` selects the stream the events record on (default: current).
+    No-op unless SGLANG_PHASE_EVENTS=1.
+    (Ported from the chain-graphs branch so PBW's slack is the SAME metric the
+    split sweep reported.)"""
+    if not _PHASE_EVENTS:
+        yield
+        return
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    t0 = time.perf_counter()
+    s.record(stream) if stream is not None else s.record()
+    try:
+        yield
+    finally:
+        e.record(stream) if stream is not None else e.record()
+        _PHASE_LOG.record(name, (time.perf_counter() - t0) * 1e3, s, e)
+
+
 def _profile_phase(name):
     def deco(fn):
         if _NVTX_PROFILE:
@@ -2018,8 +2044,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Data dependency of extend(X): verify(X)-done (predict /
             # accept_lens / hidden_states). The fused forward waits EVERY
             # covered slot's verify.
-            for _, p in pend:
-                small.wait_event(p["verify_done"])
+            # Timed ("verify_wait"): the small stream reaches this point after
+            # [gathers, draft] and then BLOCKS until its slot's verify retires
+            # on the large partition. That stall is the drafter's TRUE idle
+            # inside the verify window = the slack Design-PhasedBandwidth has
+            # to spend. Measure it; do not infer it.
+            with _phase_span("verify_wait", small):
+                for _, p in pend:
+                    small.wait_event(p["verify_done"])
             # M2.5 (step 10): the extend forward now overlaps the other
             # slot's verify, like the draft phase. The step-7 "extend-forward
             # || target-forward corrupts the drafter" hazard (tau 3.12 ->
