@@ -1701,6 +1701,12 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            # "tick_cpu": CPU wall of ONE event-loop iteration. With the GPU
+            # streams' busy time known (verify / chain phases), this is what
+            # separates a CPU-bound tick (graph-folding pays) from a GPU-bound
+            # one (it cannot). Zero cost unless SGLANG_PHASE_EVENTS=1.
+            _tick_cpu_t0 = time.perf_counter()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1710,7 +1716,8 @@ class Scheduler(
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            with self._spec_pdmux_cpu_span("sched_prep"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1754,6 +1761,11 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+            if batch is not None and self.spec_pdmux_concurrent:
+                w = getattr(self.model_worker, "spec_record_cpu", None)
+                if w is not None:
+                    w("tick_cpu", (time.perf_counter() - _tick_cpu_t0) * 1e3)
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
@@ -2865,6 +2877,12 @@ class Scheduler(
 
         return get_spec_streams()[1]
 
+    def _spec_pdmux_cpu_span(self, name):
+        """CPU-wall span on the scheduler thread (SGLANG_PHASE_EVENTS=1 only).
+        Routed through the spec worker, which owns the phase-event log."""
+        span = getattr(self.model_worker, "spec_cpu_span", None)
+        return span(name) if span is not None else nullcontext()
+
     def _refresh_spec_pdmux_union(self):
         """spec-pdmux M2.0: refresh the reqs-only union facade
         (self.running_batch) from the two slot batches, and clear the
@@ -3937,13 +3955,19 @@ class Scheduler(
                 )
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                if pool:
-                    for pb in pool:
-                        self.future_map.active_slot = pb.spec_pdmux_slot
-                        self.future_map.resolve_seq_lens_cpu(pb)
-                    self.future_map.active_slot = spec_pdmux_slot
-                elif spec_pdmux_slot is None:
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                # "sched_sync": the CPU BLOCKS here — resolve_seq_lens_cpu waits the
+                # slot's publish event and synchronizes the D2H stream, i.e. it cannot
+                # return until that slot's PREVIOUS verify has retired on the GPU. If
+                # the per-tick GPU bubble lives here, it is a CPU-GPU rendezvous and no
+                # amount of graph-folding (memo items 1-3) can remove it.
+                with self._spec_pdmux_cpu_span("sched_sync"):
+                    if pool:
+                        for pb in pool:
+                            self.future_map.active_slot = pb.spec_pdmux_slot
+                            self.future_map.resolve_seq_lens_cpu(pb)
+                        self.future_map.active_slot = spec_pdmux_slot
+                    elif spec_pdmux_slot is None:
+                        self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
@@ -3992,6 +4016,9 @@ class Scheduler(
                         # Design-PingPong enqueue order, unchanged). On a
                         # non-fire tick the pool is empty and NO gathers run —
                         # the small stream carries only the deferred extend.
+                        if pool:
+                            with self.device_module.stream(small):
+                                self.model_worker.spec_chain_span_begin()
                         for pb in pool:
                             s = pb.spec_pdmux_slot
                             if self._spec_pdmux_prefill_relay_pending[s]:
@@ -4001,7 +4028,8 @@ class Scheduler(
                             # (they read the stash it writes).
                             self.model_worker.flush_spec_pdmux_pending(s)
                             with self.device_module.stream(small):
-                                resolve_forward_inputs(pb, self.future_map)
+                                with self.model_worker.spec_phase_span("gathers"):
+                                    resolve_forward_inputs(pb, self.future_map)
                         batch._spec_pdmux_draft_pool = pool
                     else:
                         resolve_forward_inputs(batch, self.future_map)

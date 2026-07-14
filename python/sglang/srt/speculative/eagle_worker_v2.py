@@ -161,6 +161,16 @@ class _PhaseEventLog:
         if self._n % self.FLUSH_EVERY == 0:
             self.flush()
 
+    def record_cpu(self, phase, cpu_ms):
+        """CPU-wall-only record (gpu_ms=0): scheduler-thread time, which no CUDA
+        event pair can see. Needed to tell a GPU-idle bubble caused by a slow CPU
+        (fixable by folding launches into graphs) apart from one caused by a
+        CPU-GPU rendezvous (not fixable that way)."""
+        self._pending.append((phase, cpu_ms, None, None))
+        self._n += 1
+        if self._n % self.FLUSH_EVERY == 0:
+            self.flush()
+
     def flush(self, final=False):
         if self._file is None:
             if not self._pending:
@@ -170,7 +180,14 @@ class _PhaseEventLog:
             torch.cuda.synchronize()
         keep = []
         for phase, cpu_ms, s, e in self._pending:
-            if e.query():  # end done => start done (same stream, in order)
+            if e is None:  # CPU-only record
+                self._file.write(
+                    json.dumps(
+                        {"phase": phase, "gpu_ms": 0.0, "cpu_enqueue_ms": round(cpu_ms, 4)}
+                    )
+                    + "\n"
+                )
+            elif e.query():  # end done => start done (same stream, in order)
                 self._file.write(
                     json.dumps(
                         {
@@ -265,6 +282,29 @@ class _AcceptHistLog:
 
 
 _ACCEPT_HIST_LOG = _AcceptHistLog(_ACCEPT_HIST_OUT) if _ACCEPT_HIST else None
+
+
+@contextlib.contextmanager
+def _phase_span(name, stream=None):
+    """Event-pair timing for small-stream work enqueued OUTSIDE a @_profile_phase
+    call — the FutureMap gathers (enqueued by the scheduler), the relay stash and
+    the extend's verify_done wait (enqueued by the flush). Without these, the
+    measured "chain" (draft + draft_extend) omits real small-partition work, and
+    any change that MOVES work between the phases (e.g. folding the gathers into
+    the draft graph) reads as a regression. `stream` selects the stream the events
+    record on (default: current). No-op unless SGLANG_PHASE_EVENTS=1."""
+    if not _PHASE_EVENTS:
+        yield
+        return
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    t0 = time.perf_counter()
+    s.record(stream) if stream is not None else s.record()
+    try:
+        yield
+    finally:
+        e.record(stream) if stream is not None else e.record()
+        _PHASE_LOG.record(name, (time.perf_counter() - t0) * 1e3, s, e)
 
 
 def _profile_phase(name):
@@ -1936,6 +1976,54 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return False
         return bool(self._spec_pdmux_state["prefill_pending"])
 
+    # ---- chain instrumentation (SGLANG_PHASE_EVENTS=1; no-op otherwise) -------
+    # The tick's SMALL-partition work is [gathers(X), draft(X), extend(Y), stash(Y)]
+    # but only draft/extend were ever timed. `chain` spans the whole thing on the
+    # small stream (gathers-start -> stash-end), so it also captures the EAGER SEAMS
+    # between the phases — the quantity the zero-overhead memo's items 1-3 target.
+    # chain - (gathers+draft+extend+stash) = seams + the extend's verify_done wait.
+    def spec_phase_span(self, name):
+        """Event-pair around small-stream work the scheduler enqueues."""
+        return _phase_span(name)
+
+    @contextlib.contextmanager
+    def spec_cpu_span(self, name):
+        """CPU-wall span on the scheduler thread (no CUDA events). Used to split
+        the per-tick GPU bubble into 'CPU busy' vs 'CPU blocked on the GPU'."""
+        if not _PHASE_EVENTS:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            _PHASE_LOG.record_cpu(name, (time.perf_counter() - t0) * 1e3)
+
+    def spec_record_cpu(self, name, cpu_ms) -> None:
+        if _PHASE_EVENTS:
+            _PHASE_LOG.record_cpu(name, cpu_ms)
+
+    def spec_chain_span_begin(self) -> None:
+        """Called on the small stream, just before the tick's gathers."""
+        if not _PHASE_EVENTS:
+            return
+        s = torch.cuda.Event(enable_timing=True)
+        s.record()
+        self._spec_chain_span = (s, time.perf_counter())
+
+    def spec_chain_span_end(self) -> None:
+        """Called on the small stream, just after the tick's last relay stash."""
+        if not _PHASE_EVENTS:
+            return
+        pair = getattr(self, "_spec_chain_span", None)
+        if pair is None:
+            return  # tick with no gathers (non-fire tick at S>2): not a chain
+        self._spec_chain_span = None
+        s, t0 = pair
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        _PHASE_LOG.record("chain", (time.perf_counter() - t0) * 1e3, s, e)
+
     def flush_spec_pdmux_pending(
         self, slot: Optional[int] = None, decode_only: bool = False
     ) -> None:
@@ -1979,8 +2067,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Data dependency of extend(X): verify(X)-done (predict /
             # accept_lens / hidden_states). The fused forward waits EVERY
             # covered slot's verify.
-            for _, p in pend:
-                small.wait_event(p["verify_done"])
+            # Timed ("verify_wait"): the small stream reaches this point after
+            # [gathers, draft] and then BLOCKS until its slot's verify retires on
+            # the large partition. That stall is a TRUE data dependency, not a
+            # launch seam — it must be separated from the seams before any
+            # "fold the eager work into the graphs" work is justified.
+            with _phase_span("verify_wait", small):
+                for _, p in pend:
+                    small.wait_event(p["verify_done"])
             # M2.5 (step 10): the extend forward now overlaps the other
             # slot's verify, like the draft phase. The step-7 "extend-forward
             # || target-forward corrupts the drafter" hazard (tau 3.12 ->
@@ -2016,14 +2110,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker.spec_pdmux_fused_extend([p for _, p in pend])
-                for _, p in pend:
-                    if p["on_relay"] is not None:
-                        # FutureMap stash on the small stream, per slot (its own
-                        # future_indices, its own rows): the slot's next-tick
-                        # gathers follow in the same FIFO; prefill stashes (large
-                        # stream) are ordered via flush_done below + the prefill
-                        # relay event on the resolve side.
-                        p["on_relay"](p["result"])
+                with _phase_span("stash"):
+                    for _, p in pend:
+                        if p["on_relay"] is not None:
+                            # FutureMap stash on the small stream, per slot (its
+                            # own future_indices, its own rows): the slot's
+                            # next-tick gathers follow in the same FIFO; prefill
+                            # stashes (large stream) are ordered via flush_done
+                            # below + the prefill relay event on the resolve side.
+                            p["on_relay"](p["result"])
+                if decode_only:
+                    # End of the tick's small-stream chain (see spec_chain_span_*).
+                    self.spec_chain_span_end()
             for s, _ in pend:
                 if st["flush_done"][s] is None:
                     st["flush_done"][s] = dev.Event()
