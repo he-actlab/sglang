@@ -3352,10 +3352,29 @@ class Scheduler(
                     ret = slot
                     break
 
-            if ret is not None and self._spec_pdmux_draft_pool:
+            if (
+                ret is not None
+                and self._spec_pdmux_draft_pool
+                and self.spec_pdmux_n_slots > 2
+            ):
                 # The fused draft fires this tick: pull in every OTHER due slot
                 # (ascending slot order — every rank makes the identical
                 # decision, so TP lockstep is preserved).
+                #
+                # GUARDED ON S>2. Design-DraftPool's fusable pool is S-2 slots,
+                # i.e. EMPTY at S=2 — at S=2 the pool must stay exactly {ret},
+                # which is Design-PingPong. Without this guard the loop also ran
+                # at S=2 and pooled the OTHER slot whenever it happened to be
+                # draftable on the same tick (it becomes draftable again when
+                # admission/filtering invalidates its parked draft). Measured on
+                # a 32B-TP4 c=64 run: tick 42 built `draft_pool=0/1 pool_bs=64`.
+                # Consequences that guard removes: (a) at S=2 the drafter did
+                # work PingPong never did (drafting a non-verifying slot), so
+                # "S=2 == PingPong" did not hold; (b) under Design-InputParallel
+                # the 2-slot pool entered spec_pdmux_fused_draft() and tripped
+                # its "DraftPool x InputParallel is not implemented" assert,
+                # killing every rank — i.e. S=2 input-parallel (the 32B-TP4
+                # shipping config) could not run at all.
                 for j in range(self.spec_pdmux_n_slots):
                     if j == ret.spec_pdmux_slot or not self._spec_pdmux_draftable(j):
                         continue

@@ -1479,6 +1479,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             p = pendings[0]
             self._draft_extend_one(p["batch"], p["result"])
             return
+        if self._spec_pdmux_state["n_slots"] <= 2:
+            # Design-PingPong (S=2): extend fusion is NOT part of the design here
+            # (the fusable pool is S-2 = 0 slots). Unlike the draft pool, more than
+            # one pending extend at S=2 is LEGITIMATE — both slots can hold a
+            # deferred extend at a slot=None flush — and pre-DraftPool PingPong
+            # launched them one forward per slot (`for s in (0, 1)`). Keep exactly
+            # that: fusing here would (a) silently change the S=2 baseline and
+            # (b) trip the input-parallel assert below on the 32B-TP4 config.
+            for p in pendings:
+                self._draft_extend_one(p["batch"], p["result"])
+            return
         assert not self._spec_pdmux_input_parallel, (
             "Design-DraftPool fused extend x Design-InputParallel is not "
             "implemented (the fused extend would have to be partitioned across "
