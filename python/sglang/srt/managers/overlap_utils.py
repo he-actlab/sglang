@@ -187,7 +187,14 @@ class FutureMap:
         # below), and the full-buffer D2H may overlap the OTHER slot's
         # in-flight publish only on rows this slot never reads (bufs are
         # req_pool_idx-indexed; slots hold disjoint reqs).
-        self.publish_ready = [None, None]  # lazy device.Event(); spec_v2 only
+        # Design-DraftPool: one entry per sub-batch slot (S; 2 = PingPong).
+        from sglang.srt.server_args import get_global_server_args as _gsa
+
+        _sa = _gsa()
+        self.n_slots = (
+            _sa.spec_pdmux_slots if getattr(_sa, "enable_spec_pdmux", False) else 2
+        )
+        self.publish_ready = [None] * self.n_slots  # lazy device.Event(); spec_v2 only
         self.active_slot: Optional[int] = 0
 
     def _active_publish_events(self):
@@ -364,7 +371,11 @@ class FutureMap:
         # stream. Recorded per active slot; an untagged (None) publish records
         # BOTH slots' events (see the active_slot protocol in __init__).
         if self.spec_algo.is_some():
-            slots = (0, 1) if self.active_slot is None else (self.active_slot,)
+            slots = (
+                range(self.n_slots)
+                if self.active_slot is None
+                else (self.active_slot,)
+            )
             for s in slots:
                 if self.publish_ready[s] is None:
                     self.publish_ready[s] = torch.get_device_module(

@@ -918,6 +918,117 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft(self, batch: ScheduleBatch):
         if self._spec_pdmux_input_parallel and not batch.forward_mode.is_idle():
             return self._draft_input_parallel(batch)
+        raw = self._draft_raw(batch)
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
+        return self._build_verify_input(batch, batch.spec_info, *raw)
+
+    def spec_pdmux_fused_draft(self, pool: List[ScheduleBatch]):
+        """Design-DraftPool: draft SEVERAL sub-batch slots in ONE draft forward.
+
+        The drafter is weight-streaming bound, not compute bound (measured: at
+        8B-TP4 drafting N/4 instead of N saved only 7% of draft time), so the
+        cost of a draft forward is ~the cost of streaming the draft weights
+        K-1 times, almost independent of how many tokens ride along. Fusing the
+        pooled slots' token batches into one forward therefore streams the
+        drafter's weights ONCE for all of them: draft bandwidth per verified
+        sub-batch drops ~len(pool)x, which is both the draft-time saving and
+        (the real target at TP1) the drop in bandwidth CONTENTION with the
+        concurrently-running verify on the large partition.
+
+        The draft forward's raw outputs are all ROW-BLOCKED by request, so the
+        per-slot verify inputs are recovered by slicing rows and running the
+        (tiny) tree-build kernel per slot with that slot's own seq_lens and
+        bonus tokens. Verify is untouched: full slot batch, one slot per tick.
+        """
+        if len(pool) == 1:
+            return [self.draft(pool[0])]
+        assert not self._spec_pdmux_input_parallel, (
+            "Design-DraftPool x Design-InputParallel is not implemented "
+            "(the fused draft would have to be partitioned across ranks too)."
+        )
+        merged = self._spec_pdmux_merge_for_draft(pool)
+        parent_list, top_scores_index, draft_tokens, draft_probs = self._draft_raw(
+            merged
+        )
+        outs = []
+        off = 0
+        for pb in pool:
+            n = pb.batch_size()
+            outs.append(
+                self._build_verify_input(
+                    pb,
+                    pb.spec_info,
+                    parent_list[off : off + n],
+                    top_scores_index[off : off + n],
+                    draft_tokens[off : off + n],
+                    None if draft_probs is None else draft_probs[off : off + n],
+                )
+            )
+            off += n
+        assert off == merged.batch_size(), (off, merged.batch_size())
+        return outs
+
+    def _spec_pdmux_merge_for_draft(self, pool: List[ScheduleBatch]) -> ScheduleBatch:
+        """A throw-away ScheduleBatch that is the row-concatenation of the pooled
+        slots (reqs, req_pool_indices, seq_lens and the EagleDraftInput the
+        gathers just resolved). Shallow-copied off pool[0], so every non-per-
+        request field (pools, tree cache, forward mode, device, spec algo) is
+        inherited; the per-request fields are rebound to concatenations, never
+        mutated in place, so the live slot batches are untouched. prepare_for_draft
+        rebinds out_cache_loc on THIS object from the req_to_token rows each
+        slot's own prepare_for_decode already wrote, so the draft's KV writes
+        still land in each request's own rows."""
+        base = pool[0]
+        m = copy.copy(base)
+        m.reqs = [r for b in pool for r in b.reqs]
+        m.req_pool_indices = torch.cat([b.req_pool_indices for b in pool])
+        m.seq_lens = torch.cat([b.seq_lens for b in pool])
+        if all(b.seq_lens_cpu is not None for b in pool):
+            m.seq_lens_cpu = torch.cat([b.seq_lens_cpu for b in pool])
+            m.seq_lens_sum = int(m.seq_lens_cpu.sum())
+        else:
+            m.seq_lens_cpu = None
+            m.seq_lens_sum = None
+        m.out_cache_loc = None
+        m.input_ids = None
+        # topk=1 + no rejection sampling (asserted in server_args for S>2) is
+        # the only draft path that reads no sampling state; the shallow copy
+        # exists so ForwardBatch.init_new's grammar/rid writebacks cannot touch
+        # a live slot's SamplingBatchInfo.
+        m.sampling_info = copy.copy(base.sampling_info)
+        m.return_logprob = False
+        m.top_logprobs_nums = None
+        m.token_ids_logprobs = None
+        si: List[EagleDraftInput] = [b.spec_info for b in pool]
+        m.spec_info = EagleDraftInput(
+            topk_p=torch.cat([x.topk_p for x in si]),
+            topk_index=torch.cat([x.topk_index for x in si]),
+            hidden_states=(
+                torch.cat([x.hidden_states for x in si])
+                if si[0].hidden_states is not None
+                else None
+            ),
+            bonus_tokens=torch.cat([x.bonus_tokens for x in si]),
+            capture_hidden_mode=si[0].capture_hidden_mode,
+            future_indices=(
+                torch.cat([x.future_indices for x in si])
+                if si[0].future_indices is not None
+                else None
+            ),
+        )
+        return m
+
+    def _draft_raw(self, batch: ScheduleBatch):
+        """The draft model's K-1 chained forwards. Returns
+        (parent_list, top_scores_index, draft_tokens, draft_probs) — every
+        element ROW-BLOCKED by request (shape[0] == batch_size), which is what
+        lets Design-DraftPool concatenate several slots into one forward and
+        split the outputs back per slot."""
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = self.prepare_for_draft(
             draft_input,
@@ -958,13 +1069,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
-        if batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
-            )
+        return parent_list, top_scores_index, draft_tokens, draft_probs
 
+    def _build_verify_input(
+        self,
+        batch: ScheduleBatch,
+        draft_input: EagleDraftInput,
+        parent_list,
+        top_scores_index,
+        draft_tokens,
+        draft_probs,
+    ) -> EagleVerifyInput:
+        """Tree/chain assembly for ONE sub-batch, from that sub-batch's slice of
+        the (possibly fused) draft forward's raw outputs. Cheap next to the draft
+        forward: one kernel, no weight streaming."""
         # Build tree mask
         # Directly write to cuda graph buffers for verify attn
         tree_mask_buf, position_buf = (
@@ -1616,14 +1734,54 @@ class EAGLEWorkerV2(BaseSpecWorker):
           prefill_pending flush; joined by _spec_pdmux_join_flush_done.
         """
         dev = torch.get_device_module(self.device)
+        n = self.server_args.spec_pdmux_slots
         return {
-            "pending": [None, None],
-            "draft_done": [dev.Event(), dev.Event()],
-            "verify_done": [dev.Event(), dev.Event()],
-            "flush_done": [None, None],  # lazily created on first flush
+            "n_slots": n,
+            "pending": [None] * n,
+            "verify_done": [dev.Event() for _ in range(n)],
+            "flush_done": [None] * n,  # lazily created on first flush
             "prefill_pending": [],  # M2.7 deferred prefill draft-extends
             "prefill_flush_done": None,  # lazily created on first flush
+            # Design-DraftPool: a slot's draft is produced by a FUSED draft up
+            # to S-2 ticks before that slot's verify tick, so the verify input
+            # and the CUDA event that gates it are parked here in the meantime.
+            # ready_bs pins the request count the draft was built for: if the
+            # slot's composition changes (an admission merges into it) the
+            # scheduler drops the stale draft and the slot is simply re-drafted
+            # at its verify tick.
+            "ready_draft": [None] * n,
+            "ready_bs": [-1] * n,
+            "ready_ev": [None] * n,
+            # Event RING, not one event per slot: several slots' verifies (on
+            # later ticks) still reference the event a fused draft recorded, so
+            # re-recording the same Event object would silently re-point those
+            # waits at a LATER draft and serialize verify behind it. A ring of
+            # 2S is reused only after 2S fused drafts — long past every waiter.
+            "draft_ev_ring": [dev.Event() for _ in range(2 * n)],
+            "draft_ev_ct": 0,
         }
+
+    def spec_pdmux_has_ready_draft(self, slot: int) -> bool:
+        if not self.server_args.enable_spec_pdmux:
+            return False
+        return self._spec_pdmux_state["ready_draft"][slot] is not None
+
+    def spec_pdmux_ready_draft_bs(self, slot: int) -> int:
+        """Request count the parked draft was built for, or -1 if none."""
+        if not self.server_args.enable_spec_pdmux:
+            return -1
+        return self._spec_pdmux_state["ready_bs"][slot]
+
+    def spec_pdmux_invalidate_ready_draft(self, slot: int) -> None:
+        st = self._spec_pdmux_state
+        st["ready_draft"][slot] = None
+        st["ready_bs"][slot] = -1
+        st["ready_ev"][slot] = None
+
+    def spec_pdmux_has_pending_extend(self, slot: int) -> bool:
+        if not self.server_args.enable_spec_pdmux:
+            return False
+        return self._spec_pdmux_state["pending"][slot] is not None
 
     def spec_pdmux_has_prefill_pending(self) -> bool:
         """M2.7: whether any admitted prefill's draft extend (+ relay stash)
@@ -1659,7 +1817,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         st = self._spec_pdmux_state
         dev = torch.get_device_module(self.device)
         small = self._spec_pdmux_small_stream
-        for s in (0, 1) if slot is None else (slot,):
+        for s in range(st["n_slots"]) if slot is None else (slot,):
             p = st["pending"][s]
             if p is None:
                 continue
@@ -2058,40 +2216,77 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             elif concurrent:
-                # Draft on the SMALL stream. True input producers and their
-                # ordering: gathered spec extras + this slot's draft KV /
-                # graph statics (small-stream FIFO), SB fields + req_to_token
-                # (schedule stream -- the scheduler issued
-                # small.wait_stream(schedule_stream) before the gathers).
-                # NOT waited: the large stream -- the other slot's verify may
-                # still be running there; that concurrency is the point.
-                with (
-                    dev.stream(self._spec_pdmux_small_stream),
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
-                # verify(X) waits ONLY draft(X)-done (event, not a stream join).
-                draft_done = self._spec_pdmux_state["draft_done"][slot]
-                draft_done.record(self._spec_pdmux_small_stream)
-                dev.current_stream().wait_event(draft_done)
+                st = self._spec_pdmux_state
+                # Design-DraftPool: the scheduler put the slots whose drafts
+                # this tick FUSES on the batch (prepared + gathered, in slot
+                # order). Non-empty only on a fire tick, and then it always
+                # contains THIS slot (the pool fires exactly when this slot's
+                # draft is not already parked). At S=2 the pool is always
+                # exactly [batch] == Design-PingPong, unchanged.
+                pool = getattr(batch, "_spec_pdmux_draft_pool", None) or []
+                if pool:
+                    # ONE draft forward for all pooled slots, on the SMALL
+                    # stream. True input producers and their ordering: gathered
+                    # spec extras + the pooled slots' draft KV / graph statics
+                    # (small-stream FIFO), SB fields + req_to_token (schedule
+                    # stream -- the scheduler issued small.wait_stream before
+                    # the gathers). NOT waited: the large stream -- another
+                    # slot's verify may still be running there; that
+                    # concurrency is the point.
+                    with (
+                        dev.stream(self._spec_pdmux_small_stream),
+                        self.draft_worker.draft_tp_context(
+                            self.draft_worker.draft_runner.tp_group
+                        ),
+                        speculative_moe_backend_context(),
+                        speculative_moe_a2a_backend_context(),
+                        spec_stage_span("draft"),
+                    ):
+                        fused = self.draft_worker.spec_pdmux_fused_draft(pool)
+                    ev = st["draft_ev_ring"][
+                        st["draft_ev_ct"] % len(st["draft_ev_ring"])
+                    ]
+                    st["draft_ev_ct"] += 1
+                    ev.record(self._spec_pdmux_small_stream)
+                    for pb, vi in zip(pool, fused):
+                        ps = pb.spec_pdmux_slot
+                        st["ready_draft"][ps] = vi
+                        st["ready_bs"][ps] = pb.batch_size()
+                        st["ready_ev"][ps] = ev
+                # Consume THIS slot's draft (produced above, or parked by an
+                # earlier tick's fused draft).
+                verify_input: EagleVerifyInput = st["ready_draft"][slot]
+                assert verify_input is not None, (
+                    f"spec-pdmux slot {slot} reached its verify tick with no "
+                    "draft: the scheduler must either park one for it or put "
+                    "it in this tick's fused-draft pool."
+                )
+                ready_ev = st["ready_ev"][slot]
+                self.spec_pdmux_invalidate_ready_draft(slot)
+                # verify(X) waits ONLY the draft that produced its verify input
+                # (event, not a stream join). On a non-fire tick that event was
+                # recorded ticks ago and the wait is free -- the point of the
+                # pool: the drafter is off the verify critical path for S-2 of
+                # every S-1 ticks.
+                dev.current_stream().wait_event(ready_ev)
                 # verify() records the other verify_input fields on the
                 # forward stream (record_stream_for_v2_verify); draft_probs
                 # is the one small-stream allocation it does not cover.
                 record_stream_each(
                     (verify_input.draft_probs,), dev.current_stream()
                 )
-                # Steady-state key move: launch the OTHER slot's deferred
-                # extend(+stash) now, AFTER this tick's draft is in the small
-                # FIFO and BEFORE this tick's verify is enqueued on large:
-                # the whole small-stream chain [extend(1-X), gathers, draft]
-                # executes under this tick's verify (M2.5: including the
-                # extend forward -- see flush_spec_pdmux_pending).
-                self.flush_spec_pdmux_pending(slot=1 - slot)
+                # Steady-state key move: launch the OTHER slots' deferred
+                # extends(+stash) now, AFTER this tick's draft is in the small
+                # FIFO and BEFORE this tick's verify is enqueued on large: the
+                # whole small-stream chain [extends, gathers, fused draft]
+                # executes under this tick's verify (M2.5: including the extend
+                # forward -- see flush_spec_pdmux_pending). Only the slot that
+                # verified LAST tick can have a pending extend here (the pooled
+                # slots' were flushed before their gathers); at S=2 this is
+                # exactly the old flush(1-slot).
+                for other in range(st["n_slots"]):
+                    if other != slot:
+                        self.flush_spec_pdmux_pending(slot=other)
             else:
                 # spec-pdmux serialize/kill-switch, non-overlap and idle paths:
                 # M1 strictly-sequential joins.

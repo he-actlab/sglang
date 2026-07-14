@@ -2433,6 +2433,20 @@ class ServerArgs:
         int,
         "spec-pdmux M2.6 admission pacing: hard bound on how many scheduler ticks a waiting request may be deferred (bounds the TTFT cost; ~20-25 ms per decode tick at slot-bs 16).",
     ] = 16
+    spec_pdmux_slots: A[
+        int,
+        "Design-DraftPool: number of sub-batch slots S. 2 (default) = Design-PingPong "
+        "(one slot verifies, one drafts, alternating). S>2 generalizes to a DRAFT POOL: "
+        "one slot verifies per decode tick (verify batch undiminished) while the slots "
+        "whose drafts are due are drafted TOGETHER in ONE fused draft forward (their "
+        "token batches concatenated -> the drafter streams its weights once for all of "
+        "them). Of the S slots, exactly one is verifying and one has a not-yet-processed "
+        "verify result (the overlap scheduler runs the CPU one tick ahead), so the fusable "
+        "pool is S-2 slots and the fused draft fires every S-2 ticks: draft weight traffic "
+        "per verified sub-batch drops ~(S-2)x. Costs: per-request latency ~S x verify (each "
+        "request is verified every S ticks) and ~S x KV in flight -- a throughput-mode "
+        "design for saturated queues.",
+    ] = 2
     spec_pdmux_draft_mode: A[
         str,
         Arg(
@@ -7114,6 +7128,28 @@ class ServerArgs:
                 assert len(parts) == 2 and all(
                     p.strip().isdigit() for p in parts
                 ), "--spec-pdmux-sm-split must be 'LARGE,SMALL' (two integers)."
+            # Design-DraftPool: S sub-batch slots.
+            assert (
+                2 <= self.spec_pdmux_slots <= 8
+            ), "--spec-pdmux-slots must be in [2, 8] (2 = Design-PingPong)."
+            if self.spec_pdmux_slots > 2:
+                assert self.speculative_num_steps > 0, (
+                    "--spec-pdmux-slots > 2 (Design-DraftPool) needs a drafting "
+                    "configuration (speculative_num_steps > 0)."
+                )
+                assert self.speculative_eagle_topk == 1, (
+                    "--spec-pdmux-slots > 2 currently supports topk=1 chain drafting "
+                    "only: the fused draft concatenates the pooled slots' token "
+                    "batches and re-splits the raw draft outputs per slot, which the "
+                    "tree (topk>1) score/parent layout does not carry through as a "
+                    "row slice."
+                )
+                assert not self.speculative_use_rejection_sampling, (
+                    "--spec-pdmux-slots > 2 does not support "
+                    "--speculative-use-rejection-sampling (the fused draft would need "
+                    "a merged SamplingBatchInfo; the non-RS topk=1 draft path reads "
+                    "none)."
+                )
             # Design-FullReplicate / Design-InputParallel (unsharded drafter).
             if self.spec_pdmux_draft_mode != "shard":
                 assert self.tp_size > 1, (

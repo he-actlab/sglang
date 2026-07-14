@@ -1003,11 +1003,27 @@ class Scheduler(
             # draft_done/verify_done event edges are identical on all ranks.
             # SYNC_TOKEN_IDS_ACROSS_TP=1 remains available as a bring-up
             # tripwire for rank desync (off in normal operation).
+            # Design-DraftPool: S slots (S=2 == Design-PingPong, unchanged).
+            self.spec_pdmux_n_slots = self.server_args.spec_pdmux_slots
             self.spec_pdmux_slots = [
-                ScheduleBatch(reqs=[], batch_is_full=False),
-                ScheduleBatch(reqs=[], batch_is_full=False),
+                ScheduleBatch(reqs=[], batch_is_full=False)
+                for _ in range(self.spec_pdmux_n_slots)
             ]
             self.spec_pdmux_next_slot = 0  # tick-parity pointer (decode)
+            # Design-DraftPool bookkeeping:
+            # - _last_verify_ct[s]: forward_ct of slot s's last verify. A slot's
+            #   CPU-side request state (kv_committed_len / finished()) is only
+            #   current once process_batch_result has run for that verify, and
+            #   the overlap loop processes results AFTER launching the next
+            #   batch -> at get_next_batch time only forwards <= forward_ct-1
+            #   are processed. So slot s may be (re)prepared+drafted this tick
+            #   iff _last_verify_ct[s] < self.forward_ct. That is what caps the
+            #   fusable pool at S-2 (one slot verifies, one is result-pending).
+            # - _draft_pool: the slots prepared THIS tick whose drafts the
+            #   worker fuses into one forward (their gathers run first, on the
+            #   small stream, in run_batch).
+            self._spec_pdmux_last_verify_ct = [-1] * self.spec_pdmux_n_slots
+            self._spec_pdmux_draft_pool: List[ScheduleBatch] = []
             self._spec_pdmux_union_bs = 0  # for the batch_is_full clear-on-shrink
             self._spec_pdmux_kv_throttled = False  # M2.3 admission-throttle latch (log-only)
             self._spec_pdmux_defer_ticks = 0  # M2.6 admission-pacing deferral counter
@@ -1038,7 +1054,14 @@ class Scheduler(
             # gather waits it once (a new request's first decode reads the
             # rows that prefill stashed on the large stream).
             self._spec_pdmux_prefill_relay_ev = None
-            self._spec_pdmux_prefill_relay_pending = [False, False]
+            self._spec_pdmux_prefill_relay_pending = [False] * self.spec_pdmux_n_slots
+            assert self.spec_pdmux_n_slots == 2 or self.spec_pdmux_concurrent, (
+                "--spec-pdmux-slots > 2 (Design-DraftPool) requires the concurrent "
+                "path: overlap scheduling ON and SGLANG_SPEC_PDMUX_SERIALIZE unset "
+                "(the fused draft is enqueued on the small stream and consumed by a "
+                "LATER tick's verify through a CUDA event -- the serialized build "
+                "joins the streams around every drafter call and has no such handoff)."
+            )
             if self.spec_pdmux_concurrent:
                 logger.info(
                     "[spec-pdmux r%d] M2.2 concurrent mode ON (per-slot CUDA "
@@ -1374,12 +1397,16 @@ class Scheduler(
         if not self.enable_overlap:
             return
 
-        # spec-pdmux M2.0: two alternating sub-batch slots share this ring;
-        # depth 4 gives every record at least the stock 2-tick lifetime per
-        # slot under any prefill/decode interleave (FIFO-4 dominates a
-        # 2-per-slot split, and needs no slot-aware indexing).
+        # spec-pdmux M2.0: the alternating sub-batch slots share this ring;
+        # depth 2*S gives every record at least the stock 2-tick lifetime per
+        # slot under any prefill/decode interleave (FIFO-2S dominates a
+        # 2-per-slot split, and needs no slot-aware indexing). Design-DraftPool
+        # also needs the record to outlive the draft->verify gap (a slot is
+        # drafted up to S-2 ticks before it verifies); 2*S covers that too.
         self.batch_record_buf = [None] * (
-            4 if self.server_args.enable_spec_pdmux else 2
+            2 * self.server_args.spec_pdmux_slots
+            if self.server_args.enable_spec_pdmux
+            else 2
         )
         self.batch_record_ct = 0
 
@@ -2845,7 +2872,7 @@ class Scheduler(
         batch_is_full = False on filter/retract shrink; one tick of latency
         at most, and admission runs on the same tick as the clear)."""
         union = self.running_batch
-        union.reqs = self.spec_pdmux_slots[0].reqs + self.spec_pdmux_slots[1].reqs
+        union.reqs = [r for s in self.spec_pdmux_slots for r in s.reqs]
         for hb in self._spec_pdmux_held_prefill:
             # M2.7: held (not-yet-slotted) admissions are running requests —
             # budgets, abort scans and idle checks must see them.
@@ -2891,23 +2918,25 @@ class Scheduler(
 
     def _spec_pdmux_admit(self, batch: ScheduleBatch) -> None:
         """Route a finished (non-empty, filtered) prefill batch's requests
-        into the two slots, size-balanced (greedy: each request to the
-        currently smaller slot). Splits the batch per-request when safe;
-        otherwise routes it whole to the smaller slot. Assignments are sticky:
-        requests never migrate between slots afterwards."""
+        into the S slots, size-balanced (greedy: each request to the currently
+        smallest slot). Splits the batch per-request when safe; otherwise
+        routes it whole to the smallest slot. Assignments are sticky: requests
+        never migrate between slots afterwards."""
+        n_slots = self.spec_pdmux_n_slots
         sizes = self._spec_pdmux_slot_sizes()
-        keep = ([], [])
+        keep: List[List[int]] = [[] for _ in range(n_slots)]
         for i in range(batch.batch_size()):
-            t = 0 if sizes[0] <= sizes[1] else 1
+            t = min(range(n_slots), key=lambda s: sizes[s])
             keep[t].append(i)
             sizes[t] += 1
 
-        parts: List[Optional[ScheduleBatch]] = [None, None]
-        if not keep[0] or not keep[1]:
-            parts[0 if keep[0] else 1] = batch
+        parts: List[Optional[ScheduleBatch]] = [None] * n_slots
+        targets = [t for t in range(n_slots) if keep[t]]
+        if len(targets) == 1:
+            parts[targets[0]] = batch
         elif not self._spec_pdmux_can_split(batch):
             base = self._spec_pdmux_slot_sizes()
-            tgt = 0 if base[0] <= base[1] else 1
+            tgt = min(range(n_slots), key=lambda s: base[s])
             parts[tgt] = batch
             logger.info(
                 "[spec-pdmux-sched r%d] unsplittable prefill batch bs=%d -> slot=%d whole",
@@ -2916,24 +2945,30 @@ class Scheduler(
                 tgt,
             )
         else:
-            # Shallow-copy the batch, give the copy its OWN sampling_info
-            # (rebuilt; guarded by _spec_pdmux_can_split) and its own
-            # spec_info shell (filter under overlap only slices
-            # future_indices), then filter both objects to disjoint halves.
-            # ScheduleBatch.filter_batch only REBINDS fields (list/tensor
-            # slicing), so the pre-filter tensors shared by the shallow copy
-            # are never mutated.
-            half = copy.copy(batch)
-            half.sampling_info = SamplingBatchInfo.from_schedule_batch(
-                half, self.model_config.vocab_size
-            )
-            if batch.spec_info is not None:
-                half.spec_info = copy.copy(batch.spec_info)
-            half.filter_batch(keep_indices=keep[1])
-            batch.filter_batch(keep_indices=keep[0])
-            parts[0], parts[1] = batch, half
+            # Shallow-copy the batch once per extra target, give each copy its
+            # OWN sampling_info (rebuilt; guarded by _spec_pdmux_can_split) and
+            # its own spec_info shell (filter under overlap only slices
+            # future_indices), then filter every object to its disjoint index
+            # set. ScheduleBatch.filter_batch only REBINDS fields (list/tensor
+            # slicing), so the pre-filter tensors shared by the shallow copies
+            # are never mutated -- but every copy must be taken BEFORE the
+            # original is filtered.
+            copies = []
+            for t in targets[1:]:
+                part = copy.copy(batch)
+                part.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                    part, self.model_config.vocab_size
+                )
+                if batch.spec_info is not None:
+                    part.spec_info = copy.copy(batch.spec_info)
+                copies.append((t, part))
+            for t, part in copies:
+                part.filter_batch(keep_indices=keep[t])
+                parts[t] = part
+            batch.filter_batch(keep_indices=keep[targets[0]])
+            parts[targets[0]] = batch
 
-        for t in (0, 1):
+        for t in range(n_slots):
             if parts[t] is None:
                 continue
             slot = self.spec_pdmux_slots[t]
@@ -2943,14 +2978,12 @@ class Scheduler(
                 slot.merge_batch(parts[t])
         sizes = self._spec_pdmux_slot_sizes()
         logger.info(
-            "[spec-pdmux-sched r%d] tick=%d ADMIT n0=%d n1=%d slot_sizes=%d/%d "
+            "[spec-pdmux-sched r%d] tick=%d ADMIT n=%s slot_sizes=%s "
             "free_tok=%d evict_tok=%d",
             self.ps.tp_rank,
             self.forward_ct + 1,
-            len(keep[0]),
-            len(keep[1]),
-            sizes[0],
-            sizes[1],
+            "/".join(str(len(k)) for k in keep),
+            "/".join(str(s) for s in sizes),
             self.token_to_kv_pool_allocator.available_size(),
             self.tree_cache.evictable_size(),
         )
@@ -3045,6 +3078,65 @@ class Scheduler(
             )
         return ok
 
+    def _spec_pdmux_prepare_slot(self, idx: int) -> Optional[ScheduleBatch]:
+        """update_running_batch (filter/retract + verify-tree KV alloc) for one
+        slot, tagged. Under Design-DraftPool this runs at the slot's DRAFT tick,
+        which is up to S-2 ticks before its verify tick — the allocation must
+        exist before the draft, since prepare_for_draft reads the draft's write
+        targets out of the just-written req_to_token rows."""
+        slot = self.spec_pdmux_slots[idx]
+        # Tag BEFORE update_running_batch: the M2.3 headroom assert inside
+        # prepare_for_decode's verify-tree alloc reports it.
+        slot.spec_pdmux_slot = idx
+        slot = self.update_running_batch(slot)
+        self.spec_pdmux_slots[idx] = slot
+        self._refresh_spec_pdmux_union()  # update may filter/retract
+        if slot.is_empty():
+            return None
+        slot.spec_pdmux_slot = idx
+        return slot
+
+    def _spec_pdmux_settled_upto(self) -> int:
+        """forward_iter of the newest batch whose result process_batch_result has
+        already consumed. The overlap loop launches BEFORE it processes
+        (get_next_batch -> run_batch -> pop_and_process), so the batches still in
+        result_queue are exactly the unsettled ones."""
+        rq = getattr(self, "result_queue", None)
+        if rq is None:
+            return self.forward_ct  # non-overlap: results settle synchronously
+        return self.forward_ct - len(rq)
+
+    def _spec_pdmux_draftable(self, idx: int) -> bool:
+        """Whether slot idx may be (re)prepared and pooled into THIS tick's fused
+        draft. Two conditions, and between them they are what caps the pool:
+
+        - its last verify's RESULT must be settled on the CPU (kv_committed_len /
+          finished() feed prepare_for_decode). The slot that verified last tick is
+          therefore excluded — of S slots one is verifying and one is
+          result-pending, so a fused draft carries the verifying slot + S-2 others
+          = S-1 sub-batches, and fires every S-1 ticks in steady state;
+        - its deferred draft-extend must already be LAUNCHED, since the gathers
+          read the FutureMap stash that extend writes. This one is not just
+          bookkeeping: it is what gives the fused draft its SLACK. A pooled slot's
+          extend was launched on an earlier tick, so the fused draft depends only
+          on verifies that are already complete and can start under the PREVIOUS
+          tick's verify. Pooling the just-verified slot instead would chain
+          verify(t-1) -> extend -> fused draft -> verify(t) and expose the whole
+          draft between two verifies.
+
+        Not satisfying these is not fatal: if NO slot is poolable the tick falls
+        back to the Design-PingPong path (see the caller), which is what a single
+        populated slot (c=1) does on every tick.
+        """
+        slot = self.spec_pdmux_slots[idx]
+        if slot.is_empty() or slot.is_prefill_only:
+            return False
+        if self.model_worker.spec_pdmux_has_ready_draft(idx):
+            return False  # already drafted; parked until its verify tick
+        if self.model_worker.spec_pdmux_has_pending_extend(idx):
+            return False
+        return self._spec_pdmux_last_verify_ct[idx] <= self._spec_pdmux_settled_upto()
+
     def _get_next_batch_to_run_spec_pdmux(self) -> Optional[ScheduleBatch]:
         """spec-pdmux M2.0: TWO STATIC SUB-BATCHES, strictly sequential.
 
@@ -3069,6 +3161,7 @@ class Scheduler(
         self._abort_on_waiting_timeout()
         self._refresh_spec_pdmux_union()
         self._abort_on_running_timeout()  # scans the union facade
+        self._spec_pdmux_draft_pool = []  # rebuilt below on decode ticks only
 
         # M2.7: release held admissions once the worker has LAUNCHED their
         # deferred draft prefill-extend (+ relay stash) — from then on the
@@ -3170,46 +3263,114 @@ class Scheduler(
             )
             sizes = self._spec_pdmux_slot_sizes()
             logger.info(
-                "[spec-pdmux-sched r%d] tick=%d PREFILL bs=%d slot_sizes=%d/%d",
+                "[spec-pdmux-sched r%d] tick=%d PREFILL bs=%d slot_sizes=%s",
                 self.ps.tp_rank,
                 self.forward_ct + 1,
                 new_batch.batch_size(),
-                sizes[0],
-                sizes[1],
+                "/".join(str(s) for s in sizes),
             )
             ret = new_batch
         else:
-            # Decode: one slot per tick, alternating; skip empty slots.
+            # Design-DraftPool decode tick.
+            #   1. VERIFY slot X: round-robin, skipping empty slots. Its draft
+            #      is normally READY (produced by an earlier tick's fused draft)
+            #      -> no drafting happens this tick at all.
+            #   2. If X's draft is NOT ready (S=2 always; S>2 every S-1 ticks),
+            #      fire the FUSED DRAFT: X plus every other slot that is due a
+            #      draft goes into one pool, prepared here (verify-tree KV) and
+            #      drafted by the worker as ONE forward on the small stream
+            #      (the drafter streams its weights once for all of them).
+            # At S=2 the pool is always exactly {X} and this is byte-for-byte
+            # Design-PingPong: [gathers(X), draft(X), extend(1-X), verify(X)].
+            self._spec_pdmux_draft_pool = []
+            # A slot admitted into (or filtered) since its draft holds a ready
+            # draft built for a DIFFERENT request set -> drop it; the slot is
+            # simply re-drafted at its verify tick (the S=2 cadence).
+            for s, sb in enumerate(self.spec_pdmux_slots):
+                rbs = self.model_worker.spec_pdmux_ready_draft_bs(s)
+                if rbs >= 0 and rbs != sb.batch_size():
+                    self.model_worker.spec_pdmux_invalidate_ready_draft(s)
+            n = self.spec_pdmux_n_slots
             ret = None
-            for _ in range(2):
-                idx = self.spec_pdmux_next_slot
-                self.spec_pdmux_next_slot ^= 1
+            start = self.spec_pdmux_next_slot
+            # Pass 1 (the DraftPool schedule): the next slot that either already
+            # holds a parked draft (verify it, no drafting at all this tick) or
+            # may be pooled into this tick's fused draft.
+            for k in range(n):
+                idx = (start + k) % n
                 slot = self.spec_pdmux_slots[idx]
                 if slot.is_empty() or slot.is_prefill_only:
                     continue
-                # Tag BEFORE update_running_batch: the M2.3 headroom assert
-                # inside prepare_for_decode's verify-tree alloc reports it.
-                slot.spec_pdmux_slot = idx
-                slot = self.update_running_batch(slot)
-                self.spec_pdmux_slots[idx] = slot
-                self._refresh_spec_pdmux_union()  # update may filter/retract
-                if slot.is_empty():
+                if self.model_worker.spec_pdmux_has_ready_draft(idx):
+                    slot.spec_pdmux_slot = idx
+                elif self._spec_pdmux_draftable(idx):
+                    slot = self._spec_pdmux_prepare_slot(idx)
+                    if slot is None:
+                        continue
+                    self._spec_pdmux_draft_pool.append(slot)
+                else:
                     continue
-                slot.spec_pdmux_slot = idx
+                self.spec_pdmux_next_slot = (idx + 1) % n
+                ret = slot
+                break
+
+            if ret is None:
+                # Pass 2 == Design-PingPong, byte for byte: no slot is poolable
+                # this tick. That is the DEGENERATE cadence a single populated
+                # slot takes on EVERY tick (c=1, warmup, drain): the slot's own
+                # deferred extend is still pending and its last verify's result
+                # is still in flight. The 2-slot build runs it anyway and both
+                # mechanisms that make that safe are still in place — run_batch
+                # flushes the same-slot pending extend BEFORE the gathers, and
+                # prepare_for_decode's 2x alloc reserve absorbs the one-verify-
+                # stale kv_committed_len. Falling back here (rather than idling)
+                # is what keeps c=1 identical to the 2-slot build.
+                for _ in range(n):
+                    idx = self.spec_pdmux_next_slot
+                    self.spec_pdmux_next_slot = (idx + 1) % n
+                    slot = self.spec_pdmux_slots[idx]
+                    if slot.is_empty() or slot.is_prefill_only:
+                        continue
+                    if self.model_worker.spec_pdmux_has_ready_draft(idx):
+                        slot.spec_pdmux_slot = idx
+                        ret = slot
+                        break
+                    slot = self._spec_pdmux_prepare_slot(idx)
+                    if slot is None:
+                        continue
+                    self._spec_pdmux_draft_pool = [slot]
+                    ret = slot
+                    break
+
+            if ret is not None and self._spec_pdmux_draft_pool:
+                # The fused draft fires this tick: pull in every OTHER due slot
+                # (ascending slot order — every rank makes the identical
+                # decision, so TP lockstep is preserved).
+                for j in range(self.spec_pdmux_n_slots):
+                    if j == ret.spec_pdmux_slot or not self._spec_pdmux_draftable(j):
+                        continue
+                    sb = self._spec_pdmux_prepare_slot(j)
+                    if sb is not None:
+                        self._spec_pdmux_draft_pool.append(sb)
+                self._spec_pdmux_draft_pool.sort(key=lambda b: b.spec_pdmux_slot)
+
+            if ret is not None:
                 sizes = self._spec_pdmux_slot_sizes()
                 logger.info(
                     "[spec-pdmux-sched r%d] tick=%d DECODE slot=%d bs=%d "
-                    "slot_sizes=%d/%d free_tok=%d",
+                    "draft_pool=%s pool_bs=%d slot_sizes=%s free_tok=%d",
                     self.ps.tp_rank,
                     self.forward_ct + 1,
-                    idx,
-                    slot.batch_size(),
-                    sizes[0],
-                    sizes[1],
+                    ret.spec_pdmux_slot,
+                    ret.batch_size(),
+                    "/".join(
+                        str(b.spec_pdmux_slot) for b in self._spec_pdmux_draft_pool
+                    )
+                    or "-",
+                    sum(b.batch_size() for b in self._spec_pdmux_draft_pool),
+                    "/".join(str(s) for s in sizes),
                     self.token_to_kv_pool_allocator.available_size(),
                 )
-                ret = slot
-                break
 
         # Stock tail (require_mlp_sync is False under the spec-pdmux guard:
         # tp=1, no DP attention — both calls are pass-throughs kept for parity).
@@ -3702,6 +3863,13 @@ class Scheduler(
             # either slot at merge time, so their publish must record BOTH
             # slots' events.
             self.future_map.active_slot = getattr(batch, "spec_pdmux_slot", None)
+            if self.future_map.active_slot is not None:
+                # Design-DraftPool: this slot's CPU-side request state is stale
+                # until process_batch_result runs for THIS verify (one tick
+                # later) -> it cannot be re-prepared/drafted before then.
+                self._spec_pdmux_last_verify_ct[
+                    self.future_map.active_slot
+                ] = self.forward_ct
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3724,15 +3892,32 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Self-gates on batch.spec_info.future_indices; non-spec_v2
-                # no-ops (ForwardBatch.init_new lazily computes the sum).
-                self.future_map.resolve_seq_lens_cpu(batch)
-
                 spec_pdmux_slot = (
                     getattr(batch, "spec_pdmux_slot", None)
                     if self.spec_pdmux_concurrent
                     else None
                 )
+                # Design-DraftPool: the slots whose drafts this tick FUSES into
+                # one forward. Non-empty only on a fire tick, and then it always
+                # contains this tick's verify slot (the pool fires exactly when
+                # that slot's draft is not already ready). Empty => this slot's
+                # draft was produced by an earlier tick and its seq_lens were
+                # resolved THERE; re-resolving here would also fail, since its
+                # spec_info is about to become the stored EagleVerifyInput
+                # (no future_indices).
+                pool: List[ScheduleBatch] = (
+                    self._spec_pdmux_draft_pool if spec_pdmux_slot is not None else []
+                )
+                # Self-gates on batch.spec_info.future_indices; non-spec_v2
+                # no-ops (ForwardBatch.init_new lazily computes the sum).
+                if pool:
+                    for pb in pool:
+                        self.future_map.active_slot = pb.spec_pdmux_slot
+                        self.future_map.resolve_seq_lens_cpu(pb)
+                    self.future_map.active_slot = spec_pdmux_slot
+                elif spec_pdmux_slot is None:
+                    self.future_map.resolve_seq_lens_cpu(batch)
+
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
@@ -3775,17 +3960,22 @@ class Scheduler(
                         # the M2.6 sync-free plan work in flashinfer_backend).
                         small = self._spec_pdmux_small_stream
                         small.wait_stream(self.schedule_stream)
-                        if self._spec_pdmux_prefill_relay_pending[spec_pdmux_slot]:
-                            small.wait_event(self._spec_pdmux_prefill_relay_ev)
-                            self._spec_pdmux_prefill_relay_pending[
-                                spec_pdmux_slot
-                            ] = False
-                        # Same-slot pending extend must precede the gathers
-                        # (only populated when this slot also ran last tick,
-                        # e.g. the other slot is empty).
-                        self.model_worker.flush_spec_pdmux_pending(spec_pdmux_slot)
-                        with self.device_module.stream(small):
-                            resolve_forward_inputs(batch, self.future_map)
+                        # Design-DraftPool: gathers for every slot in this
+                        # tick's fused draft (S=2: exactly [batch], i.e. the
+                        # Design-PingPong enqueue order, unchanged). On a
+                        # non-fire tick the pool is empty and NO gathers run —
+                        # the small stream carries only the deferred extend.
+                        for pb in pool:
+                            s = pb.spec_pdmux_slot
+                            if self._spec_pdmux_prefill_relay_pending[s]:
+                                small.wait_event(self._spec_pdmux_prefill_relay_ev)
+                                self._spec_pdmux_prefill_relay_pending[s] = False
+                            # Same-slot pending extend must precede the gathers
+                            # (they read the stash it writes).
+                            self.model_worker.flush_spec_pdmux_pending(s)
+                            with self.device_module.stream(small):
+                                resolve_forward_inputs(pb, self.future_map)
+                        batch._spec_pdmux_draft_pool = pool
                     else:
                         resolve_forward_inputs(batch, self.future_map)
                         if (
@@ -3864,9 +4054,8 @@ class Scheduler(
                                     self.forward_stream
                                 )
                                 self._spec_pdmux_prefill_relay_pending = [
-                                    True,
-                                    True,
-                                ]
+                                    True
+                                ] * self.spec_pdmux_n_slots
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
