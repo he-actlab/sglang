@@ -1334,19 +1334,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # with the dup group's CA already off -- both stuck kernels
                 # then belong to the _TP CA object, i.e. the hazard is the
                 # CA-V2 protocol under concurrent multi-stream issue, not
-                # which group owns the object). Concurrent CA+CA was never
-                # probe-validated (greenctx_nccl_probe's occupant was a
-                # GEMM). Under spec-pdmux at tp>1, route ALL TP all-reduces
-                # (draft comm AND verify comm) over pynccl: probe-measured
-                # 15-27us in the relevant size band (vs 14-19us custom AR),
-                # and NCCL's protocol is multi-comm-safe by design. Stock
-                # servers (no --enable-spec-pdmux) are unaffected.
+                # which group owns the object). Deadlock conditions
+                # (dev-env/ca_v2_issue_draft.md): a resident spin-polling CA
+                # kernel waiting on peer flags while ANOTHER spinning
+                # collective kernel holds the SMs its not-yet-resident peer
+                # blocks need -- CA||CA, or CA||continuously-spinning-pynccl
+                # (the Design-Shard drafter's ~118 per-layer-AR chain wedged
+                # the verify comm's CA with the dup comm's CA already off).
+                #
+                # The dup (draft) comm therefore NEVER gets custom-AR under
+                # spec-pdmux; pynccl carries its collectives (probe-measured
+                # 15-27us in the relevant size band vs 14-19us custom AR).
                 _dup.ca_comm = None
-                _ps._TP.ca_comm = None
+                # The VERIFY comm keeps custom-AR unless draft-mode=shard.
+                # In 'shard' mode the TP-sharded drafter spins a per-layer
+                # pynccl AR chain on the small partition every tick -- the
+                # measured CA||spinning-pynccl wedge above -- so CA must be
+                # off on BOTH comms. In 'replicate'/'input-parallel' modes
+                # the drafter is unsharded: the small partition carries only
+                # compute plus ONE pynccl all-gather per decode tick on the
+                # dup comm -- no concurrent spinning collective -- and CA on
+                # the verify comm alone is probe-validated deadlock-free
+                # (dev-env/ca_verify_probe.py, 2xA100 NVLink 92/16 green
+                # pair: 128x1280KB CA ARs + 1 pynccl AG per tick on LARGE vs
+                # small-partition compute [arm a] and compute + the exact
+                # InputParallel i64 (16,3) pynccl AG [arm b] -- 520/520
+                # iterations clean on both arms, while the ca_shared
+                # positive control wedged 1/1 on the same pair). Stock
+                # servers (no --enable-spec-pdmux) are unaffected.
+                if self.server_args.spec_pdmux_draft_mode == "shard":
+                    _ps._TP.ca_comm = None
                 logger.info(
                     "[spec-pdmux r%d] dedicated DRAFT communicator ready: "
                     "dup group '%s' pynccl=%s(enabled=%s) custom_ar=%s(%s) "
-                    "mscclpp=%s symm_mem=%s",
+                    "mscclpp=%s symm_mem=%s | verify comm custom_ar=%s",
                     self.tp_rank,
                     _dup.unique_name,
                     _dup.pynccl_comm is not None,
@@ -1359,6 +1380,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ),
                     _dup.pymscclpp_comm is not None,
                     _dup.torch_symm_mem_comm is not None,
+                    (
+                        "off"
+                        if _ps._TP.ca_comm is None
+                        else (
+                            "disabled"
+                            if _ps._TP.ca_comm.disabled
+                            else "enabled"
+                        )
+                    ),
                 )
             initialize_dp_attention(
                 server_args=self.server_args,
