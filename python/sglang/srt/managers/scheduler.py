@@ -3106,15 +3106,24 @@ class Scheduler(
             return self.forward_ct  # non-overlap: results settle synchronously
         return self.forward_ct - len(rq)
 
-    def _spec_pdmux_next_verifier(self) -> Optional[int]:
-        """The slot that will verify NEXT tick (round-robin, skipping empties)."""
+    def _spec_pdmux_upcoming_verifiers(self, count: int) -> List[int]:
+        """The next `count` slots that will verify, in order (round-robin from the
+        parity pointer, skipping empty slots)."""
         n = self.spec_pdmux_n_slots
+        out: List[int] = []
         for k in range(n):
             idx = (self.spec_pdmux_next_slot + k) % n
             sb = self.spec_pdmux_slots[idx]
             if not sb.is_empty() and not sb.is_prefill_only:
-                return idx
-        return None
+                out.append(idx)
+                if len(out) == count:
+                    break
+        return out
+
+    def _spec_pdmux_next_verifier(self) -> Optional[int]:
+        """The slot that will verify NEXT tick (round-robin, skipping empties)."""
+        nv = self._spec_pdmux_upcoming_verifiers(1)
+        return nv[0] if nv else None
 
     def _spec_pdmux_draftable(self, idx: int) -> bool:
         """Whether slot idx may be (re)prepared and pooled into THIS tick's fused
@@ -3301,11 +3310,18 @@ class Scheduler(
                 if rbs >= 0 and rbs != sb.batch_size():
                     self.model_worker.spec_pdmux_invalidate_ready_draft(s)
             n = self.spec_pdmux_n_slots
+            lead = self.server_args.spec_pdmux_draft_lead
             ret = None
             start = self.spec_pdmux_next_slot
-            # Pass 1 (the DraftPool schedule): the next slot that either already
-            # holds a parked draft (verify it, no drafting at all this tick) or
-            # may be pooled into this tick's fused draft.
+            # Pass 1 (the DraftPool schedule): the next slot that already holds a
+            # parked draft (verify it, no drafting at all this tick), or -- only
+            # at draft_lead=0 -- one that may be pooled into this tick's fused
+            # draft (so verify waits the drafter, Design-PingPong's coupling).
+            #
+            # Design-SplitWindows (draft_lead=1, default): the verifying slot is
+            # NEVER drafted in its own tick -- its draft was produced k ticks ago
+            # -- so verify never waits the drafter and the fused chain's deadline
+            # is the verify AFTER next, i.e. TWO verify windows instead of one.
             for k in range(n):
                 idx = (start + k) % n
                 slot = self.spec_pdmux_slots[idx]
@@ -3313,7 +3329,7 @@ class Scheduler(
                     continue
                 if self.model_worker.spec_pdmux_has_ready_draft(idx):
                     slot.spec_pdmux_slot = idx
-                elif self._spec_pdmux_draftable(idx):
+                elif lead == 0 and self._spec_pdmux_draftable(idx):
                     slot = self._spec_pdmux_prepare_slot(idx)
                     if slot is None:
                         continue
@@ -3324,6 +3340,23 @@ class Scheduler(
                 ret = slot
                 break
 
+            if ret is not None and lead == 1 and not self._spec_pdmux_draft_pool:
+                # Draft-fire iff the NEXT verifier has no parked draft. The pool
+                # is then every draftable slot = the next S-2 verifiers: the slot
+                # verifying NOW already holds its draft, and the slot that
+                # verified last tick has an unsettled CPU result.
+                nv = self._spec_pdmux_next_verifier()
+                if nv is not None and not self.model_worker.spec_pdmux_has_ready_draft(
+                    nv
+                ):
+                    for j in range(n):
+                        if not self._spec_pdmux_draftable(j):
+                            continue
+                        sb = self._spec_pdmux_prepare_slot(j)
+                        if sb is not None:
+                            self._spec_pdmux_draft_pool.append(sb)
+
+            fallback = False
             if ret is None:
                 # Pass 2 == Design-PingPong, byte for byte: no slot is poolable
                 # this tick. That is the DEGENERATE cadence a single populated
@@ -3335,6 +3368,7 @@ class Scheduler(
                 # prepare_for_decode's 2x alloc reserve absorbs the one-verify-
                 # stale kv_committed_len. Falling back here (rather than idling)
                 # is what keeps c=1 identical to the 2-slot build.
+                fallback = True
                 for _ in range(n):
                     idx = self.spec_pdmux_next_slot
                     self.spec_pdmux_next_slot = (idx + 1) % n
@@ -3352,36 +3386,51 @@ class Scheduler(
                     ret = slot
                     break
 
-            if (
-                ret is not None
-                and self._spec_pdmux_draft_pool
-                and self.spec_pdmux_n_slots > 2
-            ):
-                # The fused draft fires this tick: pull in every OTHER due slot
-                # (ascending slot order — every rank makes the identical
-                # decision, so TP lockstep is preserved).
+            if ret is not None and self._spec_pdmux_draft_pool:
+                # The fused draft fires this tick: pull in every OTHER due slot.
+                # At draft_lead=1 the pool was already built complete above (the
+                # verifying slot is never in it), so this only runs for the
+                # same-tick schedule (lead=0) and for the PingPong fallback,
+                # where it also primes the pool at bootstrap.
                 #
                 # GUARDED ON S>2. Design-DraftPool's fusable pool is S-2 slots,
-                # i.e. EMPTY at S=2 — at S=2 the pool must stay exactly {ret},
-                # which is Design-PingPong. Without this guard the loop also ran
+                # i.e. EMPTY at S=2: at S=2 the pool must stay exactly {ret},
+                # which IS Design-PingPong. Without this guard the loop also ran
                 # at S=2 and pooled the OTHER slot whenever it happened to be
-                # draftable on the same tick (it becomes draftable again when
-                # admission/filtering invalidates its parked draft). Measured on
-                # a 32B-TP4 c=64 run: tick 42 built `draft_pool=0/1 pool_bs=64`.
-                # Consequences that guard removes: (a) at S=2 the drafter did
-                # work PingPong never did (drafting a non-verifying slot), so
-                # "S=2 == PingPong" did not hold; (b) under Design-InputParallel
-                # the 2-slot pool entered spec_pdmux_fused_draft() and tripped
-                # its "DraftPool x InputParallel is not implemented" assert,
-                # killing every rank — i.e. S=2 input-parallel (the 32B-TP4
-                # shipping config) could not run at all.
-                for j in range(self.spec_pdmux_n_slots):
-                    if j == ret.spec_pdmux_slot or not self._spec_pdmux_draftable(j):
-                        continue
-                    sb = self._spec_pdmux_prepare_slot(j)
-                    if sb is not None:
-                        self._spec_pdmux_draft_pool.append(sb)
+                # draftable that tick -- which it becomes as soon as an idle /
+                # prefill tick flushes its pending extend. Two real consequences,
+                # both found by the 32B-TP4 control arm: (a) S=2 x
+                # Design-InputParallel (the 32B-TP4 shipping config) hit the
+                # unimplemented-fusion assert and every rank died at startup;
+                # (b) at TP1 the S=2 arm silently took the FUSED draft path and
+                # drafted a NON-VERIFYING slot -- work PingPong never does -- so
+                # the S=2 "PingPong baseline" was not PingPong. Measured
+                # contamination: 48 multi-slot pools in 1110 ticks (4.3%).
+                if (lead == 0 or fallback) and self.spec_pdmux_n_slots > 2:
+                    for j in range(self.spec_pdmux_n_slots):
+                        if (
+                            j == ret.spec_pdmux_slot
+                            or not self._spec_pdmux_draftable(j)
+                        ):
+                            continue
+                        sb = self._spec_pdmux_prepare_slot(j)
+                        if sb is not None:
+                            self._spec_pdmux_draft_pool.append(sb)
+                # Ascending slot order — every rank makes the identical decision,
+                # so TP lockstep is preserved.
                 self._spec_pdmux_draft_pool.sort(key=lambda b: b.spec_pdmux_slot)
+
+            # ENFORCE the invariant the comments assert (it was only a comment
+            # before, and it silently broke): at S=2 the pool never holds more
+            # than the verifying slot, so S=2 is Design-PingPong on every path.
+            assert (
+                self.spec_pdmux_n_slots > 2
+                or len(self._spec_pdmux_draft_pool) <= 1
+            ), (
+                "spec-pdmux S=2 must never build a multi-slot draft pool "
+                f"(got {[b.spec_pdmux_slot for b in self._spec_pdmux_draft_pool]}): "
+                "S=2 is Design-PingPong."
+            )
 
             if ret is not None:
                 # Fire the FUSED EXTEND exactly one tick before the next fused
@@ -3391,10 +3440,20 @@ class Scheduler(
                 # the small partition (and the memory bus) idle for verify.
                 # A draft fires next tick iff the next verifier has no parked
                 # draft and is not getting one from THIS tick's pool.
-                nv = self._spec_pdmux_next_verifier()
+                # The fused extend fires on the tick IMMEDIATELY BEFORE the next
+                # fused draft -- at that moment the pending extends are precisely
+                # the slots that draft will pool. Keeping it adjacent to the
+                # draft-fire is also what keeps the launched-before-free
+                # invariant: no pending extend ever survives across a draft-fire,
+                # which is the only tick that allocates verify-tree KV.
+                # A draft fires next tick iff the verifier (lead+1) ahead has no
+                # parked draft and is not getting one from THIS tick's pool.
                 pooled = {b.spec_pdmux_slot for b in self._spec_pdmux_draft_pool}
+                ups = self._spec_pdmux_upcoming_verifiers(lead + 1)
+                nv = ups[-1] if len(ups) == lead + 1 else None
                 ret._spec_pdmux_fire_extends = (
-                    nv is None
+                    fallback
+                    or nv is None
                     or (
                         nv not in pooled
                         and not self.model_worker.spec_pdmux_has_ready_draft(nv)
