@@ -706,6 +706,31 @@ def draft_dup_tp_context(tp_group: Optional[GroupCoordinator] = None):
         set_pdmux_status(prev)
 
 
+def spec_pdmux_concurrent_enabled(server_args: ServerArgs) -> bool:
+    """spec-pdmux M2.2: SINGLE SOURCE OF TRUTH for the concurrent-path
+    predicate (event-based cross-stream ordering instead of the M1 full
+    joins). Scheduler (gather routing, Scheduler.spec_pdmux_concurrent) and
+    worker (defer/join branch, EAGLEWorkerV2._spec_pdmux_concurrent) MUST
+    take the same path every tick, so both derive from this helper -- do not
+    fork the conjuncts at the call sites again. Site-specific extra
+    conjuncts stay at the sites: the scheduler additionally requires its own
+    overlap loop (Scheduler.enable_overlap); the worker sees overlap per
+    batch (batch.enable_overlap) at its decode use site.
+
+    - SGLANG_SPEC_PDMUX_SERIALIZE=1 is the kill-switch back to the strictly
+      sequential M1 semantics (bisection aid).
+    - speculative_adaptive can flip speculative_num_steps to 0 at runtime,
+      which the worker checks but the scheduler's routing cannot see -->
+      both must exclude it up front.
+    """
+    return (
+        server_args.enable_spec_pdmux
+        and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+        and not server_args.speculative_adaptive
+        and server_args.speculative_num_steps > 0
+    )
+
+
 def spec_pdmux_extend_capture_bs(model_runner, capture_bs):
     """Design-DraftPool: widen a DRAFT-SIDE graph runner's capture buckets.
 

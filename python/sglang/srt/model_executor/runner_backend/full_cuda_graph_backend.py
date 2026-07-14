@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_utils.pool import (
+    get_global_graph_memory_pool,
     get_or_create_global_graph_memory_pool,
     get_or_create_spec_pdmux_draft_graph_memory_pool,
 )
@@ -96,6 +97,33 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             else:
                 self._pool = get_or_create_global_graph_memory_pool(
                     self._device_module
+                )
+            # INIT-TIME enforcement of the shared-pool premise (runs once, at
+            # first capture; the replay path is untouched): the process-wide
+            # pool is safe only because its graphs never replay concurrently.
+            # Under spec-pdmux the draft-side graphs replay on the SMALL
+            # green-ctx stream WHILE the target's verify graph replays on the
+            # large stream, so a draft runner sharing the target's pool means
+            # intermediate-buffer aliasing -> illegal memory access / silent
+            # corruption (observed at c=32). The branch above is what keeps
+            # the premise true; if it is ever bypassed, fail loudly here
+            # instead. (Explicit raise, never a bare assert: python -O strips
+            # asserts and multiprocessing children inherit the flag.)
+            if (
+                getattr(self._model_runner, "is_draft_worker", False)
+                and self._model_runner.server_args.enable_spec_pdmux
+                and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+                and self._pool is get_global_graph_memory_pool()
+            ):
+                raise AssertionError(
+                    "spec-pdmux: a DRAFT-side CUDA-graph runner was about to "
+                    "capture into the process-wide (target) graph memory "
+                    "pool. Draft graphs replay on the small green-ctx stream "
+                    "concurrently with the target's verify graph; sharing "
+                    "one pool aliases their intermediate buffers (illegal "
+                    "memory access / silent corruption). Draft-side runners "
+                    "must use the dedicated spec-pdmux draft pool "
+                    "(get_or_create_spec_pdmux_draft_graph_memory_pool)."
                 )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream

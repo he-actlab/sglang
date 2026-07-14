@@ -1040,14 +1040,19 @@ class Scheduler(
             # slot's own last relay stash) and defers the relay stash to the
             # worker's flush. SGLANG_SPEC_PDMUX_SERIALIZE=1 restores the M1
             # strictly-sequential behavior end to end.
-            self.spec_pdmux_concurrent = (
-                self.enable_overlap
-                and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
-                # Must mirror EAGLEWorkerV2._spec_pdmux_concurrent: scheduler
-                # (gather routing) and worker (defer/join branch) have to take
-                # the same path every tick.
-                and not self.server_args.speculative_adaptive
-                and self.server_args.speculative_num_steps > 0
+            # Mirrors EAGLEWorkerV2._spec_pdmux_concurrent BY CONSTRUCTION:
+            # scheduler (gather routing) and worker (defer/join branch) have
+            # to take the same path every tick, so both call the shared
+            # spec_utils.spec_pdmux_concurrent_enabled predicate instead of
+            # duplicating its conjuncts. The scheduler additionally requires
+            # its own overlap loop; the worker sees overlap per batch
+            # (batch.enable_overlap) at its decode use site.
+            from sglang.srt.speculative.spec_utils import (
+                spec_pdmux_concurrent_enabled,
+            )
+
+            self.spec_pdmux_concurrent = self.enable_overlap and (
+                spec_pdmux_concurrent_enabled(self.server_args)
             )
             # Recorded on the forward (large) stream after an untagged
             # (prefill) batch's relay stash; each slot's next small-stream
@@ -1055,13 +1060,18 @@ class Scheduler(
             # rows that prefill stashed on the large stream).
             self._spec_pdmux_prefill_relay_ev = None
             self._spec_pdmux_prefill_relay_pending = [False] * self.spec_pdmux_n_slots
-            assert self.spec_pdmux_n_slots == 2 or self.spec_pdmux_concurrent, (
-                "--spec-pdmux-slots > 2 (Design-DraftPool) requires the concurrent "
-                "path: overlap scheduling ON and SGLANG_SPEC_PDMUX_SERIALIZE unset "
-                "(the fused draft is enqueued on the small stream and consumed by a "
-                "LATER tick's verify through a CUDA event -- the serialized build "
-                "joins the streams around every drafter call and has no such handoff)."
-            )
+            if self.spec_pdmux_n_slots > 2 and not self.spec_pdmux_concurrent:
+                # Explicit raise (never a bare assert: python -O strips those,
+                # and multiprocessing children inherit the flag).
+                raise AssertionError(
+                    "--spec-pdmux-slots > 2 (Design-DraftPool) requires the "
+                    "concurrent path: overlap scheduling ON and "
+                    "SGLANG_SPEC_PDMUX_SERIALIZE unset (the fused draft is "
+                    "enqueued on the small stream and consumed by a LATER "
+                    "tick's verify through a CUDA event -- the serialized "
+                    "build joins the streams around every drafter call and "
+                    "has no such handoff)."
+                )
             if self.spec_pdmux_concurrent:
                 logger.info(
                     "[spec-pdmux r%d] M2.2 concurrent mode ON (per-slot CUDA "
@@ -3421,16 +3431,69 @@ class Scheduler(
                 self._spec_pdmux_draft_pool.sort(key=lambda b: b.spec_pdmux_slot)
 
             # ENFORCE the invariant the comments assert (it was only a comment
-            # before, and it silently broke): at S=2 the pool never holds more
-            # than the verifying slot, so S=2 is Design-PingPong on every path.
-            assert (
-                self.spec_pdmux_n_slots > 2
-                or len(self._spec_pdmux_draft_pool) <= 1
-            ), (
-                "spec-pdmux S=2 must never build a multi-slot draft pool "
-                f"(got {[b.spec_pdmux_slot for b in self._spec_pdmux_draft_pool]}): "
-                "S=2 is Design-PingPong."
-            )
+            # before, and it silently broke): at S=2 the pool never holds
+            # anything but THE VERIFYING BATCH ITSELF, so S=2 is
+            # Design-PingPong on every path. Length alone is not enough -- a
+            # pool of ONE WRONG slot at S=2 would draft a non-verifying slot
+            # through spec_pdmux_fused_draft's merged-copy branch (pool[0] is
+            # not the worker's inplace_batch), i.e. silently run
+            # Design-SplitWindows work under the S=2 "PingPong" label -- so
+            # IDENTITY is checked too: every S=2 pool-building path (pass-1
+            # lead=0, the Design-PingPong fallback) appends exactly `ret`, and
+            # the lead=1 builder plus the S>2 completion loop are dead at S=2
+            # (spec_pdmux_draft_lead is forced to 0 at S=2 at arg resolution;
+            # the loop is guarded on n_slots > 2). Explicit raise, never a
+            # bare assert: python -O strips asserts and multiprocessing
+            # children inherit the flag.
+            if self.spec_pdmux_n_slots == 2 and self._spec_pdmux_draft_pool:
+                if len(self._spec_pdmux_draft_pool) > 1 or (
+                    self._spec_pdmux_draft_pool[0] is not ret
+                ):
+                    raise AssertionError(
+                        "spec-pdmux S=2 draft pool must be exactly the "
+                        "verifying batch (Design-PingPong); got slots "
+                        f"{[b.spec_pdmux_slot for b in self._spec_pdmux_draft_pool]}"
+                        f" for verify slot "
+                        f"{None if ret is None else ret.spec_pdmux_slot}"
+                        " -- a non-verifying pooled slot at S=2 is "
+                        "Design-SplitWindows work PingPong never does."
+                    )
+
+            # Launched-before-free ENFORCEMENT (previously only the comment
+            # below): a draft-fire tick is the only tick kind that allocates
+            # verify-tree KV (prepare_for_decode inside
+            # _spec_pdmux_prepare_slot), i.e. the only decode tick whose
+            # allocation can RECYCLE req_to_token/KV rows that
+            # process_batch_result freed. A slot may legally still hold an
+            # un-launched deferred draft-extend here ONLY while its last
+            # verify result is UNSETTLED (still in result_queue): its rows
+            # are freed at THIS tick's pop_and_process, strictly after this
+            # tick's allocation, and the extend is flushed at the next
+            # fused-extend fire before the next draft-fire. A SETTLED slot
+            # with a pending extend means its rows may already be freed AND
+            # re-allocated by the verify-tree alloc that just ran -- the
+            # extend would read/write recycled rows: silent KV corruption.
+            # Fail loudly instead. O(S) pointer/int compares, fire ticks only.
+            if self._spec_pdmux_draft_pool:
+                settled_upto = self._spec_pdmux_settled_upto()
+                for s in range(self.spec_pdmux_n_slots):
+                    if (
+                        self.model_worker.spec_pdmux_has_pending_extend(s)
+                        and self._spec_pdmux_last_verify_ct[s] <= settled_upto
+                    ):
+                        raise AssertionError(
+                            f"spec-pdmux launched-before-free violation: slot "
+                            f"{s} still holds an un-launched deferred "
+                            f"draft-extend at a draft-fire tick although its "
+                            f"verify result is already settled "
+                            f"(last_verify_ct="
+                            f"{self._spec_pdmux_last_verify_ct[s]} <= "
+                            f"settled_upto={settled_upto}). Its rows may "
+                            "already be freed and recycled by this tick's "
+                            "verify-tree KV alloc; the Design-DraftPool "
+                            "fused-extend fire tick must launch every "
+                            "pending extend before the next draft-fire."
+                        )
 
             if ret is not None:
                 # Fire the FUSED EXTEND exactly one tick before the next fused
@@ -3444,8 +3507,11 @@ class Scheduler(
                 # fused draft -- at that moment the pending extends are precisely
                 # the slots that draft will pool. Keeping it adjacent to the
                 # draft-fire is also what keeps the launched-before-free
-                # invariant: no pending extend ever survives across a draft-fire,
-                # which is the only tick that allocates verify-tree KV.
+                # invariant (ENFORCED above at the draft-fire): by any
+                # draft-fire tick -- the only tick that allocates verify-tree
+                # KV -- every pending extend except the still-unsettled last
+                # verifier's has been launched, so no extend can read/write
+                # rows that allocation recycles.
                 # A draft fires next tick iff the verifier (lead+1) ahead has no
                 # parked draft and is not getting one from THIS tick's pool.
                 pooled = {b.spec_pdmux_slot for b in self._spec_pdmux_draft_pool}
@@ -4003,12 +4069,20 @@ class Scheduler(
                     else None
                 )
                 # Design-DraftPool: the slots whose drafts this tick FUSES into
-                # one forward. Non-empty only on a fire tick, and then it always
-                # contains this tick's verify slot (the pool fires exactly when
-                # that slot's draft is not already ready). Empty => this slot's
-                # draft was produced by an earlier tick and its seq_lens were
-                # resolved THERE; re-resolving here would also fail, since its
-                # spec_info is about to become the stored EagleVerifyInput
+                # one forward. Non-empty only on a fire tick; WHICH slots it
+                # holds depends on spec_pdmux_draft_lead. At lead=0, at S=2
+                # (lead forced to 0 at arg resolution) and on the
+                # Design-PingPong fallback, the pool contains THIS tick's
+                # verify batch (the fire is triggered by this slot's own
+                # missing draft). At lead=1 (Design-SplitWindows, S>2) it is
+                # the next S-2 verifiers -- PARKED batches drafted ahead of
+                # their verify ticks; the slot verifying NOW is never in it
+                # (its draft was parked by an earlier fire tick), which is
+                # exactly why the in-place guard in spec_pdmux_fused_draft
+                # exists. Empty => this slot's draft was produced by an
+                # earlier tick and its seq_lens were resolved THERE;
+                # re-resolving here would also fail, since its spec_info is
+                # about to become the stored EagleVerifyInput
                 # (no future_indices).
                 pool: List[ScheduleBatch] = (
                     self._spec_pdmux_draft_pool if spec_pdmux_slot is not None else []

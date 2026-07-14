@@ -89,6 +89,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     renorm_draft_probs,
     select_top_k_tokens,
+    spec_pdmux_concurrent_enabled,
     spec_stage_span,
 )
 from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
@@ -1851,16 +1852,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _spec_pdmux_concurrent(self):
         """spec-pdmux M2.2 (step 7): event-based cross-stream ordering instead
         of the M1 full joins. SGLANG_SPEC_PDMUX_SERIALIZE=1 is the kill-switch
-        back to the strictly-sequential M1 semantics (bisection aid)."""
-        return (
-            self.server_args.enable_spec_pdmux
-            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
-            # Scheduler and worker must take the same branch per tick; adaptive
-            # spec can flip speculative_num_steps to 0 at runtime, which the
-            # worker checks but the scheduler's routing cannot see.
-            and not self.server_args.speculative_adaptive
-            and self.server_args.speculative_num_steps > 0
-        )
+        back to the strictly-sequential M1 semantics (bisection aid).
+
+        Mirrors Scheduler.spec_pdmux_concurrent BY CONSTRUCTION: both call
+        the shared spec_utils.spec_pdmux_concurrent_enabled predicate
+        (single source of truth) instead of duplicating its conjuncts. The
+        scheduler additionally ANDs its own overlap loop; the worker sees
+        overlap per batch (batch.enable_overlap) at the decode use site."""
+        return spec_pdmux_concurrent_enabled(self.server_args)
 
     @functools.cached_property
     def _spec_pdmux_state(self):
@@ -2403,10 +2402,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 st = self._spec_pdmux_state
                 # Design-DraftPool: the scheduler put the slots whose drafts
                 # this tick FUSES on the batch (prepared + gathered, in slot
-                # order). Non-empty only on a fire tick, and then it always
-                # contains THIS slot (the pool fires exactly when this slot's
-                # draft is not already parked). At S=2 the pool is always
-                # exactly [batch] == Design-PingPong, unchanged.
+                # order). Non-empty only on a fire tick; WHICH slots it holds
+                # depends on spec_pdmux_draft_lead. At lead=0 and on the
+                # Design-PingPong fallback the pool contains THIS slot's
+                # batch; at S=2 (lead forced to 0 at arg resolution) it is
+                # always exactly [batch] == Design-PingPong, enforced by the
+                # scheduler's S=2 identity raise. At lead=1
+                # (Design-SplitWindows, S>2) it is OTHER, parked batches --
+                # the slot verifying NOW is never pooled -- which is exactly
+                # why spec_pdmux_fused_draft's in-place guard exists: a
+                # pooled batch that is not this tick's inplace_batch must
+                # take the merged-copy path (no isolation snapshot undoes
+                # prepare_for_draft's out_cache_loc rebind for it).
                 pool = getattr(batch, "_spec_pdmux_draft_pool", None) or []
                 if pool:
                     # ONE draft forward for all pooled slots, on the SMALL
@@ -2442,11 +2449,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # Consume THIS slot's draft (produced above, or parked by an
                 # earlier tick's fused draft).
                 verify_input: EagleVerifyInput = st["ready_draft"][slot]
-                assert verify_input is not None, (
-                    f"spec-pdmux slot {slot} reached its verify tick with no "
-                    "draft: the scheduler must either park one for it or put "
-                    "it in this tick's fused-draft pool."
-                )
+                if verify_input is None:
+                    # Explicit raise, not a bare assert (python -O strips
+                    # asserts; multiprocessing children inherit the flag).
+                    raise AssertionError(
+                        f"spec-pdmux slot {slot} reached its verify tick with "
+                        "no draft: the scheduler must either park one for it "
+                        "or put it in this tick's fused-draft pool."
+                    )
                 ready_ev = st["ready_ev"][slot]
                 self.spec_pdmux_invalidate_ready_draft(slot)
                 # verify(X) waits ONLY the draft that produced its verify input
@@ -2496,7 +2506,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         (verify_input.draft_probs,),
                         dev.current_stream(),
                     )
-            assert verify_input.is_verify_input()
+            if not verify_input.is_verify_input():
+                # Explicit raise, not a bare assert (python -O strips asserts;
+                # multiprocessing children inherit the flag).
+                raise AssertionError(
+                    "spec-pdmux decode tick produced a spec_info that is not "
+                    f"an EagleVerifyInput (got {type(verify_input).__name__}); "
+                    "verify would consume a draft-input shell."
+                )
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
             if concurrent:

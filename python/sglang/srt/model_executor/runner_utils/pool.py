@@ -14,6 +14,11 @@
 """Process-wide CUDA graph memory pool shared across the prefill and
 decode graph backends. The two phases never replay concurrently, so
 sharing one pool reserves only the larger phase's capture footprint.
+
+That premise does NOT hold for spec-pdmux draft-side graphs (they replay
+concurrently with the target's verify graph); those must use the
+dedicated pool below, and FullCudaGraphBackend.capture_session enforces
+it at capture time (init-time raise, no per-replay check).
 """
 
 from __future__ import annotations

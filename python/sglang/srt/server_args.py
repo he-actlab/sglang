@@ -2477,7 +2477,9 @@ class ServerArgs:
         "chain still runs back to back on the small stream but now has TWO verify "
         "windows to finish in. The pool is then S-2 slots (the slot verifying now "
         "already holds its draft; the slot that verified last tick has an unsettled "
-        "result), so a 3-wide fused draft needs S=5. Ignored at S=2.",
+        "result), so a 3-wide fused draft needs S=5. FORCED to 0 at S=2 during arg "
+        "resolution (check_server_args): S=2 is Design-PingPong by definition and "
+        "must never draft a non-verifying slot (Design-SplitWindows).",
     ] = 1
 
     def spec_pdmux_draft_unsharded(self) -> bool:
@@ -7101,100 +7103,135 @@ class ServerArgs:
                     "  Please manually install torch 2.6.x."
                 )
 
-        # Check spec-pdmux (co-located speculative decoding, M1)
+        # Check spec-pdmux (co-located speculative decoding, M1).
+        # Explicit raises, never bare asserts (python -O strips those, and
+        # multiprocessing children inherit the flag): a stripped config guard
+        # here would let an unsupported combination reach the scheduler.
         if self.enable_spec_pdmux:
-            assert (
-                not self.enable_pdmux
-            ), "--enable-spec-pdmux is incompatible with --enable-pdmux."
-            assert (
-                self.speculative_algorithm is not None
-            ), "--enable-spec-pdmux requires a speculative algorithm."
+            if self.enable_pdmux:
+                raise AssertionError(
+                    "--enable-spec-pdmux is incompatible with --enable-pdmux."
+                )
+            if self.speculative_algorithm is None:
+                raise AssertionError(
+                    "--enable-spec-pdmux requires a speculative algorithm."
+                )
             # M3 step 2: TP{2,4} run concurrently on the dedicated draft
             # communicator (duplicate TP group; model_runner passes
             # duplicate_tp_group at tp_size>1, spec_utils.draft_dup_tp_context
             # scopes it over the draft-side regions + graph captures).
-            assert self.tp_size in (
-                1,
-                2,
-                4,
-            ), "--enable-spec-pdmux supports tp_size in {1, 2, 4}."
+            if self.tp_size not in (1, 2, 4):
+                raise AssertionError(
+                    "--enable-spec-pdmux supports tp_size in {1, 2, 4}."
+                )
             # The duplicate group must not carry mscclpp/symm-mem communicators
             # (unvalidated as a SECOND comm set beside verify's; the probe
             # covered pynccl + custom one-shot AR only).
-            assert (
-                not self.enable_symm_mem and not self.enable_mscclpp
-            ), "--enable-spec-pdmux: mscclpp/symm-mem all-reduce must stay off."
-            assert (
-                not self.enable_dp_attention
-            ), "--enable-spec-pdmux is incompatible with --enable-dp-attention."
-            assert self.device == "cuda", "--enable-spec-pdmux requires CUDA."
+            if self.enable_symm_mem or self.enable_mscclpp:
+                raise AssertionError(
+                    "--enable-spec-pdmux: mscclpp/symm-mem all-reduce must stay off."
+                )
+            if self.enable_dp_attention:
+                raise AssertionError(
+                    "--enable-spec-pdmux is incompatible with --enable-dp-attention."
+                )
+            if self.device != "cuda":
+                raise AssertionError("--enable-spec-pdmux requires CUDA.")
             # M2.0 (two scheduler sub-batch slots): paths not mirrored by the
             # spec-pdmux scheduler branch must be off.
-            assert (
-                self.disaggregation_mode == "null"
-            ), "--enable-spec-pdmux does not support PD disaggregation."
-            assert self.pp_size == 1, "--enable-spec-pdmux requires pp_size=1."
-            assert (
-                not self.enable_mixed_chunk
-            ), "--enable-spec-pdmux is incompatible with --enable-mixed-chunk."
+            if self.disaggregation_mode != "null":
+                raise AssertionError(
+                    "--enable-spec-pdmux does not support PD disaggregation."
+                )
+            if self.pp_size != 1:
+                raise AssertionError("--enable-spec-pdmux requires pp_size=1.")
+            if self.enable_mixed_chunk:
+                raise AssertionError(
+                    "--enable-spec-pdmux is incompatible with --enable-mixed-chunk."
+                )
             if self.spec_pdmux_sm_split is not None:
                 parts = self.spec_pdmux_sm_split.split(",")
-                assert len(parts) == 2 and all(
+                if len(parts) != 2 or not all(
                     p.strip().isdigit() for p in parts
-                ), "--spec-pdmux-sm-split must be 'LARGE,SMALL' (two integers)."
+                ):
+                    raise AssertionError(
+                        "--spec-pdmux-sm-split must be 'LARGE,SMALL' (two integers)."
+                    )
             # Design-DraftPool: S sub-batch slots.
-            assert (
-                2 <= self.spec_pdmux_slots <= 8
-            ), "--spec-pdmux-slots must be in [2, 8] (2 = Design-PingPong)."
-            assert self.spec_pdmux_draft_lead in (
-                0,
-                1,
-            ), "--spec-pdmux-draft-lead must be 0 or 1."
+            if not 2 <= self.spec_pdmux_slots <= 8:
+                raise AssertionError(
+                    "--spec-pdmux-slots must be in [2, 8] (2 = Design-PingPong)."
+                )
+            if self.spec_pdmux_draft_lead not in (0, 1):
+                raise AssertionError("--spec-pdmux-draft-lead must be 0 or 1.")
+            if self.spec_pdmux_slots == 2:
+                # Design-PingPong invariant MADE CODE (it used to be an
+                # emergent property of the scheduler's fallback path): at S=2
+                # the draft lead is forced to 0, because the lead=1 builder in
+                # the scheduler has no S-guard and does not exclude the
+                # verifying slot -- anything that ever parked a draft at S=2
+                # would silently convert S=2 into Design-SplitWindows
+                # (drafting a NON-verifying slot, work PingPong never does).
+                # With lead=0 the S=2 pool is exactly the verifying batch on
+                # every path (the scheduler raises on violation), and the
+                # GPU-visible schedule is unchanged: at S=2 pass-1/lead=0 and
+                # the fallback issue the identical prepare/pool/flush
+                # sequence.
+                self.spec_pdmux_draft_lead = 0
             if self.spec_pdmux_slots > 2:
-                assert self.speculative_num_steps > 0, (
-                    "--spec-pdmux-slots > 2 (Design-DraftPool) needs a drafting "
-                    "configuration (speculative_num_steps > 0)."
-                )
-                assert self.speculative_eagle_topk == 1, (
-                    "--spec-pdmux-slots > 2 currently supports topk=1 chain drafting "
-                    "only: the fused draft concatenates the pooled slots' token "
-                    "batches and re-splits the raw draft outputs per slot, which the "
-                    "tree (topk>1) score/parent layout does not carry through as a "
-                    "row slice."
-                )
-                assert not self.speculative_use_rejection_sampling, (
-                    "--spec-pdmux-slots > 2 does not support "
-                    "--speculative-use-rejection-sampling (the fused draft would need "
-                    "a merged SamplingBatchInfo; the non-RS topk=1 draft path reads "
-                    "none)."
-                )
+                if self.speculative_num_steps <= 0:
+                    raise AssertionError(
+                        "--spec-pdmux-slots > 2 (Design-DraftPool) needs a drafting "
+                        "configuration (speculative_num_steps > 0)."
+                    )
+                if self.speculative_eagle_topk != 1:
+                    raise AssertionError(
+                        "--spec-pdmux-slots > 2 currently supports topk=1 chain "
+                        "drafting only: the fused draft concatenates the pooled "
+                        "slots' token batches and re-splits the raw draft outputs "
+                        "per slot, which the tree (topk>1) score/parent layout does "
+                        "not carry through as a row slice."
+                    )
+                if self.speculative_use_rejection_sampling:
+                    raise AssertionError(
+                        "--spec-pdmux-slots > 2 does not support "
+                        "--speculative-use-rejection-sampling (the fused draft "
+                        "would need a merged SamplingBatchInfo; the non-RS topk=1 "
+                        "draft path reads none)."
+                    )
             # Design-FullReplicate / Design-InputParallel (unsharded drafter).
             if self.spec_pdmux_draft_mode != "shard":
-                assert self.tp_size > 1, (
-                    "--spec-pdmux-draft-mode replicate/input-parallel is a tp_size>1 "
-                    "arm (at tp_size=1 the drafter is already unsharded; use 'shard')."
-                )
-                assert (
-                    self.speculative_algorithm is not None
-                    and self.speculative_algorithm.upper() == "STANDALONE"
-                ), (
-                    "--spec-pdmux-draft-mode replicate/input-parallel requires "
-                    "STANDALONE speculative decoding: EAGLE-style drafters share "
-                    "the target's TP-SHARDED embed/lm_head, which an unsharded "
-                    "draft build cannot consume."
-                )
+                if self.tp_size <= 1:
+                    raise AssertionError(
+                        "--spec-pdmux-draft-mode replicate/input-parallel is a "
+                        "tp_size>1 arm (at tp_size=1 the drafter is already "
+                        "unsharded; use 'shard')."
+                    )
+                if (
+                    self.speculative_algorithm is None
+                    or self.speculative_algorithm.upper() != "STANDALONE"
+                ):
+                    raise AssertionError(
+                        "--spec-pdmux-draft-mode replicate/input-parallel requires "
+                        "STANDALONE speculative decoding: EAGLE-style drafters share "
+                        "the target's TP-SHARDED embed/lm_head, which an unsharded "
+                        "draft build cannot consume."
+                    )
                 if self.spec_pdmux_draft_mode == "input-parallel":
-                    assert self.speculative_eagle_topk == 1, (
-                        "--spec-pdmux-draft-mode input-parallel currently supports "
-                        "topk=1 chain drafting only (the per-rank draft-token "
-                        "all-gather carries the chain tokens; topk>1 tree scores/"
-                        "parents are not gathered)."
-                    )
-                    assert not self.speculative_use_rejection_sampling, (
-                        "--spec-pdmux-draft-mode input-parallel does not support "
-                        "--speculative-use-rejection-sampling (per-step draft_probs "
-                        "of shape (bs, steps, vocab) are not all-gathered)."
-                    )
+                    if self.speculative_eagle_topk != 1:
+                        raise AssertionError(
+                            "--spec-pdmux-draft-mode input-parallel currently "
+                            "supports topk=1 chain drafting only (the per-rank "
+                            "draft-token all-gather carries the chain tokens; "
+                            "topk>1 tree scores/parents are not gathered)."
+                        )
+                    if self.speculative_use_rejection_sampling:
+                        raise AssertionError(
+                            "--spec-pdmux-draft-mode input-parallel does not "
+                            "support --speculative-use-rejection-sampling "
+                            "(per-step draft_probs of shape (bs, steps, vocab) "
+                            "are not all-gathered)."
+                        )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
