@@ -931,7 +931,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return self._build_verify_input(batch, batch.spec_info, *raw)
 
     @_profile_phase("draft")
-    def spec_pdmux_fused_draft(self, pool: List[ScheduleBatch]):
+    def spec_pdmux_fused_draft(
+        self, pool: List[ScheduleBatch], inplace_batch: ScheduleBatch = None
+    ):
         """Design-DraftPool: draft SEVERAL sub-batch slots in ONE draft forward.
 
         The drafter is weight-streaming bound, not compute bound (measured: at
@@ -949,7 +951,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         (tiny) tree-build kernel per slot with that slot's own seq_lens and
         bonus tokens. Verify is untouched: full slot batch, one slot per tick.
         """
-        if len(pool) == 1:
+        if len(pool) == 1 and pool[0] is inplace_batch:
+            # The pooled slot IS this tick's verify batch (S=2 / draft_lead=0 /
+            # the PingPong fallback), so drafting it in place is safe: it sits
+            # inside run_batch's _forward_isolation, which snapshots its SB attrs
+            # BEFORE the draft and restores them after -- undoing prepare_for_draft's
+            # rebind of out_cache_loc (verify-tree KV slots -> draft KV slots).
+            #
+            # When the pooled slot is NOT the current batch (Design-SplitWindows:
+            # its draft is produced a tick before it verifies) that undo never
+            # happens. The clobbered out_cache_loc would then survive to the slot's
+            # own verify tick, be captured as THAT tick's isolation snapshot,
+            # restored after the forward, and handed to process_batch_result --
+            # which frees the verify-tree overshoot from it. It would free the
+            # WRONG KV slots. So every pooled slot that is not the current batch
+            # goes through the throw-away merged copy below, even a pool of one.
             return [self._draft_one(pool[0])]
         assert not self._spec_pdmux_input_parallel, (
             "Design-DraftPool x Design-InputParallel is not implemented "
@@ -959,6 +975,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         parent_list, top_scores_index, draft_tokens, draft_probs = self._draft_raw(
             merged
         )
+        # (a pool of one still goes through the copy: only the SPLIT below is a
+        # no-op there, the isolation hazard above is not)
         outs = []
         off = 0
         for pb in pool:
@@ -2015,7 +2033,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    self.draft_worker.spec_pdmux_fused_extend([p for _, p in pend])
+                    if st["n_slots"] <= 2:
+                        # S=2 is Design-PingPong: ONE extend forward per slot,
+                        # exactly as the pre-DraftPool build did ("for s in
+                        # (0, 1)"). Fusing here would be work PingPong never did.
+                        for _, p in pend:
+                            self.draft_worker.spec_pdmux_fused_extend([p])
+                    else:
+                        self.draft_worker.spec_pdmux_fused_extend(
+                            [p for _, p in pend]
+                        )
                 for _, p in pend:
                     if p["on_relay"] is not None:
                         # FutureMap stash on the small stream, per slot (its own
@@ -2399,7 +2426,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         speculative_moe_a2a_backend_context(),
                         spec_stage_span("draft"),
                     ):
-                        fused = self.draft_worker.spec_pdmux_fused_draft(pool)
+                        fused = self.draft_worker.spec_pdmux_fused_draft(
+                            pool, inplace_batch=batch
+                        )
                     ev = st["draft_ev_ring"][
                         st["draft_ev_ct"] % len(st["draft_ev_ring"])
                     ]

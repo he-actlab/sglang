@@ -2466,6 +2466,20 @@ class ServerArgs:
         ),
     ] = "shard"
 
+    spec_pdmux_draft_lead: A[
+        int,
+        "Design-DraftPool: how many verify ticks AHEAD of its own verify a slot's "
+        "fused draft is produced. 0 = the slot is drafted in the very tick it verifies, "
+        "so verify WAITS the drafter (Design-PingPong's coupling) and the whole "
+        "[fused extend -> fused draft] chain must fit in ONE verify window; the pool is "
+        "then S-1 slots. 1 (default, Design-SplitWindows) = the fused draft is produced "
+        "one verify window before it is needed, so verify NEVER waits the drafter: the "
+        "chain still runs back to back on the small stream but now has TWO verify "
+        "windows to finish in. The pool is then S-2 slots (the slot verifying now "
+        "already holds its draft; the slot that verified last tick has an unsettled "
+        "result), so a 3-wide fused draft needs S=5. Ignored at S=2.",
+    ] = 1
+
     def spec_pdmux_draft_unsharded(self) -> bool:
         """True when the spec-pdmux drafter loads FULL (tp=1-style) weights on
         every rank (Design-FullReplicate / Design-InputParallel)."""
@@ -7132,6 +7146,10 @@ class ServerArgs:
             assert (
                 2 <= self.spec_pdmux_slots <= 8
             ), "--spec-pdmux-slots must be in [2, 8] (2 = Design-PingPong)."
+            assert self.spec_pdmux_draft_lead in (
+                0,
+                1,
+            ), "--spec-pdmux-draft-lead must be 0 or 1."
             if self.spec_pdmux_slots > 2:
                 assert self.speculative_num_steps > 0, (
                     "--spec-pdmux-slots > 2 (Design-DraftPool) needs a drafting "
