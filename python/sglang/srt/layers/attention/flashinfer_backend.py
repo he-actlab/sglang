@@ -38,10 +38,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
+    draft_kv_window_cfg,
     generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import (
@@ -2039,6 +2041,20 @@ class FlashInferIndicesUpdaterPrefill:
                 num_tokens_per_req is not None and num_tokens_per_req > 0
             ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+            # BOUNDED-KV DRAFTER: EagleDraftExtendInput.generate_attn_arg_prefill already
+            # truncated the DEVICE kv_indices/kv_indptr to the retained window. fast_prefill_plan
+            # is sync-free -- it rebuilds the layout on the HOST from seq_lens_cpu and IGNORES
+            # the kv_indptr passed below. Without this clamp it plans for the FULL seq_len while
+            # kv_indices holds only `cap` valid entries per request, so the kernel walks off the
+            # end of the list into stale memory and the drafter reads garbage KV (tau collapses
+            # to ~1.1 with the indices themselves perfectly correct). Host must mirror device.
+            if (
+                spec_info is not None
+                and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+            ):
+                _cap = draft_kv_window_cfg(get_global_server_args())[2]
+                if _cap:
+                    seq_lens_cpu_i32 = torch.clamp(seq_lens_cpu_i32, max=_cap)
             qo_indptr_host = torch.arange(
                 0,
                 (bs + 1) * num_tokens_per_req,
@@ -2133,6 +2149,40 @@ class FlashInferMultiStepDraftBackend:
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = model_runner.req_to_token_pool
 
+        # BOUNDED-KV DRAFTER. This backend is only ever built for the DRAFT runner
+        # (EagleDraftWorker.init_attention_backend -> create_decode_backend), so the
+        # bound cannot leak into the target's attention.
+        assert model_runner.is_draft_worker, (
+            "FlashInferMultiStepDraftBackend must be built on the draft ModelRunner "
+            "(the bounded-KV window is applied here and must never touch the target)."
+        )
+        self.draft_kv_sink, self.draft_kv_window, self.draft_kv_cap = draft_kv_window_cfg(
+            model_runner.server_args
+        )
+        if self.draft_kv_cap:
+            logger.info(
+                "Bounded-KV drafter (decode): sink=%d + window=%d => the drafter reads at "
+                "most %d KV entries/req (target unchanged).",
+                self.draft_kv_sink,
+                self.draft_kv_window,
+                self.draft_kv_cap,
+            )
+
+    def _retained_seq_lens_sum(self, forward_batch: ForwardBatch, num_seqs: int) -> int:
+        """Sum of the per-request KV entries the bounded drafter actually reads.
+
+        Must mirror the kernel's clamp exactly (both the device kv_indptr written by
+        generate_draft_decode_kv_indices and the host indptr rebuilt below derive from it).
+        Host-side so it costs no D2H sync.
+        """
+        if not self.draft_kv_cap:
+            return forward_batch.seq_lens_sum
+        if forward_batch.seq_lens_cpu is not None:
+            src = forward_batch.seq_lens_cpu[:num_seqs]
+        else:  # no CPU mirror (dflash opts out) -- falls back to a sync
+            src = forward_batch.seq_lens[:num_seqs]
+        return int(torch.clamp(src, max=self.draft_kv_cap).sum())
+
     def common_template(
         self,
         forward_batch: ForwardBatch,
@@ -2141,7 +2191,10 @@ class FlashInferMultiStepDraftBackend:
     ):
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
-        seq_lens_sum = forward_batch.seq_lens_sum
+        # Bounded-KV drafter: every length below is the RETAINED length (== the raw one
+        # when the window is off), so the kernel, the device kv_indptr, the host indptr
+        # mirror and the per-step kv_indices slices all agree.
+        seq_lens_sum = self._retained_seq_lens_sum(forward_batch, num_seqs)
 
         required_kv_indices_len = draft_kv_indices_used_len(
             seq_lens_sum, self.topk, bs, self.speculative_num_steps
@@ -2170,7 +2223,10 @@ class FlashInferMultiStepDraftBackend:
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
+            self.draft_kv_sink,
+            self.draft_kv_window,
         )
+
 
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
@@ -2190,6 +2246,10 @@ class FlashInferMultiStepDraftBackend:
             # positions tail and seq_lens_cpu with seq_len_fill_value, so
             # host == device on padded rows too.
             pos_cpu = forward_batch.seq_lens_cpu[:num_seqs].to(torch.int64)
+            if self.draft_kv_cap:
+                # Mirror the kernel's clamp, or the host indptr and the device kv_indices
+                # disagree and flashinfer plans over garbage.
+                pos_cpu = torch.clamp(pos_cpu, max=self.draft_kv_cap)
             if self.topk > 1:
                 pos_cpu = pos_cpu.repeat_interleave(self.topk)
             base = torch.zeros(bs + 1, dtype=torch.int64)

@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -128,8 +128,30 @@ def draft_kv_indices_used_len(
 
     bs = topk * num_seqs branches, one index appended per branch per step. Called with
     num_steps = i + 1 (per-step slice) and speculative_num_steps (capacity assert).
+
+    seq_lens_sum must be the RETAINED sum under a bounded-KV drafter (see
+    draft_kv_window_cfg) -- the kernel writes only the retained indices.
     """
     return seq_lens_sum * topk + bs * num_steps
+
+
+def draft_kv_window_cfg(server_args) -> Tuple[int, int, int]:
+    """(sink, window, cap) for the BOUNDED-KV DRAFTER; window == 0 => unbounded (stock).
+
+    `cap` = sink + window is the max KV entries the drafter reads per request. The drafter
+    only proposes, so bounding its read-set cannot change the served tokens (the target
+    verifies everything at full context) -- it can only move acceptance length tau.
+    """
+    window = int(getattr(server_args, "spec_pdmux_draft_kv_window", 0) or 0)
+    if window <= 0:
+        return 0, 0, 0
+    sink = max(0, int(getattr(server_args, "spec_pdmux_draft_kv_sink", 0) or 0))
+    return sink, window, sink + window
+
+
+def retained_kv_lens(seq_lens: torch.Tensor, cap: int) -> torch.Tensor:
+    """Per-request KV entries the bounded drafter actually reads. cap == 0 => unbounded."""
+    return seq_lens if cap <= 0 else torch.clamp(seq_lens, max=cap)
 
 
 def record_stream_each(tensors, stream):

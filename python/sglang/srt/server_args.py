@@ -2447,6 +2447,26 @@ class ServerArgs:
         "request is verified every S ticks) and ~S x KV in flight -- a throughput-mode "
         "design for saturated queues.",
     ] = 2
+    spec_pdmux_draft_kv_window: A[
+        int,
+        "BOUNDED-KV DRAFTER: cap the DRAFT model's KV read-set to the most recent W tokens "
+        "(plus --spec-pdmux-draft-kv-sink leading tokens; StreamingLLM sink+window). 0 = off "
+        "= stock (unbounded). The TARGET is untouched, so outputs stay bit-identical to stock "
+        "-- the drafter only PROPOSES and every token is still verified against the full "
+        "context; the only thing a bound can cost is acceptance length tau. Motivation: a "
+        "STANDALONE drafter runs ~K forwards per target forward and (Qwen3-0.6B) carries the "
+        "SAME 8 KV heads x 128 head_dim as the 8B/32B target while running UNSHARDED, so its "
+        "KV traffic is ~2.3x the target's and GROWS FASTER with context -- past ctx~2048 the "
+        "draft chain exceeds verify and stops hiding behind it, killing co-location. Bounding "
+        "the read-set restores the slack. Implemented by truncating the draft's kv_indices "
+        "lists (flashinfer's window_left only masks -- it still streams every KV byte).",
+    ] = 0
+    spec_pdmux_draft_kv_sink: A[
+        int,
+        "BOUNDED-KV DRAFTER: number of leading 'attention sink' tokens the drafter always "
+        "keeps when --spec-pdmux-draft-kv-window > 0 (StreamingLLM: softmax needs a sink; a "
+        "pure recent-window drafter can lose acceptance without it). 0 = pure sliding window.",
+    ] = 4
     spec_pdmux_draft_mode: A[
         str,
         Arg(
@@ -7086,6 +7106,37 @@ class ServerArgs:
                     f"  Current torch version is {torch.__version__}.\n"
                     "  Please manually install torch 2.6.x."
                 )
+
+        # Check the bounded-KV drafter. Deliberately NOT gated on --enable-spec-pdmux:
+        # the bound is what makes the draft chain hide behind verify at long context, so it
+        # must be measurable on the stock/serial arm too (chain-vs-verify slack, tau-vs-W).
+        if self.spec_pdmux_draft_kv_window:
+            assert (
+                self.spec_pdmux_draft_kv_window > 0
+            ), "--spec-pdmux-draft-kv-window must be >= 0 (0 = off)."
+            assert (
+                self.spec_pdmux_draft_kv_sink >= 0
+            ), "--spec-pdmux-draft-kv-sink must be >= 0."
+            assert self.speculative_algorithm is not None, (
+                "--spec-pdmux-draft-kv-window bounds the DRAFT model's KV and needs a "
+                "speculative algorithm."
+            )
+            # The bound is implemented in the two producers of the draft's kv_indices:
+            # generate_draft_decode_kv_indices (draft decode) and
+            # EagleDraftExtendInput.generate_attn_arg_prefill (draft extend). Both are
+            # consumed by the flashinfer backend. Other backends build the draft's KV
+            # indices themselves and would silently ignore the bound.
+            assert self.attention_backend in (None, "flashinfer"), (
+                "--spec-pdmux-draft-kv-window is implemented for the flashinfer attention "
+                f"backend (got '{self.attention_backend}'); other backends would silently "
+                "read the drafter's full KV."
+            )
+            assert (
+                self.spec_pdmux_draft_kv_window >= self.speculative_num_draft_tokens
+            ), (
+                "--spec-pdmux-draft-kv-window must be >= --speculative-num-draft-tokens "
+                "(the drafter must at least see the tokens of its own chain)."
+            )
 
         # Check spec-pdmux (co-located speculative decoding, M1)
         if self.enable_spec_pdmux:

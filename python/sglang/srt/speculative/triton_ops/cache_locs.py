@@ -108,7 +108,23 @@ def generate_draft_decode_kv_indices(
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
+    SINK: tl.constexpr = 0,
+    WINDOW: tl.constexpr = 0,
 ):
+    """Build the draft-decode kv_indices/kv_indptr for every draft step.
+
+    BOUNDED-KV DRAFTER (SINK/WINDOW > 0): each branch keeps only
+    [0, SINK) U [seq_len - tail, seq_len) of the target's context, i.e.
+    retained = min(seq_len, SINK + WINDOW) entries, plus its own `iters` chain tokens
+    (which are ALWAYS kept -- the drafter must see the chain it is extending).
+    WINDOW = 0 reproduces the stock full-context gather exactly (n_sink = 0,
+    retained = seq_len, tail_start = 0 => the original single copy loop).
+
+    The gather source is always the TRUE req_to_token row (raw seq_len), only the
+    destination layout and kv_indptr shrink -- so positions/RoPE are untouched and the
+    retained keys keep their true positions (no StreamingLLM position re-indexing needed:
+    at ctx <= 4k every retained relative distance is far inside the drafter's trained range).
+    """
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
@@ -123,36 +139,63 @@ def generate_draft_decode_kv_indices(
     iters += 1
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
-    seq_len = tl.load(paged_kernel_lens + bid)
+    seq_lens_raw = tl.load(
+        paged_kernel_lens + load_offset, mask=load_offset < bid, other=0
+    )
+    seq_len_raw = tl.load(paged_kernel_lens + bid)
+
+    # Retained (== raw when unbounded). Masked rows are 0 -> minimum keeps them 0.
+    if WINDOW > 0:
+        seq_lens = tl.minimum(seq_lens_raw, SINK + WINDOW)
+        seq_len = tl.minimum(seq_len_raw, SINK + WINDOW)
+    else:
+        seq_lens = seq_lens_raw
+        seq_len = seq_len_raw
     cum_seq_len = tl.sum(seq_lens)
 
-    # Update kv_indices
+    # Update kv_indices. Layout/offsets use the RETAINED lengths.
     kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len + iters)
     kv_ptr = kv_indices + kv_offset
     token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
 
+    n_sink = tl.minimum(seq_len, SINK)  # 0 when SINK == 0
+    n_tail = seq_len - n_sink
+    tail_start = seq_len_raw - n_tail  # 0 when unbounded
+
+    # sink block: req_to_token[req, 0:n_sink]
+    sink_offset = tl.arange(0, BLOCK_SIZE)
+    for _ in range(tl.cdiv(n_sink, BLOCK_SIZE)):
+        mask = sink_offset < n_sink
+        data = tl.load(token_pool_ptr + sink_offset, mask=mask)
+        tl.store(kv_ptr + sink_offset, data, mask=mask)
+        sink_offset += BLOCK_SIZE
+
+    # tail block: req_to_token[req, tail_start:seq_len_raw] (the whole row when unbounded)
     kv_offset = tl.arange(0, BLOCK_SIZE)
-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+    num_loop = tl.cdiv(n_tail, BLOCK_SIZE)
     for _ in range(num_loop):
-        mask = kv_offset < seq_len
-        data = tl.load(token_pool_ptr + kv_offset, mask=mask)
-        tl.store(kv_ptr + kv_offset, data, mask=mask)
+        mask = kv_offset < n_tail
+        data = tl.load(token_pool_ptr + tail_start + kv_offset, mask=mask)
+        tl.store(kv_ptr + n_sink + kv_offset, data, mask=mask)
         kv_offset += BLOCK_SIZE
 
+    # The chain's own tokens: SOURCE is at the true seq_len_raw, DEST after the retained set.
     extend_offset = tl.arange(0, iter_upper)
     if page_size == 1 or topk == 1:
         extend_data = tl.load(
-            token_pool_ptr + seq_len + topk_id * num_steps + tl.arange(0, iter_upper),
+            token_pool_ptr
+            + seq_len_raw
+            + topk_id * num_steps
+            + tl.arange(0, iter_upper),
             mask=extend_offset < iters,
         )
     else:
-        prefix_len = seq_len
+        prefix_len = seq_len_raw
         last_page_len = prefix_len % page_size
         num_new_pages_per_topk = (
             last_page_len + num_steps + page_size - 1
         ) // page_size
-        prefix_base = seq_len // page_size * page_size
+        prefix_base = seq_len_raw // page_size * page_size
         start = (
             prefix_base + topk_id * num_new_pages_per_topk * page_size + last_page_len
         )
@@ -163,13 +206,16 @@ def generate_draft_decode_kv_indices(
 
     tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
 
-    # Update kv_indptr
+    # Update kv_indptr. `positions` carries each branch's seq_len, so it is clamped in
+    # lockstep with the layout above (host mirror: FlashInferMultiStepDraftBackend).
     bs_offset = tl.arange(0, num_tokens_upper)
 
     zid = bid * topk + topk_id
     if zid == 0:
         zid = num_seqs * topk
     positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
+    if WINDOW > 0:
+        positions = tl.minimum(positions, SINK + WINDOW)
     base = tl.sum(positions)
     tl.store(kv_indptr + zid, base + zid * iters)
 

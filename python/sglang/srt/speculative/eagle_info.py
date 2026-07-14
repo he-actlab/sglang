@@ -6,10 +6,14 @@ import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    create_windowed_kv_indices_triton,
+)
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_utils import draft_kv_window_cfg, retained_kv_lens
 
 logger = logging.getLogger(__name__)
 
@@ -368,23 +372,49 @@ class EagleDraftExtendInput(SpecInput):
             dtype=torch.int32,
             device=device,
         )
+        # BOUNDED-KV DRAFTER: this is the DRAFT model's extend (EagleDraftExtendInput is
+        # only ever the draft's spec input -- the target verifies via EagleVerifyInput), so
+        # bounding the read-set here cannot touch the target. Truncating the FRONT of the kv
+        # list is safe under flashinfer: the paged prefix wrapper runs non-causal, and the
+        # causal wrapper anchors its diagonal at the END of the list (kv_len - qo_len + i),
+        # so the drafter's own new tokens stay correctly aligned.
+        sink, window, cap = draft_kv_window_cfg(get_global_server_args())
+
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        cum_kv_seq_len[1:] = torch.cumsum(
+            retained_kv_lens(paged_kernel_lens, cap), dim=0
+        )
 
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
+        elif cap:
+            # Upper bound on the retained total -- avoids a D2H sync on cum_kv_seq_len[-1].
+            # Over-allocating the buffer is harmless (kv_indptr says what is live).
+            paged_kernel_lens_sum = min(paged_kernel_lens_sum, bs * cap)
 
         kv_indices = torch.empty(
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
-        )
+        if cap:
+            create_windowed_kv_indices_triton[(bs,)](
+                req_to_token,
+                req_pool_indices,
+                paged_kernel_lens,
+                cum_kv_seq_len,
+                kv_indices,
+                req_to_token.size(1),
+                sink,
+                window,
+            )
+        else:
+            create_flashinfer_kv_indices_triton[(bs,)](
+                req_to_token,
+                req_pool_indices,
+                paged_kernel_lens,
+                cum_kv_seq_len,
+                None,
+                kv_indices,
+                req_to_token.size(1),
+            )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
