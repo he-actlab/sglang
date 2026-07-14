@@ -1031,9 +1031,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         m.spec_info = EagleDraftInput(
             topk_p=torch.cat([x.topk_p for x in si]),
             topk_index=torch.cat([x.topk_index for x in si]),
+            # all(), not si[0]: the pool can MIX None and tensor. STANDALONE's
+            # gathers never refresh hidden_states (spec_need_hidden_states()
+            # is False), so a slot fresh from prefill carries None while a
+            # post-extend slot carries a stale tensor the draft never reads --
+            # cat() on the mix raised TypeError at the first mixed pool
+            # (lead=0 / fallback with a newly admitted slot). None is correct
+            # whenever any slot lacks it: EAGLE (which does consume hidden)
+            # refreshes EVERY pooled slot's hidden at the same-tick gathers,
+            # so all() is equivalent to the old check there.
             hidden_states=(
                 torch.cat([x.hidden_states for x in si])
-                if si[0].hidden_states is not None
+                if all(x.hidden_states is not None for x in si)
                 else None
             ),
             bonus_tokens=torch.cat([x.bonus_tokens for x in si]),
@@ -2566,10 +2575,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     "verify_done": verify_done,
                     # record_stream(small) targets at flush: cross-stream
                     # inputs whose Python refs may drop mid-execution.
+                    #
+                    # bonus_tokens MUST be in this set (S>2 churn crash,
+                    # 2026-07-14): it is the ONE relay-payload tensor produced
+                    # on the LARGE stream (verify's fill_bonus_tokens) and read
+                    # on the SMALL stream by the deferred stash; every other
+                    # payload field is (re)allocated on the small stream by the
+                    # deferred extend itself. Its only Python ref is
+                    # next_draft_input.bonus_tokens (== the slot's live
+                    # spec_info), which the slot's next draft-tick FutureMap
+                    # gather REBINDS -- dropping the last ref and freeing the
+                    # block back to the LARGE stream's pool while the stash may
+                    # still be queued behind the small stream's extend backlog.
+                    # The next verify's allocations then recycle the block and
+                    # its accept_index full_(-1) init writes -1s that the stash
+                    # relays as the tree ROOT token: negative verify input_ids
+                    # -> indexSelectSmallIndex device assert. S=2
+                    # (Design-PingPong) is immune only because verify(X) waits
+                    # the SAME tick's small-stream draft event, which orders the
+                    # recycled write after the stash; Design-SplitWindows'
+                    # whole point -- verify never waits the drafter -- removes
+                    # that accidental protection.
                     "used_tensors": (
                         batch_output.next_token_ids,
                         batch_output.accept_lens,
                         batch_output.logits_output.hidden_states,
+                        batch_output.next_draft_input.bonus_tokens,
                         batch.seq_lens,
                         batch.seq_lens_cpu,
                         batch.req_pool_indices,

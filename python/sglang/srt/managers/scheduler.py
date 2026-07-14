@@ -3517,9 +3517,22 @@ class Scheduler(
                 pooled = {b.spec_pdmux_slot for b in self._spec_pdmux_draft_pool}
                 ups = self._spec_pdmux_upcoming_verifiers(lead + 1)
                 nv = ups[-1] if len(ups) == lead + 1 else None
+                # nv == the slot verifying THIS tick happens when <= lead+1
+                # slots are populated: _spec_pdmux_upcoming_verifiers wraps
+                # around onto ret itself (drain / churn window). Its parked
+                # draft is being CONSUMED this very tick, so has_ready_draft
+                # (nv) is a stale read -- by the time nv verifies again it
+                # needs a fresh fused draft, which (Design-SplitWindows)
+                # fires next tick. Concluding "no fire" here skipped the
+                # flush and left a pending extend to cross its own result's
+                # settle + the next draft-fire's KV re-alloc: exactly the
+                # launched-before-free hazard the invariant below raises on.
+                # Fire on the wrap instead (a flush is always legal; at <=2
+                # populated slots there is no fusion to lose).
                 ret._spec_pdmux_fire_extends = (
                     fallback
                     or nv is None
+                    or nv == ret.spec_pdmux_slot
                     or (
                         nv not in pooled
                         and not self.model_worker.spec_pdmux_has_ready_draft(nv)
