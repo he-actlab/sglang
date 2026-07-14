@@ -69,6 +69,14 @@ def _set_window(base_ptr, num_bytes, prop):
 
 
 def _pre_hook(module, args, rows_max):
+    # Prefill is TorchDynamo-compiled in SGLang v2; tracing a ctypes Structure
+    # ctor blows up (and a graph break per linear would wreck prefill anyway).
+    # Skipping under trace is exactly right: the window is only ever wanted on
+    # the DECODE path, whose graphs are captured EAGERLY -> the policy still
+    # bakes into the verify graph's kernel nodes. Compiled prefill keeps L2
+    # Normal, which is the behaviour the rows_max reset branch existed for.
+    if torch.compiler.is_compiling():
+        return
     x = args[0] if args else None
     if x is not None and x.dim() >= 2 and x.shape[0] > rows_max:
         _set_window(None, 0, _ACCESS_NORMAL)  # prefill-shaped: keep L2 normal
