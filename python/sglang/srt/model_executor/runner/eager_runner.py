@@ -116,6 +116,29 @@ class EagerRunner(BaseRunner):
         self._eager_max_bs = max_bs
         self._eager_num_tokens_per_bs = num_tokens_per_bs
         is_encoder_decoder = mr.model_config.is_encoder_decoder
+        # spec-pdmux M2.5 (extended, trunk bug #5): the DRAFT worker's eager
+        # statics live in the same dedicated pool namespace as the draft-side
+        # graph runners' (eagle_draft[_extend]_cuda_graph_runner). The draft
+        # eager forwards (notably the B5 deferred prefill draft-extend flush)
+        # fill and read these statics on the SMALL green-ctx stream while the
+        # target's runners fill identically-keyed default-namespace statics
+        # (seq_lens / req_pool_indices / ...) on the large stream — cross-
+        # stream, unordered. Measured hazard: the deferred extend's flashinfer
+        # ragged plan read the VERIFY's seq_lens out of the shared pooled
+        # buffer (plan tokens == verify seq_len - prefix, != q tokens) and the
+        # scheduler crashed. Draft-side work still shares among itself: it is
+        # serialized on the one small stream.
+        buffer_namespace = ""
+        if (
+            mr.is_draft_worker
+            and sa.enable_spec_pdmux
+            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+        ):
+            buffer_namespace = "spec-pdmux-draft"
+            logger.info(
+                "[spec-pdmux] EagerRunner (draft): statics in DEDICATED "
+                "input-buffer namespace"
+            )
         self._eager_registry = build_eager_registry(
             device=mr.device,
             max_bs=max_bs,
@@ -131,6 +154,7 @@ class EagerRunner(BaseRunner):
                 else 0
             ),
             dp_size=sa.dp_size,
+            pool_namespace=buffer_namespace,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()

@@ -3280,10 +3280,14 @@ class Scheduler(
                 # unsafe under TP>1 concurrency until fixed -- OFF at tp>1
                 # (SGLANG_SPEC_PDMUX_DEFER_PREFILL=1 forces it back on for
                 # debugging). TP1 keeps the M2.7 behavior unchanged.
+                # When SET, the env var is an explicit override in BOTH
+                # directions (=0 disables the B5 deferral even at TP1 — the
+                # discriminator for deferral-lifetime bugs); when unset, the
+                # default is ON exactly at TP1 as before.
                 and (
-                    self.server_args.tp_size == 1
-                    or envs.SGLANG_SPEC_PDMUX_DEFER_PREFILL.is_set()
-                    and envs.SGLANG_SPEC_PDMUX_DEFER_PREFILL.get()
+                    envs.SGLANG_SPEC_PDMUX_DEFER_PREFILL.get()
+                    if envs.SGLANG_SPEC_PDMUX_DEFER_PREFILL.is_set()
+                    else self.server_args.tp_size == 1
                 )
                 and self.chunked_req is None
                 and new_batch.chunked_req is None

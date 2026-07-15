@@ -2085,6 +2085,41 @@ class EAGLEWorkerV2(BaseSpecWorker):
         while pending:
             p = pending.pop(0)
             small.wait_event(p["prefill_done"])
+            # B5 plan-lifetime invariant (enforced raise, CPU-only, no sync):
+            # the stashed batch's composition at flush must equal what was
+            # stashed. Catches shared-container mutations leaking through the
+            # shallow copy between stash and flush.
+            b = p["batch"]
+            d = p["composition"]
+            now = {
+                "rids": [r.rid for r in b.reqs],
+                "bs": b.batch_size(),
+                "input_ids_len": (
+                    int(b.input_ids.shape[0]) if b.input_ids is not None else -1
+                ),
+                "input_ids_ptr": (
+                    b.input_ids.data_ptr() if b.input_ids is not None else 0
+                ),
+                "extend_lens": (
+                    list(b.extend_lens) if b.extend_lens is not None else None
+                ),
+                "prefix_lens": (
+                    list(b.prefix_lens) if b.prefix_lens is not None else None
+                ),
+                "seq_lens_shape": tuple(b.seq_lens.shape),
+                "seq_lens_ptr": b.seq_lens.data_ptr(),
+            }
+            drift = {
+                k: {"stash": d.get(k), "flush": v}
+                for k, v in now.items()
+                if d.get(k) != v
+            }
+            if drift:
+                raise RuntimeError(
+                    f"[spec-pdmux] B5 deferred prefill draft-extend: batch "
+                    f"composition drifted between stash (tick={d.get('tick')}) "
+                    f"and flush: {drift}"
+                )
             with dev.stream(small):
                 # Caching-allocator insurance (same rationale as the decode
                 # pending flush): these tensors' home streams are the large /
@@ -2099,12 +2134,41 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    next_draft_input = self.draft_worker._draft_extend_for_prefill(
-                        p["batch"],
-                        p["hidden_states"],
-                        p["next_token_ids"],
-                        p["mm_input_embeds"],
-                    )
+                    try:
+                        next_draft_input = (
+                            self.draft_worker._draft_extend_for_prefill(
+                                p["batch"],
+                                p["hidden_states"],
+                                p["next_token_ids"],
+                                p["mm_input_embeds"],
+                            )
+                        )
+                    except ValueError as e:
+                        # Plan-vs-q mismatch context (trunk bug #5 class): the
+                        # flashinfer ragged-plan token count disagreeing with
+                        # q means the plan was computed from data that is not
+                        # this batch's — historically the draft eager statics
+                        # aliasing the target's via the default input-buffer
+                        # pool namespace (fixed by the spec-pdmux-draft
+                        # namespace on the draft EagerRunner registry). Raise
+                        # with the batch composition so the drift is named.
+                        wr = getattr(
+                            getattr(
+                                self.draft_worker.draft_runner,
+                                "attn_backend",
+                                None,
+                            ),
+                            "prefill_wrapper_ragged",
+                            None,
+                        )
+                        raise RuntimeError(
+                            f"[spec-pdmux] B5 deferred prefill draft-extend "
+                            f"failed: q tokens={now['input_ids_len']}, ragged "
+                            f"plan tokens="
+                            f"{getattr(wr, '_qo_indptr_last', None)}, "
+                            f"stash tick={d.get('tick')}, "
+                            f"composition={d}"
+                        ) from e
                 # FutureMap stash on the small stream (extend outputs:
                 # topk_p/topk_index/bonus/hidden). The scheduler-side shell
                 # spec_info is filled by the newcomers' first-tick gathers.
@@ -2307,6 +2371,45 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         # / _forward_isolation restore (same pattern as the
                         # deferred decode extend).
                         "batch": copy.copy(batch),
+                        # B5 plan-lifetime invariant: CPU-only composition
+                        # snapshot at stash time, re-checked at flush. The
+                        # deferral's contract is that the stashed batch is
+                        # FROZEN between stash and flush; any drift here means
+                        # a shared-container mutation leaked through the
+                        # shallow copy (the documented reason B5 stays OFF at
+                        # TP>1). Cheap: a few host ints/lists per prefill.
+                        "composition": {
+                            "tick": getattr(batch, "forward_iter", -1),
+                            "rids": [r.rid for r in batch.reqs],
+                            "bs": batch.batch_size(),
+                            "input_ids_len": (
+                                int(batch.input_ids.shape[0])
+                                if batch.input_ids is not None
+                                else -1
+                            ),
+                            "input_ids_ptr": (
+                                batch.input_ids.data_ptr()
+                                if batch.input_ids is not None
+                                else 0
+                            ),
+                            "extend_lens": (
+                                list(batch.extend_lens)
+                                if batch.extend_lens is not None
+                                else None
+                            ),
+                            "prefix_lens": (
+                                list(batch.prefix_lens)
+                                if batch.prefix_lens is not None
+                                else None
+                            ),
+                            "seq_lens_shape": tuple(batch.seq_lens.shape),
+                            "seq_lens_ptr": batch.seq_lens.data_ptr(),
+                            "seq_lens_cpu": (
+                                batch.seq_lens_cpu.tolist()
+                                if batch.seq_lens_cpu is not None
+                                else None
+                            ),
+                        },
                         # GPU refs frozen before the scheduler's copy_to_cpu
                         # rebinds next_token_ids (and optionally
                         # logits_output.hidden_states) to host tensors.

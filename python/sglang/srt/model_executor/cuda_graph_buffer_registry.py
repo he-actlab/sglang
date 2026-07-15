@@ -297,6 +297,7 @@ class CudaGraphBufferRegistry:
         max_bs: int,
         max_num_tokens: int,
         share_pool: bool = False,
+        pool_namespace: str = "",
     ) -> None:
         self.device = device
         self.max_bs = max_bs
@@ -304,6 +305,10 @@ class CudaGraphBufferRegistry:
         # Coalesce allocated slot buffers through the global pool; only applies
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
+        # Pool partition (see share_input_buffer): callers whose fills/reads
+        # are NOT serialized with the default-namespace users (spec-pdmux
+        # draft-side work on the SMALL stream) must isolate their statics.
+        self.pool_namespace = pool_namespace
         self._slots: Dict[str, GraphSlot] = {}
 
     # ---- registration ------------------------------------------------------
@@ -354,7 +359,7 @@ class CudaGraphBufferRegistry:
             # Coalesce with any same-named buffer (e.g. the legacy
             # DecodeInputBuffers field) so capture and replay see one
             # physical allocation with a stable data_ptr.
-            buffer = share_input_buffer(slot.name, buffer)
+            buffer = share_input_buffer(slot.name, buffer, self.pool_namespace)
         if (
             slot.padding_policy
             in (PaddingPolicy.FILL_SENTINEL, PaddingPolicy.FILL_ONCE)
@@ -521,6 +526,7 @@ def build_decode_registry(
     dp_size: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
+    pool_namespace: str = "",
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
@@ -549,6 +555,7 @@ def build_decode_registry(
         max_bs=max_bs,
         max_num_tokens=max_num_token,
         share_pool=share_pool,
+        pool_namespace=pool_namespace,
     )
 
     def _tokens(_bs: int, mt: int) -> Tuple[int, ...]:
@@ -899,6 +906,7 @@ def build_eager_registry(
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
     dp_size: int = 1,
+    pool_namespace: str = "",
 ) -> CudaGraphBufferRegistry:
     """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
     decode and eager prefill.
@@ -930,5 +938,6 @@ def build_eager_registry(
         require_mlp_tp_gather=False,
         dp_size=dp_size,
         share_pool=True,
+        pool_namespace=pool_namespace,
         source=None,
     )
