@@ -2822,6 +2822,17 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
+        elif (
+            self.server_args.enable_admit_pacing
+            and not self._spec_pdmux_admit_pacing_ok()
+        ):
+            # Paced admission (optimization B4, --enable-admit-pacing): the
+            # spec-pdmux M2.6 pacing predicate, same code and parameters, on
+            # the stock admission path — defer this tick's prefill admission
+            # (the requests stay in waiting_queue; decode proceeds below).
+            # Guarded by the opt-in flag: without it this branch is dead and
+            # stock admission is byte-identical to before.
+            new_batch = None
         else:
             new_batch = self.get_new_batch_prefill()
 
@@ -3028,6 +3039,11 @@ class Scheduler(
 
         A mid-chunk prefill (self.chunked_req) is never deferred: the chunk
         must finish before its KV/state can progress.
+
+        Paced admission (optimization B4, --enable-admit-pacing) runs this SAME
+        predicate — same code, same parameter flags — on the STOCK admission
+        path; the only mode difference is where the running bs is read from
+        (slot union under spec-pdmux, running_batch on stock).
         """
         n_min = self.server_args.spec_pdmux_admit_min_new
         if n_min <= 1 or self.chunked_req is not None:
@@ -3035,7 +3051,11 @@ class Scheduler(
         if not self.waiting_queue:
             self._spec_pdmux_defer_ticks = 0
             return True  # nothing to admit; keep the counter cold
-        union_bs = sum(self._spec_pdmux_slot_sizes())
+        union_bs = (
+            sum(self._spec_pdmux_slot_sizes())
+            if self.spec_pdmux_slots is not None
+            else len(self.running_batch.reqs)  # stock B4 path (--enable-admit-pacing)
+        )
         if (
             union_bs < self.server_args.spec_pdmux_admit_pace_floor
             or len(self.waiting_queue) >= n_min

@@ -2433,6 +2433,20 @@ class ServerArgs:
         int,
         "spec-pdmux M2.6 admission pacing: hard bound on how many scheduler ticks a waiting request may be deferred (bounds the TTFT cost; ~20-25 ms per decode tick at slot-bs 16).",
     ] = 16
+    enable_admit_pacing: A[
+        bool,
+        "Paced admission (optimization B4) on the STOCK admission path: run the "
+        "spec-pdmux M2.6 pacing predicate — with the SAME code and the SAME "
+        "parameter flags (--spec-pdmux-admit-min-new / --spec-pdmux-admit-pace-floor "
+        "/ --spec-pdmux-admit-max-defer-ticks) — in front of stock prefill "
+        "admission: defer admission until admit-min-new requests are waiting, "
+        "bounded by admit-max-defer-ticks, active only while the running bs >= "
+        "admit-pace-floor (below the floor, and thus at c=1, pacing never "
+        "activates). OFF by default: without this flag stock admission is "
+        "byte-identical to before, and the pacing parameter defaults do not leak "
+        "into stock behavior. Incompatible with --enable-spec-pdmux, which "
+        "already paces its own admission path via the same flags.",
+    ] = False
     spec_pdmux_slots: A[
         int,
         "Design-DraftPool: number of sub-batch slots S. 2 (default) = Design-PingPong "
@@ -7232,6 +7246,26 @@ class ServerArgs:
                             "(per-step draft_probs of shape (bs, steps, vocab) "
                             "are not all-gathered)."
                         )
+
+        # Check paced admission (optimization B4) on the STOCK admission path.
+        # Explicit raises, never bare asserts (same rationale as spec-pdmux above).
+        if self.enable_admit_pacing:
+            if self.enable_spec_pdmux:
+                raise AssertionError(
+                    "--enable-admit-pacing is the stock-path opt-in for paced "
+                    "admission (optimization B4); --enable-spec-pdmux already "
+                    "paces its own admission path via --spec-pdmux-admit-min-new."
+                )
+            if self.pp_size != 1:
+                raise AssertionError(
+                    "--enable-admit-pacing requires pp_size=1 (the PP admission "
+                    "path is not paced)."
+                )
+            if self.dllm_algorithm is not None:
+                raise AssertionError(
+                    "--enable-admit-pacing does not support dllm (the dllm "
+                    "admission path is not paced)."
+                )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
