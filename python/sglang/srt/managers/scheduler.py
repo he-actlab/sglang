@@ -3115,6 +3115,20 @@ class Scheduler(
         exist before the draft, since prepare_for_draft reads the draft's write
         targets out of the just-written req_to_token rows."""
         slot = self.spec_pdmux_slots[idx]
+        # Launched-before-free, retraction leg: update_running_batch below can
+        # retract under KV pressure and release req/KV rows that this slot's
+        # deferred draft-extend still references (it was recorded at verify
+        # time; retraction does not rewrite it). The draft-fire assertion only
+        # covers frees from SETTLED results — retraction frees happen right
+        # here, at prepare time. Launching the extend first closes that leg:
+        # its GPU work (small stream, waits verify_done internally) is enqueued
+        # before any row this call frees can be recycled by this tick's
+        # verify-tree alloc. Steady-state 2-slot cadence never has a pending
+        # extend at its own prepare (the worker flushed it on the intervening
+        # tick), so this fires only on the single-populated-slot fallback,
+        # where run_batch's same-slot flush then no-ops.
+        if self.model_worker.spec_pdmux_has_pending_extend(idx):
+            self.model_worker.flush_spec_pdmux_pending(idx)
         # Tag BEFORE update_running_batch: the M2.3 headroom assert inside
         # prepare_for_decode's verify-tree alloc reports it.
         slot.spec_pdmux_slot = idx

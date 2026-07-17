@@ -7130,6 +7130,29 @@ class ServerArgs:
                 raise AssertionError(
                     "--enable-spec-pdmux requires a speculative algorithm."
                 )
+            # The slot scheduler drives the worker through EAGLEWorkerV2's
+            # slot/pending/relay protocol (spec_pdmux_has_ready_draft /
+            # spec_pdmux_has_pending_extend / spec_pdmux_ready_draft_bs /
+            # spec_pdmux_invalidate_ready_draft / flush_spec_pdmux_pending).
+            # Only workers that implement it are supported; any other
+            # algorithm passes startup and dies with AttributeError on its
+            # first decode tick (NGRAM/DFLASH/multi-layer), or inherits the
+            # methods without maintaining the slot state (FROZEN_KV_MTP —
+            # unvalidated). Reject at startup instead.
+            _spec_pdmux_supported_algos = ("EAGLE", "EAGLE3", "STANDALONE")
+            if self.speculative_algorithm.upper() not in _spec_pdmux_supported_algos:
+                raise AssertionError(
+                    "--enable-spec-pdmux supports speculative algorithms "
+                    f"{_spec_pdmux_supported_algos} (their workers implement "
+                    "the spec-pdmux slot/pending/relay protocol). Got: "
+                    f"{self.speculative_algorithm}."
+                )
+            if self.enable_multi_layer_eagle:
+                raise AssertionError(
+                    "--enable-spec-pdmux is incompatible with "
+                    "--enable-multi-layer-eagle (MultiLayerEagleWorkerV2 does "
+                    "not implement the spec-pdmux worker protocol)."
+                )
             # M3 step 2: TP{2,4} run concurrently on the dedicated draft
             # communicator (duplicate TP group; model_runner passes
             # duplicate_tp_group at tp_size>1, spec_utils.draft_dup_tp_context
