@@ -73,6 +73,15 @@ def get_arch_constraints(compute_capability):
         return 4, 2
     elif major == 9 and minor >= 0:
         return 8, 8
+    elif major == 12:
+        # Blackwell sm_120 (GB202, RTX PRO 6000): probed 2026-07-21 on the
+        # g7e dev box — create_greenctx_stream_by_value rejects partitions
+        # of 2-3 SMs and accepts every size >= 4, including odd sizes.
+        # (4, 2) is deliberately stricter than the raw acceptance: 2 = TPC
+        # granularity, so requested counts can't be silently rounded. The
+        # split-performance cliff on 188 SMs is unprobed — A100/GH200 split
+        # answers do not transfer (dev-env/AWS-RTXPRO6000.md).
+        return 4, 2
     else:
         raise ValueError(f"Unsupported compute capability: {major}.{minor}")
 
