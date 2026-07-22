@@ -19,6 +19,12 @@ CURRENT_STREAM_GROUP = None
 # drafter to the small stream.
 SPEC_STREAM_PAIR: Optional[Tuple[torch.cuda.Stream, torch.cuda.Stream]] = None
 SPEC_SM_SPLIT: Optional[Tuple[int, int]] = None
+# Design-FullChipPrefill (TODO-34): a plain full-device stream for target
+# prompt prefill. Not a green-ctx partition stream — graph SM affinity bakes
+# at capture, so target-prefill graphs captured here may use the whole chip.
+# The worker fences both partitions around every use (no green-ctx kernel may
+# overlap a full-chip prefill).
+SPEC_PREFILL_STREAM: Optional[torch.cuda.Stream] = None
 
 
 @dataclass
@@ -206,7 +212,7 @@ def initialize_spec_stream_pair(
     """Create the process-wide (large, small) green-ctx stream pair once.
     Idempotent: repeat calls (target + draft model runners share one process)
     return the existing pair, and must ask for the same split."""
-    global SPEC_STREAM_PAIR, SPEC_SM_SPLIT
+    global SPEC_STREAM_PAIR, SPEC_SM_SPLIT, SPEC_PREFILL_STREAM
     if SPEC_STREAM_PAIR is not None:
         if SPEC_SM_SPLIT != (large_sm, small_sm):
             raise ValueError(
@@ -220,6 +226,7 @@ def initialize_spec_stream_pair(
         large_sm, small_sm, gpu_id
     )
     SPEC_SM_SPLIT = (large_sm, small_sm)
+    SPEC_PREFILL_STREAM = torch.cuda.Stream(device=gpu_id)
     logger.info(
         "[spec-pdmux] green-ctx stream pair created on gpu %d: "
         "large=%d SMs, small=%d SMs (total=%d)",
@@ -239,6 +246,17 @@ def get_spec_streams() -> Tuple[torch.cuda.Stream, torch.cuda.Stream]:
             "(initialize_spec_stream_pair must run first)"
         )
     return SPEC_STREAM_PAIR
+
+
+def get_spec_prefill_stream() -> torch.cuda.Stream:
+    """The full-device target-prefill stream (Design-FullChipPrefill);
+    initialize_spec_stream_pair must have run."""
+    if SPEC_PREFILL_STREAM is None:
+        raise RuntimeError(
+            "spec-pdmux prefill stream not initialized "
+            "(initialize_spec_stream_pair must run first)"
+        )
+    return SPEC_PREFILL_STREAM
 
 
 def set_current_stream_idx(idx: int):

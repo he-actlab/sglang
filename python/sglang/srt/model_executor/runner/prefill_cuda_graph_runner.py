@@ -124,19 +124,38 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- core state ------------------------------------------------
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.is_multimodal
-        # spec-pdmux (M1): capture prefill graphs on the LARGE green-ctx stream
-        # too — graph SM affinity is baked at CAPTURE time, so a plain capture
-        # stream would let prefill escape the partition (measured: brief 99%
-        # SM-Active bursts at each prefill). None => stock behavior.
+        # spec-pdmux: graph SM affinity is baked at CAPTURE time, so the
+        # capture stream decides which SMs replay may use. Role-aware
+        # (Design-FullChipPrefill, TODO-34):
+        #   target: the dedicated full-device prefill stream — target prefill
+        #     has no intended concurrent partner on SMALL, so confining it to
+        #     LARGE only costs wave quantization. The worker fences both
+        #     partitions around every replay (eagle_worker_v2
+        #     forward_batch_generation, extend branch).
+        #   draft (BCG only): the SMALL green-ctx stream, like the other two
+        #     draft runners — draft prompt ingestion runs under a later verify.
+        # None => stock behavior.
         self.capture_stream_override = None
         if model_runner.server_args.enable_spec_pdmux:
-            from sglang.srt.multiplex.pdmux_context import get_spec_streams
-
-            self.capture_stream_override = get_spec_streams()[0]
-            logger.info(
-                "[spec-pdmux] %s: graph capture on LARGE green-ctx stream",
-                type(self).__name__,
+            from sglang.srt.multiplex.pdmux_context import (
+                get_spec_prefill_stream,
+                get_spec_streams,
             )
+
+            if model_runner.is_draft_worker:
+                self.capture_stream_override = get_spec_streams()[1]
+                logger.info(
+                    "[spec-pdmux] %s (draft): graph capture on SMALL "
+                    "green-ctx stream",
+                    type(self).__name__,
+                )
+            else:
+                self.capture_stream_override = get_spec_prefill_stream()
+                logger.info(
+                    "[spec-pdmux] %s (target): graph capture on the "
+                    "full-device prefill stream (Design-FullChipPrefill)",
+                    type(self).__name__,
+                )
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation

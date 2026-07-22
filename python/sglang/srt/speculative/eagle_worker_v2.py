@@ -1858,6 +1858,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return small
 
     @functools.cached_property
+    def _spec_pdmux_prefill_stream(self):
+        """Design-FullChipPrefill (TODO-34): the full-device stream target
+        prompt prefill runs on, or None when --enable-spec-pdmux is off.
+        cached_property for the same StandaloneWorkerV2 __init__ reason as
+        _spec_pdmux_small_stream. Applies under SERIALIZE too: the route is
+        strictly fenced against both partitions, so it composes with the M1
+        sequential semantics unchanged."""
+        if not self.server_args.enable_spec_pdmux:
+            return None
+        from sglang.srt.multiplex.pdmux_context import get_spec_prefill_stream
+
+        stream = get_spec_prefill_stream()
+        logger.info(
+            "[spec-pdmux r%d] %s: target prefill -> full-device stream",
+            self.tp_rank,
+            type(self).__name__,
+        )
+        return stream
+
+    @functools.cached_property
     def _spec_pdmux_concurrent(self):
         """spec-pdmux M2.2 (step 7): event-based cross-stream ordering instead
         of the M1 full joins. SGLANG_SPEC_PDMUX_SERIALIZE=1 is the kill-switch
@@ -1887,9 +1907,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
           two cross-stream true dependencies: verify(X) waits draft(X)-done;
           deferred extend(X) waits verify(X)-done.
         - flush_done[slot]: recorded on the small stream after each deferred
-          extend+stash; prefill forwards (whole-batch on the large stream,
-          untagged relay) wait these so their FutureMap/KV writes to possibly
-          recycled rows are ordered after all in-flight small-stream stashes.
+          extend+stash; prefill forwards (whole-batch, full-device stream
+          since TODO-34, untagged relay) wait these so their FutureMap/KV
+          writes to possibly recycled rows are ordered after all in-flight
+          small-stream stashes.
         - prefill_pending (M2.7): the DEFERRED eager draft prefill-extends of
           admitted prefill batches (FIFO list; multiple chunks / consecutive
           prefills preserve draft-KV write order). The extend's ~26 ms of
@@ -2071,7 +2092,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         stash) on the SMALL stream. Data dependency: the target prefill's
         outputs (next_token_ids / hidden_states) and its in-place input_ids
         rotation source — carried by the per-admission prefill_done event
-        recorded on the large stream right after the target forward+publish.
+        recorded on the full-device prefill stream right after the target
+        forward+publish (TODO-34; both partitions also tail-wait it at the
+        admission tick, so this wait is usually already satisfied).
         The relay stash runs here on the small stream, so the newcomers'
         first-tick gathers (also small-stream) are FIFO-ordered after it;
         the scheduler's held admission guarantees those gathers are ENQUEUED
@@ -2316,15 +2339,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    @_profile_phase("target_prefill")
+    def _target_prefill_forward(self, batch: ScheduleBatch, on_publish):
+        """Target prompt prefill forward + publish. Runs on the current
+        stream: the full-device prefill stream under spec-pdmux (TODO-34),
+        the plain forward stream otherwise."""
+        with spec_stage_span("target_prefill"):
+            batch_output = self.target_worker.forward_batch_generation(batch)
+            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's
+            # tokens. Extend processed L prompt tokens; next verify iter
+            # expects same L.
+            batch_output.new_seq_lens = batch.seq_lens
+            # Publish before draft_extend so the fence is at target-end.
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+        return batch_output
+
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, on_relay=None
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if self._spec_pdmux_concurrent:
-                # spec-pdmux M2.2: a prefill runs whole-batch on the LARGE
-                # stream and its relay stash may write FutureMap/KV rows
-                # recycled from retired requests -- order it after every
-                # in-flight small-stream deferred extend+stash.
+                # spec-pdmux M2.2: a prefill runs whole-batch (full-device
+                # stream since TODO-34, fenced below) and its relay stash may
+                # write FutureMap/KV rows recycled from retired requests --
+                # order it after every in-flight small-stream deferred
+                # extend+stash.
                 self.flush_spec_pdmux_pending()
                 self._spec_pdmux_join_flush_done()
             # Target prefill
@@ -2334,14 +2374,40 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch.capture_hidden_mode = target_capture_mode
-            batch_output = self.target_worker.forward_batch_generation(batch)
 
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
-            # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
+            # Design-FullChipPrefill (TODO-34): run the target prefill on the
+            # full-device prefill stream — on an admission tick SMALL has no
+            # intended concurrent work, so LARGE confinement only costs wave
+            # quantization. Contract: no green-ctx kernel may overlap the
+            # full-chip interval. (a) The prefill stream first waits both
+            # partition tails (LARGE dominates the schedule stream — run_batch
+            # enqueued that edge this tick); (b) both partitions then wait
+            # prefill_done — each partition is one FIFO stream, so a tail-wait
+            # fences every later enqueue on it, including batch-less-tick
+            # pending flushes. Allocator safety without record_stream: blocks
+            # freed to the prefill stream's pool are only reused by a later
+            # prefill, whose entry waits both partition tails — which, by
+            # scheduler-thread program order, include every consumer enqueued
+            # for the freed tensors; the deferred-stash path additionally
+            # holds refs + used_tensors until its flush.
+            prefill_done = None
+            pf = self._spec_pdmux_prefill_stream
+            if pf is not None and not batch.forward_mode.is_idle():
+                dev = torch.get_device_module(self.device)
+                large = dev.current_stream()
+                small = self._spec_pdmux_small_stream
+                pf.wait_stream(large)
+                if small is not None:
+                    pf.wait_stream(small)
+                with dev.stream(pf):
+                    batch_output = self._target_prefill_forward(batch, on_publish)
+                    prefill_done = dev.Event()
+                    prefill_done.record(pf)
+                large.wait_event(prefill_done)
+                if small is not None:
+                    small.wait_event(prefill_done)
+            else:
+                batch_output = self._target_prefill_forward(batch, on_publish)
 
             # spec-pdmux M2.7: DEFER the eager draft prefill-extend off the
             # admission tick. Its ~26 ms of CPU launches (prompt shapes vary,
@@ -2361,8 +2427,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 and not batch.forward_mode.is_idle()
             ):
                 dev = torch.get_device_module(self.device)
-                prefill_done = dev.Event()
-                prefill_done.record(dev.current_stream())
+                if prefill_done is None:
+                    # Idle-mode fallback only: the full-chip route above
+                    # already recorded the event on the prefill stream.
+                    prefill_done = dev.Event()
+                    prefill_done.record(dev.current_stream())
                 self._spec_pdmux_state["prefill_pending"].append(
                     {
                         # copy.copy at exactly the sync call point: isolates
