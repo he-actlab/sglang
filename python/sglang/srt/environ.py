@@ -731,6 +731,17 @@ class Envs:
     # the draft-worker captures to the SMALL width. Target prefill is never
     # hinted: it captures on the full-device stream (Design-FullChipPrefill).
     SGLANG_SPEC_PDMUX_SM_HINT = EnvInt(0)
+    # Phased-bandwidth v2 (TODO-43): schedule-aligned drafter gating. The
+    # verify capture records an external event at each decoder layer's
+    # attention entry (the measured low-DRAM window); the draft capture
+    # segments its forward and waits one credit per segment, so the drafter's
+    # weight streams land inside verify's bandwidth valleys instead of its
+    # saturated GEMM windows. Timing-only: kernels compute the same values in
+    # the same order, so parity must stay byte-identical (unlike SM_HINT).
+    # 0 = off (default; byte-identical no-op — no event nodes are captured).
+    # 1 = align the draft-worker decode/extend captures to the target verify
+    # capture's per-layer credits. See multiplex/phase_align.py.
+    SGLANG_SPEC_PDMUX_PHASE_ALIGN = EnvInt(0)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
