@@ -22,6 +22,7 @@ _compiled_fn reused for every shape.
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -62,6 +63,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
     from sglang.srt.server_args import ServerArgs
 
+
+logger = logging.getLogger(__name__)
 
 _VALID_COMPILERS = ("eager", "inductor")
 
