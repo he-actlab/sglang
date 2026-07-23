@@ -1371,6 +1371,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft_extend(self):
         pass
 
+    @_profile_phase("draft_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
