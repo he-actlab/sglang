@@ -1,4 +1,5 @@
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -280,3 +281,101 @@ def get_sm_counts() -> list[tuple[int, int]]:
 def get_current_stream_idx() -> int:
     """Get the current stream index."""
     return CURRENT_STREAM_IDX
+
+
+def get_spec_sm_split() -> Optional[Tuple[int, int]]:
+    """The (large, small) SM split of the spec-pdmux pair; None before init."""
+    return SPEC_SM_SPLIT
+
+
+# --- Design-SMHint (TODO-15 rebuild) ----------------------------------------
+# cuBLAS picks GEMM kernels at CALL time from the DEVICE SM count; a green
+# context does not change what the SM-count APIs report, so grids are shaped
+# for the full device and pay a tail wave on the partition (wave quantization
+# — design/VERIFY-KERNELS-2026-07-14.md). cublasSetSmCountTarget re-tiles for
+# the partition width. Under CUDA graphs the kernel choice bakes at CAPTURE,
+# so the hint is applied around graph capture only (mirrors
+# experiments/greenctx_gemm_probe.py).
+
+_CUBLAS_LIB = None
+
+
+def _cublas_lib():
+    global _CUBLAS_LIB
+    if _CUBLAS_LIB is None:
+        import ctypes
+
+        last_err = None
+        for name in ("libcublas.so.13", "libcublas.so.12", "libcublas.so.11",
+                     "libcublas.so"):
+            try:
+                _CUBLAS_LIB = ctypes.CDLL(name)
+                break
+            except OSError as exc:
+                last_err = exc
+        if _CUBLAS_LIB is None:
+            raise RuntimeError(f"SM hint: cannot load libcublas: {last_err}")
+    return _CUBLAS_LIB
+
+
+def _cublas_sm_count_target_get() -> int:
+    import ctypes
+
+    lib = _cublas_lib()
+    handle = torch.cuda.current_blas_handle()
+    value = ctypes.c_int(-1)
+    rc = lib.cublasGetSmCountTarget(ctypes.c_void_p(handle), ctypes.byref(value))
+    if rc != 0:
+        raise RuntimeError(f"cublasGetSmCountTarget -> {rc}")
+    return value.value
+
+
+def _cublas_sm_count_target_set(n: int) -> None:
+    import ctypes
+
+    lib = _cublas_lib()
+    handle = torch.cuda.current_blas_handle()
+    rc = lib.cublasSetSmCountTarget(ctypes.c_void_p(handle), ctypes.c_int(n))
+    if rc != 0:
+        raise RuntimeError(f"cublasSetSmCountTarget({n}) -> {rc}")
+
+
+@contextmanager
+def spec_pdmux_sm_hint_capture(model_runner):
+    """Apply the partition-width cuBLAS hint around a graph-capture block.
+
+    No-op unless --enable-spec-pdmux and SGLANG_SPEC_PDMUX_SM_HINT != 0.
+    Mode 1 hints only the target worker's captures (LARGE width); mode 2 also
+    hints the draft worker's captures (SMALL width). The hint is thread-local
+    (per cuBLAS handle) and always restored, so eager/stock paths and target
+    prefill capture (full-device stream) are untouched.
+    """
+    from sglang.srt.environ import envs
+
+    hint = 0
+    if getattr(model_runner.server_args, "enable_spec_pdmux", False):
+        hint = envs.SGLANG_SPEC_PDMUX_SM_HINT.get()
+    width = None
+    if hint and SPEC_SM_SPLIT is not None:
+        large, small = SPEC_SM_SPLIT
+        if not getattr(model_runner, "is_draft_worker", False):
+            width = large
+        elif hint >= 2:
+            width = small
+    if not width:
+        yield
+        return
+    previous = _cublas_sm_count_target_get()
+    _cublas_sm_count_target_set(width)
+    logger.info(
+        "[spec-pdmux] SM hint: cublasSetSmCountTarget(%d) around %s graph capture "
+        "(mode %d, restore to %d after)",
+        width,
+        "draft" if getattr(model_runner, "is_draft_worker", False) else "target",
+        hint,
+        previous,
+    )
+    try:
+        yield
+    finally:
+        _cublas_sm_count_target_set(previous if previous > 0 else 0)

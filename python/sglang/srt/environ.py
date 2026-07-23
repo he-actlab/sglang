@@ -723,6 +723,14 @@ class Envs:
     # Input rows above which the hook resets the window to Normal (prefill-
     # shaped forwards reuse weight tiles in L2; streaming them regresses).
     SGLANG_SPEC_PDMUX_L2_ROWS_MAX = EnvInt(512)
+    # Design-SMHint (TODO-15 rebuild): cublasSetSmCountTarget at graph CAPTURE
+    # so cuBLAS tiles GEMMs for the green-ctx partition width instead of the
+    # full device (wave-quantization fix; kernel choice bakes into the graph).
+    # 0 = off (default; the build is a byte-identical no-op). 1 = hint the
+    # TARGET decode/verify captures to the LARGE width. 2 = additionally hint
+    # the draft-worker captures to the SMALL width. Target prefill is never
+    # hinted: it captures on the full-device stream (Design-FullChipPrefill).
+    SGLANG_SPEC_PDMUX_SM_HINT = EnvInt(0)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

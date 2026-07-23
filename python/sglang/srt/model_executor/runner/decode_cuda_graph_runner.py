@@ -697,7 +697,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+        # Design-SMHint (SGLANG_SPEC_PDMUX_SM_HINT): re-tile cuBLAS GEMMs for
+        # the green-ctx partition width around capture only — kernel choice
+        # bakes into the graph. Default 0 = exact no-op. Applies to the target
+        # decode/verify captures (and draft captures at mode 2); target prefill
+        # captures on the full-device stream and is never hinted.
+        from sglang.srt.multiplex.pdmux_context import spec_pdmux_sm_hint_capture
+
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc), \
+                spec_pdmux_sm_hint_capture(self.model_runner):
             if not self.enable_pdmux:
                 # capture_stream_override (spec-pdmux): capture on the given
                 # (green-ctx) stream; getattr because EAGLE subclasses set up
