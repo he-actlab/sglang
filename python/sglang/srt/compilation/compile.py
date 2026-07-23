@@ -118,10 +118,27 @@ def install_torch_compiled(
     compile_config: CompilationConfig = None,
     fullgraph: bool = True,
     graph_pool: Any = None,
+    isolate_code_cache: bool = False,
 ):
     unbound_fwd = module.__class__.forward
     if not callable(unbound_fwd):
         raise TypeError("module.__class__.forward must be callable")
+    if isolate_code_cache:
+        # TorchDynamo's cache is keyed by code object. Target and draft models
+        # can have the same Python class but require independent compiled
+        # graphs; removing the shared class code from Dynamo's cache while
+        # installing the second runner invalidates the first runner. Give the
+        # opt-in instance an equivalent, private code object instead.
+        original = unbound_fwd
+        unbound_fwd = types.FunctionType(
+            original.__code__.replace(),
+            original.__globals__,
+            name=original.__name__,
+            argdefs=original.__defaults__,
+            closure=original.__closure__,
+        )
+        unbound_fwd.__kwdefaults__ = original.__kwdefaults__
+        unbound_fwd.__annotations__ = original.__annotations__
     original_code = unbound_fwd.__code__
 
     dyn_map = dynamic_arg_dims or _infer_dynamic_arg_dims_from_annotations(unbound_fwd)

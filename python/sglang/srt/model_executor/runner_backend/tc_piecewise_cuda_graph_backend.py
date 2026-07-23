@@ -138,6 +138,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         graph_pool: Any,
         fullgraph: bool = True,
         dynamic_arg_dims: Optional[Any] = None,
+        isolate_code_cache: bool = False,
     ) -> None:
         """Wrap language_model.model.forward with torch.compile."""
         install_torch_compiled(
@@ -146,6 +147,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             dynamic_arg_dims=dynamic_arg_dims,
             compile_config=compile_config,
             graph_pool=graph_pool,
+            isolate_code_cache=isolate_code_cache,
         )
 
     def _run_compile_pass(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
@@ -166,14 +168,14 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     num_tokens=cuda_graph_runner.capture_num_tokens[0]
                 )
 
+                mr = cuda_graph_runner.model_runner
+                concurrent_draft = (
+                    getattr(mr, "is_draft_worker", False)
+                    and mr.server_args.enable_spec_pdmux
+                    and mr.server_args.spec_pdmux_draft_prefill_graph
+                    and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+                )
                 if self._pool is None:
-                    mr = cuda_graph_runner.model_runner
-                    concurrent_draft = (
-                        getattr(mr, "is_draft_worker", False)
-                        and mr.server_args.enable_spec_pdmux
-                        and mr.server_args.spec_pdmux_draft_prefill_graph
-                        and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
-                    )
                     if concurrent_draft:
                         self._pool = get_or_create_spec_pdmux_draft_graph_memory_pool(
                             self._device_module
@@ -198,6 +200,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     language_model.model,
                     compile_config=self._compile_config,
                     graph_pool=self._pool,
+                    isolate_code_cache=concurrent_draft,
                 )
 
                 with enable_torch_compile_warmup():
