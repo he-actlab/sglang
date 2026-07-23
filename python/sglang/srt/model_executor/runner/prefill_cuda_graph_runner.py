@@ -35,7 +35,6 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
-from sglang.srt.environ import envs
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
@@ -206,7 +205,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.is_draft_worker
             and model_runner.server_args.enable_spec_pdmux
             and model_runner.server_args.spec_pdmux_draft_prefill_graph
-            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
         ):
             self.pool_namespace = "spec-pdmux-draft"
 

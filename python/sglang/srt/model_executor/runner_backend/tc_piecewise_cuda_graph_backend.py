@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 import tqdm
 
-from sglang.srt.environ import envs
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.compile_phase import (
@@ -169,14 +168,13 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
                 mr = cuda_graph_runner.model_runner
-                concurrent_draft = (
+                draft_prefill_graph = (
                     getattr(mr, "is_draft_worker", False)
                     and mr.server_args.enable_spec_pdmux
                     and mr.server_args.spec_pdmux_draft_prefill_graph
-                    and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
                 )
                 if self._pool is None:
-                    if concurrent_draft:
+                    if draft_prefill_graph:
                         self._pool = get_or_create_spec_pdmux_draft_graph_memory_pool(
                             self._device_module
                         )
@@ -200,7 +198,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     language_model.model,
                     compile_config=self._compile_config,
                     graph_pool=self._pool,
-                    isolate_code_cache=concurrent_draft,
+                    isolate_code_cache=draft_prefill_graph,
                 )
 
                 with enable_torch_compile_warmup():
