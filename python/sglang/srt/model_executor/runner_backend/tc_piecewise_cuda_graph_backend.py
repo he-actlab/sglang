@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 import tqdm
 
+from sglang.srt.environ import envs
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.compile_phase import (
@@ -47,7 +48,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
+    get_global_graph_memory_pool,
     get_or_create_global_graph_memory_pool,
+    get_or_create_spec_pdmux_draft_graph_memory_pool,
 )
 from sglang.srt.utils import is_hip
 
@@ -161,9 +164,31 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
                 if self._pool is None:
-                    self._pool = get_or_create_global_graph_memory_pool(
-                        self._device_module
+                    mr = cuda_graph_runner.model_runner
+                    concurrent_draft = (
+                        getattr(mr, "is_draft_worker", False)
+                        and mr.server_args.enable_spec_pdmux
+                        and mr.server_args.spec_pdmux_draft_prefill_graph
+                        and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
                     )
+                    if concurrent_draft:
+                        self._pool = get_or_create_spec_pdmux_draft_graph_memory_pool(
+                            self._device_module
+                        )
+                        if self._pool is get_global_graph_memory_pool():
+                            raise RuntimeError(
+                                "spec-pdmux draft tc_piecewise prefill graph selected "
+                                "the global target graph pool; concurrent replay would "
+                                "alias graph intermediates"
+                            )
+                        logger.info(
+                            "[spec-pdmux] draft tc_piecewise prefill captured in "
+                            "the dedicated draft graph memory pool"
+                        )
+                    else:
+                        self._pool = get_or_create_global_graph_memory_pool(
+                            self._device_module
+                        )
                 set_graph_pool_id(self._pool)
 
                 self.install_compile(

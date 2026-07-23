@@ -796,6 +796,7 @@ def build_prefill_registry(
     enable_mamba_track: bool = False,
     register_input_embeds: bool = True,
     share_pool: bool = True,
+    pool_namespace: str = "",
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
@@ -825,6 +826,7 @@ def build_prefill_registry(
         max_bs=max_bs,
         max_num_tokens=max_num_token,
         share_pool=share_pool,
+        pool_namespace=pool_namespace,
     )
 
     def _tokens(_bs: int, mt: int) -> Tuple[int, ...]:

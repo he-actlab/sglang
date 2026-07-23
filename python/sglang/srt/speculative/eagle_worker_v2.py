@@ -452,7 +452,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             speculative_moe_a2a_backend_context(),
         ):
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
-            if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+            if (
+                check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+                or self.server_args.spec_pdmux_draft_prefill_graph
+            ):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
             self._capture_cuda_graphs()
 
@@ -1430,7 +1433,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
         with canary_ctx:
-            logits_output = self.draft_runner.forward(forward_batch).logits_output
+            model_output = self.draft_runner.forward(forward_batch)
+            if self.server_args.spec_pdmux_draft_prefill_graph:
+                logger.info(
+                    "[spec-pdmux draft-prefill-graph] status=%s raw_tokens=%d "
+                    "batch_size=%d hidden_mode=%s",
+                    "hit" if model_output.can_run_graph else "fallback",
+                    int(forward_batch.input_ids.shape[0]),
+                    batch.batch_size(),
+                    capture_hidden_mode.name,
+                )
+            logits_output = model_output.logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 

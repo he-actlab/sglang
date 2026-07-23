@@ -2417,6 +2417,10 @@ class ServerArgs:
         bool,
         "Co-located speculative decoding on green-context streams (M1): run the forward path on the LARGE SM partition of a green-context (large, small) stream pair. Requires a speculative algorithm, tp_size=1, and CUDA; incompatible with --enable-pdmux.",
     ] = False
+    spec_pdmux_draft_prefill_graph: A[
+        bool,
+        "TODO-37: piecewise-graph deferred draft prompt ingestion on SMALL. Default off; initial support is TP=1 STANDALONE, S=2, and tc_piecewise prefill.",
+    ] = False
     spec_pdmux_sm_split: A[
         Optional[str],
         "SM split for --enable-spec-pdmux as 'LARGE,SMALL' (e.g. '92,16'). Default: SMALL=16 rounded up to the arch granularity, LARGE=the rest (92,16 on a 108-SM A100).",
@@ -7269,6 +7273,32 @@ class ServerArgs:
                             "(per-step draft_probs of shape (bs, steps, vocab) "
                             "are not all-gathered)."
                         )
+
+        if self.spec_pdmux_draft_prefill_graph:
+            if not self.enable_spec_pdmux:
+                raise ValueError(
+                    "--spec-pdmux-draft-prefill-graph requires --enable-spec-pdmux."
+                )
+            if self.tp_size != 1:
+                raise ValueError(
+                    "--spec-pdmux-draft-prefill-graph initially supports tp_size=1 only; "
+                    "TP>1 deferred prefill remains disabled by BUG-1."
+                )
+            if self.speculative_algorithm.upper() != "STANDALONE":
+                raise ValueError(
+                    "--spec-pdmux-draft-prefill-graph initially supports STANDALONE only "
+                    "(EAGLE/EAGLE3 require a gated LAST-hidden-state capture)."
+                )
+            if self.spec_pdmux_slots != 2:
+                raise ValueError(
+                    "--spec-pdmux-draft-prefill-graph initially supports "
+                    "--spec-pdmux-slots 2 only."
+                )
+            if self.cuda_graph_config.prefill.backend != Backend.TC_PIECEWISE:
+                raise ValueError(
+                    "--spec-pdmux-draft-prefill-graph requires the tc_piecewise "
+                    "prefill CUDA-graph backend."
+                )
 
         # Check paced admission (optimization B4) on the STOCK admission path.
         # Explicit raises, never bare asserts (same rationale as spec-pdmux above).

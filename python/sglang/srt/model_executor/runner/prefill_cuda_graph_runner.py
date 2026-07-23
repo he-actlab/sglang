@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
+from sglang.srt.environ import envs
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
@@ -198,6 +199,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 else CaptureHiddenMode.FULL
             )
 
+        # Concurrent target/draft compilation must not alias the global
+        # target graph pool or its process-wide input-buffer namespace.
+        self.pool_namespace = ""
+        if (
+            model_runner.is_draft_worker
+            and model_runner.server_args.enable_spec_pdmux
+            and model_runner.server_args.spec_pdmux_draft_prefill_graph
+            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+        ):
+            self.pool_namespace = "spec-pdmux-draft"
+
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
         # --- buffers ---------------------------------------------------
@@ -211,7 +223,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
         )
-        self.buffers.share_buffers()
+        self.buffers.share_buffers(namespace=self.pool_namespace)
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
         # storage; same physical tensors, stable data_ptr for capture vs
         # replay. Replaces populate_from_forward_batch on capture/replay paths.
@@ -225,6 +237,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             source=self.buffers,
+            pool_namespace=self.pool_namespace,
+        )
+
+        logger.info(
+            "[prefill-cuda-graph] role=%s backend=%s namespace=%r "
+            "capture_tokens=%s hidden_mode=%s",
+            "draft" if model_runner.is_draft_worker else "target",
+            _prefill_backend_name,
+            self.pool_namespace,
+            self.capture_num_tokens,
+            self.capture_hidden_mode,
         )
 
         self.attention_layers = self.model_runner.attention_layers
