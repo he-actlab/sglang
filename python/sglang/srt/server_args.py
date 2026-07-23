@@ -2419,7 +2419,11 @@ class ServerArgs:
     ] = False
     spec_pdmux_draft_prefill_graph: A[
         bool,
-        "TODO-37: piecewise-graph deferred draft prompt ingestion on SMALL. Default off; initial support is TP=1 STANDALONE, S=2, and tc_piecewise prefill.",
+        "TODO-37: force piecewise-graph deferred draft prompt ingestion on SMALL. Supported spec-pdmux configurations enable it by default; initial support is TP=1 STANDALONE, S=2, and tc_piecewise prefill.",
+    ] = False
+    disable_spec_pdmux_draft_prefill_graph: A[
+        bool,
+        "Disable the default-on draft prompt-prefill graph for rollback, diagnosis, or A/B measurement.",
     ] = False
     spec_pdmux_sm_split: A[
         Optional[str],
@@ -7273,6 +7277,21 @@ class ServerArgs:
                             "(per-step draft_probs of shape (bs, steps, vocab) "
                             "are not all-gathered)."
                         )
+
+        draft_prefill_graph_supported = (
+            self.enable_spec_pdmux
+            and self.tp_size == 1
+            and self.speculative_algorithm.upper() == "STANDALONE"
+            and self.spec_pdmux_slots == 2
+            and self.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE
+        )
+        if (
+            draft_prefill_graph_supported
+            and not self.disable_spec_pdmux_draft_prefill_graph
+        ):
+            self.spec_pdmux_draft_prefill_graph = True
+        elif self.disable_spec_pdmux_draft_prefill_graph:
+            self.spec_pdmux_draft_prefill_graph = False
 
         if self.spec_pdmux_draft_prefill_graph:
             if not self.enable_spec_pdmux:
