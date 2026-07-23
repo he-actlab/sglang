@@ -355,6 +355,12 @@ def spec_pdmux_sm_hint_capture(model_runner):
     hint = 0
     if getattr(model_runner.server_args, "enable_spec_pdmux", False):
         hint = envs.SGLANG_SPEC_PDMUX_SM_HINT.get()
+    if hint not in (0, 1, 2):
+        raise ValueError(
+            f"SGLANG_SPEC_PDMUX_SM_HINT must be 0, 1, or 2, got {hint!r} "
+            "(0 = off, 1 = hint target captures to LARGE, 2 = also hint draft "
+            "captures to SMALL)"
+        )
     width = None
     if hint and SPEC_SM_SPLIT is not None:
         large, small = SPEC_SM_SPLIT
