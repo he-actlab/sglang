@@ -22,6 +22,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.multiplex import pdmux_context
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -1102,6 +1103,10 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # Phased-bandwidth v2 (TODO-43): no-op unless a phase-align capture
+        # role is armed and this stream is capturing (target verify records a
+        # credit; draft extend waits one). See multiplex/phase_align.py.
+        pdmux_context.phase_align_on_layer(layer.layer_id)
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -1236,6 +1241,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # Phased-bandwidth v2 (TODO-43): draft decode waits its credit here;
+        # no-op unless a phase-align capture role is armed on this stream.
+        pdmux_context.phase_align_on_layer(layer.layer_id)
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]

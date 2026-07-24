@@ -1,38 +1,46 @@
 """Phased-bandwidth v2 (TODO-43): schedule-aligned drafter gating.
 
-Mechanism: the target verify graph records one CREDIT per decoder layer at its
-attention entry — the measured low-DRAM window (A100 @ c=64: attention windows
-run ~31-39% DRAM vs GEMM windows ~52-66%; window analysis 2026-07-23). The
-draft graph is segmented and each segment WAITS one credit before launching,
-so the drafter's weight streams land inside verify's bandwidth valleys instead
-of contending with its saturated GEMM windows.
+Mechanism: the target verify capture records one CREDIT per decoder layer at
+its attention entry — the measured low-DRAM window (A100 @ c=64: attention
+windows run ~31-39% DRAM vs GEMM windows ~52-66%; window analysis 2026-07-23).
+Draft-side captures WAIT one credit per decoder layer, per the evenly-spread
+layer->credit policy below, so the drafter's weight streams land inside
+verify's bandwidth valleys instead of contending with its saturated GEMM
+windows.
 
 Timing-only by construction: no kernel computes different values or in a
 different order, so strict c=1 parity must remain byte-identical with the
 feature ON (stronger gate than SM_HINT can offer — assert it in CI).
 
-Credit policy is pure python (unit-tested); the CUDA seam uses external-
-semantics events so that record/wait nodes captured into two DIFFERENT graphs
-still synchronize against the same event object at replay. Feasibility of that
-seam on green-context streams is established by
-experiments/greenctx_event_align_probe.py before integration is trusted.
+The events use external semantics: record/wait nodes captured into two
+DIFFERENT graphs still synchronize against the same event object at replay
+(feasibility: experiments/greenctx_event_align_probe.py, PASSED 2026-07-23 on
+green-context streams, 4.2 us/credit). Everything here is static per layer_id
+— capture bakes the node structure once; cursors would be meaningless at
+replay.
 
-Known v0 limitation (documented, accepted): the credit ring is reused across
-verify windows without a generation tag. A drafter segment that arrives a full
-window late waits on an already-signaled event and passes through immediately
-— alignment degrades for that window, correctness is unaffected.
+Known v0 limitations (documented, accepted):
+- one credit ring, no generation tag: draft replays after the first in a
+  window wait already-signaled events and pass through — alignment covers the
+  first draft pass fully and later passes opportunistically; correctness is
+  never affected.
+- waits on never-recorded (pre-initialized) events complete immediately, so a
+  draft window that outruns verify degrades to unaligned, never deadlocks.
 """
 
-from typing import List
+import logging
+from typing import List, Optional
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_RING = 128
 
 
 def credit_for_segment(segment_idx: int, num_credits: int, num_segments: int) -> int:
     """Map draft segment i -> verify credit slot, spread evenly.
 
     Monotonic non-decreasing in i; uses every credit slot when
-    num_segments >= num_credits; never exceeds num_credits - 1 (late segments
-    pile on the last credit rather than deadlocking on credits that will not
-    be recorded again this window).
+    num_segments >= num_credits; never exceeds num_credits - 1.
     """
     if num_credits <= 0:
         raise ValueError(f"num_credits must be positive, got {num_credits}")
@@ -54,63 +62,49 @@ def alignment_plan(num_credits: int, num_segments: int) -> List[int]:
 
 
 class PhaseAlignState:
-    """Runtime credit ring shared by the target and draft capture paths.
+    """Process-wide credit ring shared by target and draft capture paths.
 
-    Created once per process at spec stream-pair initialization when
-    SGLANG_SPEC_PDMUX_PHASE_ALIGN=1. `record_credit` is called inside the
-    TARGET verify capture at each decoder layer's attention entry;
-    `wait_credit` inside the DRAFT capture at each segment boundary. Both use
-    external-semantics events so cross-graph synchronization survives capture.
+    Events are pre-created AND pre-recorded once outside any capture (lazy
+    CUDA event initialization inside stream capture is a hazard, and a
+    pre-recorded event is 'complete', so early draft waits pass instead of
+    deadlocking).
     """
 
-    def __init__(self, num_credits: int, num_segments: int, device=None):
+    def __init__(self, ring_size: int = DEFAULT_RING):
         import torch
 
-        self.num_credits = num_credits
-        self.num_segments = num_segments
-        self.plan = alignment_plan(num_credits, num_segments)
-        self._record_cursor = 0
-        self._wait_cursor = 0
+        self.ring = ring_size
+        self.num_credits: Optional[int] = None   # target decoder layer count
+        self.draft_plan: Optional[List[int]] = None
         self.events = [
-            _make_external_event(torch) for _ in range(num_credits)
+            torch.cuda.Event(external=True) for _ in range(ring_size)
         ]
+        s = torch.cuda.current_stream()
+        for ev in self.events:
+            ev.record(s)
+        s.synchronize()
 
-    def record_credit(self, stream) -> None:
-        ev = self.events[self._record_cursor % self.num_credits]
-        self._record_cursor += 1
-        ev.record(stream)
+    def set_target_layers(self, n: int) -> None:
+        if self.num_credits is None:
+            self.num_credits = n
+            if self.draft_plan is not None:
+                # draft registered first with a guessed credit count; rebuild
+                self.draft_plan = alignment_plan(n, len(self.draft_plan))
 
-    def wait_credit(self, stream) -> None:
-        seg = self._wait_cursor % self.num_segments
-        self._wait_cursor += 1
-        ev = self.events[self.plan[seg]]
-        stream.wait_event(ev)
+    def set_draft_layers(self, n: int) -> None:
+        credits = self.num_credits if self.num_credits is not None else n
+        if self.num_credits is None:
+            logger.warning(
+                "[spec-pdmux] phase-align: draft capture before target — "
+                "using %d credits provisionally", n
+            )
+        self.draft_plan = alignment_plan(credits, n)
 
+    def record_credit(self, layer_id: int, stream) -> None:
+        self.events[layer_id % self.ring].record(stream)
 
-def _make_external_event(torch):
-    """External-semantics CUDA event, or a loud failure naming the probe.
-
-    torch >= 2.7 exposes Event(external=True) for exactly this graph-capture
-    use; on older builds fall back to cuda-python bindings. Never silently
-    degrade to a normal event: a normal event captured into a graph becomes a
-    graph-internal node and cross-graph alignment silently does nothing.
-    """
-    try:
-        return torch.cuda.Event(external=True)
-    except TypeError:
-        pass
-    try:
-        from cuda import cudart  # noqa: F401
-
-        raise NotImplementedError(
-            "torch.cuda.Event(external=True) unavailable; the cuda-python "
-            "fallback is not wired yet — run "
-            "experiments/greenctx_event_align_probe.py and extend "
-            "_make_external_event with the working path it reports."
-        )
-    except ImportError:
-        raise NotImplementedError(
-            "No external-event path available on this build; "
-            "SGLANG_SPEC_PDMUX_PHASE_ALIGN requires one. See "
-            "experiments/greenctx_event_align_probe.py."
-        )
+    def wait_credit(self, layer_id: int, stream) -> None:
+        if self.draft_plan is None:
+            return
+        idx = self.draft_plan[layer_id % len(self.draft_plan)]
+        stream.wait_event(self.events[idx % self.ring])

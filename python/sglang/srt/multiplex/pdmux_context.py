@@ -379,3 +379,80 @@ def spec_pdmux_sm_hint_capture(model_runner):
         yield
     finally:
         _cublas_sm_count_target_set(previous if previous > 0 else 0)
+
+
+# ---------------------------------------------------------------------------
+# Phased-bandwidth v2 (TODO-43): schedule-aligned drafter gating.
+# ---------------------------------------------------------------------------
+PHASE_ALIGN_STATE = None
+_PHASE_ALIGN_ROLE = None  # None | "target" | "draft" — set only around capture
+
+
+@contextmanager
+def spec_pdmux_phase_align_capture(model_runner):
+    """Arm the phase-align capture role around a graph-capture block.
+
+    No-op unless --enable-spec-pdmux and SGLANG_SPEC_PDMUX_PHASE_ALIGN=1 and
+    the green-ctx split exists. With the env at 0 no event node is captured
+    anywhere — the build is a byte-identical no-op (gate 2 of the work plan).
+    """
+    global PHASE_ALIGN_STATE, _PHASE_ALIGN_ROLE
+    from sglang.srt.environ import envs
+
+    enabled = (
+        getattr(model_runner.server_args, "enable_spec_pdmux", False)
+        and envs.SGLANG_SPEC_PDMUX_PHASE_ALIGN.get() == 1
+        and SPEC_SM_SPLIT is not None
+    )
+    if not enabled:
+        yield
+        return
+    from sglang.srt.multiplex.phase_align import PhaseAlignState
+
+    if PHASE_ALIGN_STATE is None:
+        PHASE_ALIGN_STATE = PhaseAlignState()
+    n_layers = int(
+        getattr(
+            model_runner.model_config,
+            "num_hidden_layers",
+            getattr(
+                getattr(model_runner.model_config, "hf_config", None),
+                "num_hidden_layers",
+                0,
+            ),
+        )
+        or 0
+    )
+    role = "draft" if getattr(model_runner, "is_draft_worker", False) else "target"
+    if n_layers > 0:
+        if role == "target":
+            PHASE_ALIGN_STATE.set_target_layers(n_layers)
+        else:
+            PHASE_ALIGN_STATE.set_draft_layers(n_layers)
+    logger.info(
+        "[spec-pdmux] phase-align capture armed: role=%s layers=%d credits=%s",
+        role, n_layers, PHASE_ALIGN_STATE.num_credits,
+    )
+    _PHASE_ALIGN_ROLE = role
+    try:
+        yield
+    finally:
+        _PHASE_ALIGN_ROLE = None
+
+
+def phase_align_on_layer(layer_id: int) -> None:
+    """Per-layer attention-entry hook (called from the attention backend).
+
+    Fast no-op unless a phase-align capture role is armed AND the current
+    stream is actively capturing: eager/stock forwards, warmup passes, and
+    align-disabled builds never reach the event calls.
+    """
+    if _PHASE_ALIGN_ROLE is None:
+        return
+    if not torch.cuda.is_current_stream_capturing():
+        return
+    stream = torch.cuda.current_stream()
+    if _PHASE_ALIGN_ROLE == "target":
+        PHASE_ALIGN_STATE.record_credit(layer_id, stream)
+    else:
+        PHASE_ALIGN_STATE.wait_credit(layer_id, stream)
