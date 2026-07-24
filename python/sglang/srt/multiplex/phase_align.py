@@ -74,6 +74,14 @@ def alignment_plan(
     ]
 
 
+def resolve_span(num_credits: int, requested: int) -> int:
+    """0 = auto: about a third of the credit window, so the K-1 decode passes
+    plus extend fit inside one verify window; clamped to [1, num_credits]."""
+    if requested <= 0:
+        return max(1, num_credits // 3)
+    return max(1, min(requested, num_credits))
+
+
 class PhaseAlignState:
     """Process-wide credit ring shared by target and draft capture paths.
 
@@ -88,6 +96,9 @@ class PhaseAlignState:
 
         self.ring = ring_size
         self.num_credits: Optional[int] = None   # target decoder layer count
+        self.draft_layers: Optional[int] = None
+        self.draft_span_requested: int = 0
+        self.draft_span: Optional[int] = None    # resolved, for logging
         self.draft_plan: Optional[List[int]] = None
         self.events = [
             torch.cuda.Event(external=True) for _ in range(ring_size)
@@ -100,23 +111,29 @@ class PhaseAlignState:
     def set_target_layers(self, n: int) -> None:
         if self.num_credits is None:
             self.num_credits = n
-            if self.draft_plan is not None:
-                # draft registered first with a guessed credit count; rebuild
-                self.draft_plan = alignment_plan(n, len(self.draft_plan))
+            if self.draft_layers is not None:
+                # Draft registered first with a guessed credit count; rebuild
+                # with the true count AND the stored span request — dropping
+                # the span here silently reverts to the measured-bad
+                # full-window policy (review finding 2026-07-24).
+                self._rebuild_draft_plan()
 
     def set_draft_layers(self, n: int, span: int = 0) -> None:
-        credits = self.num_credits if self.num_credits is not None else n
         if self.num_credits is None:
             logger.warning(
                 "[spec-pdmux] phase-align: draft capture before target — "
                 "using %d credits provisionally", n
             )
-        if span <= 0:
-            # auto: one draft pass spans ~1/3 of the credit window so the
-            # K-1 decode passes + extend fit inside one verify window.
-            span = max(1, credits // 3)
-        self.draft_span = span
-        self.draft_plan = alignment_plan(credits, n, span)
+        self.draft_layers = n
+        self.draft_span_requested = span
+        self._rebuild_draft_plan()
+
+    def _rebuild_draft_plan(self) -> None:
+        credits = (
+            self.num_credits if self.num_credits is not None else self.draft_layers
+        )
+        self.draft_span = resolve_span(credits, self.draft_span_requested)
+        self.draft_plan = alignment_plan(credits, self.draft_layers, self.draft_span)
 
     def record_credit(self, layer_id: int, stream) -> None:
         self.events[layer_id % self.ring].record(stream)
