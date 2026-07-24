@@ -742,6 +742,11 @@ class Envs:
     # 1 = align the draft-worker decode/extend captures to the target verify
     # capture's per-layer credits. See multiplex/phase_align.py.
     SGLANG_SPEC_PDMUX_PHASE_ALIGN = EnvInt(0)
+    # How many LEADING verify-layer credits one draft pass spreads across.
+    # 0 = auto (about a third of the target layer count) so the K-1 decode
+    # passes plus extend fit inside one verify window; spreading across ALL
+    # credits stretches the chain past verify (measured, run 20260724T0028).
+    SGLANG_SPEC_PDMUX_PHASE_ALIGN_SPAN = EnvInt(0)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

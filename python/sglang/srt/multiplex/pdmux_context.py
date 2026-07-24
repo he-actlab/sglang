@@ -428,10 +428,13 @@ def spec_pdmux_phase_align_capture(model_runner):
         if role == "target":
             PHASE_ALIGN_STATE.set_target_layers(n_layers)
         else:
-            PHASE_ALIGN_STATE.set_draft_layers(n_layers)
+            PHASE_ALIGN_STATE.set_draft_layers(
+                n_layers, envs.SGLANG_SPEC_PDMUX_PHASE_ALIGN_SPAN.get()
+            )
     logger.info(
-        "[spec-pdmux] phase-align capture armed: role=%s layers=%d credits=%s",
+        "[spec-pdmux] phase-align capture armed: role=%s layers=%d credits=%s span=%s",
         role, n_layers, PHASE_ALIGN_STATE.num_credits,
+        getattr(PHASE_ALIGN_STATE, "draft_span", None),
     )
     _PHASE_ALIGN_ROLE = role
     try:

@@ -53,10 +53,23 @@ def credit_for_segment(segment_idx: int, num_credits: int, num_segments: int) ->
     return min(num_credits - 1, (segment_idx * num_credits) // num_segments)
 
 
-def alignment_plan(num_credits: int, num_segments: int) -> List[int]:
-    """The full segment->credit map for one verify window."""
+def alignment_plan(
+    num_credits: int, num_segments: int, span: Optional[int] = None
+) -> List[int]:
+    """The segment->credit map for one verify window.
+
+    `span` limits how many LEADING credits the segments spread across. A draft
+    graph replays 2-3x per verify window, so one pass must occupy only a
+    fraction of the credit window or the chain stretches past verify and
+    becomes the critical path (measured: c=64 draft p50 10.57->18.47 ms with
+    span=all, run 20260724T0028). Default span=None spreads over all credits
+    (the policy-pure form the unit tests pin); callers pass an explicit span.
+    """
+    if span is None:
+        span = num_credits
+    span = max(1, min(span, num_credits))
     return [
-        credit_for_segment(i, num_credits, num_segments)
+        credit_for_segment(i, span, num_segments)
         for i in range(num_segments)
     ]
 
@@ -91,14 +104,19 @@ class PhaseAlignState:
                 # draft registered first with a guessed credit count; rebuild
                 self.draft_plan = alignment_plan(n, len(self.draft_plan))
 
-    def set_draft_layers(self, n: int) -> None:
+    def set_draft_layers(self, n: int, span: int = 0) -> None:
         credits = self.num_credits if self.num_credits is not None else n
         if self.num_credits is None:
             logger.warning(
                 "[spec-pdmux] phase-align: draft capture before target — "
                 "using %d credits provisionally", n
             )
-        self.draft_plan = alignment_plan(credits, n)
+        if span <= 0:
+            # auto: one draft pass spans ~1/3 of the credit window so the
+            # K-1 decode passes + extend fit inside one verify window.
+            span = max(1, credits // 3)
+        self.draft_span = span
+        self.draft_plan = alignment_plan(credits, n, span)
 
     def record_credit(self, layer_id: int, stream) -> None:
         self.events[layer_id % self.ring].record(stream)
