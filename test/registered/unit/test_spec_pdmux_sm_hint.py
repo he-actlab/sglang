@@ -149,6 +149,51 @@ class SpecPdmuxAllocationTests(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "cannot re-initialize"):
             pdmux_context.initialize_spec_stream_pair(0, 150, 38)
 
+    def _resolve(self, split, env):
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(spatial, "get_sm_available", return_value=188),
+            patch.object(pdmux_context.torch.cuda, "current_device", return_value=0),
+            patch.object(
+                pdmux_context.torch.cuda,
+                "get_device_capability",
+                return_value=(12, 0),
+            ),
+        ):
+            return pdmux_context.resolve_spec_sm_split(0, split)
+
+    def test_inverted_split_rejected_by_default(self):
+        with self.assertRaisesRegex(ValueError, "LARGE > SMALL"):
+            self._resolve(
+                "88,100",
+                {
+                    "SGLANG_SPEC_PDMUX_ALLOW_INVERTED_SPLIT": "0",
+                    "SGLANG_SPEC_PDMUX_SERIALIZE": "1",
+                },
+            )
+
+    def test_inverted_split_requires_serialization(self):
+        with self.assertRaisesRegex(ValueError, "requires.*SERIALIZE"):
+            self._resolve(
+                "88,100",
+                {
+                    "SGLANG_SPEC_PDMUX_ALLOW_INVERTED_SPLIT": "1",
+                    "SGLANG_SPEC_PDMUX_SERIALIZE": "0",
+                },
+            )
+
+    def test_inverted_split_allowed_for_serialized_diagnostic(self):
+        self.assertEqual(
+            self._resolve(
+                "88,100",
+                {
+                    "SGLANG_SPEC_PDMUX_ALLOW_INVERTED_SPLIT": "1",
+                    "SGLANG_SPEC_PDMUX_SERIALIZE": "1",
+                },
+            ),
+            (88, 100),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

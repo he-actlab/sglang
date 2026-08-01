@@ -705,6 +705,10 @@ class Envs:
     # joins (and in-tick draft_extend + forward-stream FutureMap gathers)
     # under --enable-spec-pdmux, for bisection of concurrency bugs.
     SGLANG_SPEC_PDMUX_SERIALIZE = EnvBool(False)
+    # Diagnostic-only: permit target,draft green-context splits with target <=
+    # draft while strict serialization is enabled. Production scheduling keeps
+    # the LARGE > SMALL invariant.
+    SGLANG_SPEC_PDMUX_ALLOW_INVERTED_SPLIT = EnvBool(False)
     # M3 step 2 bring-up restriction: the M2.7 deferred prefill draft-extend
     # re-plans shared flashinfer wrappers between stash and flush; at TP>1
     # concurrency this was caught mismatching plan vs batch (q.shape[0] 143

@@ -178,6 +178,7 @@ def resolve_spec_sm_split(
     small = 16 rounded up to the arch multiple (>= arch min), large = rest
     rounded down to the arch multiple (e.g. 92,16 on a 108-SM A100)."""
     from sgl_kernel import spatial
+    from sglang.srt.environ import envs
 
     total = spatial.get_sm_available(gpu_id)
     min_per_part, multiple = get_arch_constraints(
@@ -204,7 +205,13 @@ def resolve_spec_sm_split(
         raise ValueError(
             f"spec-pdmux split {large}+{small} exceeds {total} available SMs"
         )
-    if large <= small:
+    allow_inverted = envs.SGLANG_SPEC_PDMUX_ALLOW_INVERTED_SPLIT.get()
+    if allow_inverted and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get():
+        raise ValueError(
+            "SGLANG_SPEC_PDMUX_ALLOW_INVERTED_SPLIT=1 is diagnostic-only and "
+            "requires SGLANG_SPEC_PDMUX_SERIALIZE=1"
+        )
+    if large <= small and not allow_inverted:
         raise ValueError(
             f"spec-pdmux split must have LARGE > SMALL, got {large},{small}"
         )
