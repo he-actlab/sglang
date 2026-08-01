@@ -1,4 +1,4 @@
-"""Correctness test for the exact-shape single-stage drafter TMA GEMM."""
+"""Correctness tests for the exact-shape drafter TMA GEMM variants."""
 
 import sys
 
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from sglang.jit_kernel.cutedsl_drafter_tma_gemm import (
     DRAFTER_TMA_GEMM_MKN,
     drafter_tma_single_stage_gate_up,
+    drafter_tma_three_stage_gate_up,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -17,7 +18,12 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("seed", [17, 20260801])
-def test_drafter_tma_single_stage_gate_up_matches_production_linear(seed):
+@pytest.mark.parametrize(
+    "implementation",
+    [drafter_tma_single_stage_gate_up, drafter_tma_three_stage_gate_up],
+    ids=["one-stage", "three-stage"],
+)
+def test_drafter_tma_gate_up_matches_production_linear(seed, implementation):
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("SM120 required")
 
@@ -27,8 +33,8 @@ def test_drafter_tma_single_stage_gate_up_matches_production_linear(seed):
     weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
     reference = F.linear(activation, weight)
 
-    output = drafter_tma_single_stage_gate_up(activation, weight)
-    repeated = drafter_tma_single_stage_gate_up(activation, weight)
+    output = implementation(activation, weight)
+    repeated = implementation(activation, weight)
     torch.cuda.synchronize()
 
     assert torch.isfinite(output).all()

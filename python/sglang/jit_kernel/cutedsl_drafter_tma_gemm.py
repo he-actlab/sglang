@@ -27,13 +27,14 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Exact-shape, single-stage TMA/Tensor-Core drafter GEMM for SM120.
+"""Exact-shape TMA/Tensor-Core drafter GEMM construction kernels for SM120.
 
 This is a construction gate, not the production dispatch.  It implements the
 Qwen3 drafter's fused gate-up projection at M=32, K=1024, N=6144 with BF16
-inputs, FP32 accumulation, and BF16 output.  A and W are loaded by TMA into one
-shared-memory stage; four consumer warps issue ``mma.sync`` operations.  There
-is deliberately no multi-stage overlap or persistent tile scheduler.
+inputs, FP32 accumulation, and BF16 output.  A and W are loaded by TMA into
+shared-memory stages; four consumer warps issue ``mma.sync`` operations.  Gate
+1B retains a one-stage diagnostic and Gate 1C adds a three-stage circular
+producer/consumer pipeline.  Neither variant uses a persistent tile scheduler.
 
 The SM120 TMA/MMA layouts, pipeline protocol, and epilogue are reduced from
 NVIDIA CUTLASS 4.5.2's
@@ -57,17 +58,23 @@ from cutlass.cute.runtime import from_dlpack
 
 DRAFTER_TMA_GEMM_MKN = (32, 1024, 6144)
 _TILE_MNK = (32, 64, 64)
-_AB_STAGES = 1
+DRAFTER_TMA_GEMM_SINGLE_STAGE = 1
+DRAFTER_TMA_GEMM_PIPELINED_STAGES = 3
 _EPILOGUE_STAGES = 8
 _ATOM_LAYOUT = (2, 2, 1)
 _MMA_WARPS = 4
 _THREADS_PER_CTA = (_MMA_WARPS + 1) * 32
 
 
-class _DrafterTmaSingleStageGemm:
-    def __init__(self):
+class _DrafterTmaGemm:
+    def __init__(self, ab_stages: int):
+        if ab_stages not in (
+            DRAFTER_TMA_GEMM_SINGLE_STAGE,
+            DRAFTER_TMA_GEMM_PIPELINED_STAGES,
+        ):
+            raise ValueError(f"unsupported A/B stage count: {ab_stages}")
         self.tile_shape_mnk = _TILE_MNK
-        self.ab_stages = _AB_STAGES
+        self.ab_stages = ab_stages
         self.epilogue_stages = _EPILOGUE_STAGES
         self.acc_dtype = cutlass.Float32
         self.buffer_align_bytes = 1024
@@ -92,7 +99,7 @@ class _DrafterTmaSingleStageGemm:
             or self.weight_dtype != cutlass.BFloat16
             or self.output_dtype != cutlass.BFloat16
         ):
-            raise TypeError("Gate 1B requires BF16 A, weight, and output")
+            raise TypeError("drafter TMA GEMM requires BF16 A, weight, and output")
 
         self.a_layout = utils.LayoutEnum.from_tensor(a)
         self.weight_layout = utils.LayoutEnum.from_tensor(weight)
@@ -493,15 +500,16 @@ class _DrafterTmaSingleStageGemm:
             mainloop.producer_tail(producer_state)
 
 
-_compiled: dict[int, object] = {}
+_compiled: dict[tuple[int, int], object] = {}
 
 
 def _as_cute_3d(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor.unsqueeze(-1), assumed_align=16)
 
 
-def _compiled_kernel(device_index: int):
-    if device_index not in _compiled:
+def _compiled_kernel(device_index: int, ab_stages: int):
+    cache_key = (device_index, ab_stages)
+    if cache_key not in _compiled:
         m, k, n = DRAFTER_TMA_GEMM_MKN
         with torch.cuda.device(device_index):
             activation = torch.empty(
@@ -516,22 +524,20 @@ def _compiled_kernel(device_index: int):
             stream = cuda.CUstream(
                 torch.cuda.current_stream(device_index).cuda_stream
             )
-            _compiled[device_index] = cute.compile(
-                _DrafterTmaSingleStageGemm(),
+            _compiled[cache_key] = cute.compile(
+                _DrafterTmaGemm(ab_stages),
                 _as_cute_3d(activation),
                 _as_cute_3d(weight),
                 _as_cute_3d(output),
                 stream,
             )
-    return _compiled[device_index]
+    return _compiled[cache_key]
 
 
-def drafter_tma_single_stage_gate_up(
+def _validate_inputs(
     activation: torch.Tensor,
     weight: torch.Tensor,
-) -> torch.Tensor:
-    """Run the exact Gate-1B fused gate-up GEMM on the current CUDA stream."""
-
+) -> int:
     m, k, n = DRAFTER_TMA_GEMM_MKN
     if not activation.is_cuda or not weight.is_cuda:
         raise ValueError("activation and weight must be CUDA tensors")
@@ -550,16 +556,48 @@ def drafter_tma_single_stage_gate_up(
     if device_index is None:
         device_index = torch.cuda.current_device()
     if torch.cuda.get_device_capability(device_index) != (12, 0):
-        raise RuntimeError("drafter_tma_single_stage_gate_up requires SM120")
+        raise RuntimeError("drafter TMA GEMM requires SM120")
+    return device_index
+
+
+def _drafter_tma_gate_up(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    ab_stages: int,
+) -> torch.Tensor:
+    device_index = _validate_inputs(activation, weight)
+    m, _, n = DRAFTER_TMA_GEMM_MKN
 
     output = torch.empty(
         (m, n), dtype=torch.bfloat16, device=activation.device
     )
     stream = cuda.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
-    _compiled_kernel(device_index)(
+    _compiled_kernel(device_index, ab_stages)(
         _as_cute_3d(activation),
         _as_cute_3d(weight),
         _as_cute_3d(output),
         stream,
     )
     return output
+
+
+def drafter_tma_single_stage_gate_up(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run the exact Gate-1B fused gate-up GEMM on the current CUDA stream."""
+
+    return _drafter_tma_gate_up(
+        activation, weight, DRAFTER_TMA_GEMM_SINGLE_STAGE
+    )
+
+
+def drafter_tma_three_stage_gate_up(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run the Gate-1C three-stage fused gate-up GEMM on the current stream."""
+
+    return _drafter_tma_gate_up(
+        activation, weight, DRAFTER_TMA_GEMM_PIPELINED_STAGES
+    )
