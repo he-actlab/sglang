@@ -19,7 +19,11 @@ CURRENT_STREAM_GROUP = None
 # whole forward path (verify + draft) on the LARGE stream; step 3 moves the
 # drafter to the small stream.
 SPEC_STREAM_PAIR: Optional[Tuple[torch.cuda.Stream, torch.cuda.Stream]] = None
+# The requested split is the idempotence/configuration key. CUDA's allocator
+# may realize a different split; partition-aware library hints must use the
+# allocated counts instead.
 SPEC_SM_SPLIT: Optional[Tuple[int, int]] = None
+SPEC_SM_ALLOCATED_SPLIT: Optional[Tuple[int, int]] = None
 # Design-FullChipPrefill (TODO-34): a plain full-device stream for target
 # prompt prefill. Not a green-ctx partition stream — graph SM affinity bakes
 # at capture, so target-prefill graphs captured here may use the whole chip.
@@ -213,7 +217,10 @@ def initialize_spec_stream_pair(
     """Create the process-wide (large, small) green-ctx stream pair once.
     Idempotent: repeat calls (target + draft model runners share one process)
     return the existing pair, and must ask for the same split."""
-    global SPEC_STREAM_PAIR, SPEC_SM_SPLIT, SPEC_PREFILL_STREAM
+    global SPEC_PREFILL_STREAM
+    global SPEC_SM_ALLOCATED_SPLIT
+    global SPEC_SM_SPLIT
+    global SPEC_STREAM_PAIR
     if SPEC_STREAM_PAIR is not None:
         if SPEC_SM_SPLIT != (large_sm, small_sm):
             raise ValueError(
@@ -223,18 +230,24 @@ def initialize_spec_stream_pair(
         return SPEC_STREAM_PAIR
     from sgl_kernel import spatial
 
-    SPEC_STREAM_PAIR = spatial.create_greenctx_stream_by_value(
-        large_sm, small_sm, gpu_id
+    large_stream, small_stream, allocated_large, allocated_small = (
+        spatial.create_greenctx_stream_by_value_with_sm_counts(
+            large_sm, small_sm, gpu_id
+        )
     )
+    SPEC_STREAM_PAIR = (large_stream, small_stream)
     SPEC_SM_SPLIT = (large_sm, small_sm)
+    SPEC_SM_ALLOCATED_SPLIT = (allocated_large, allocated_small)
     SPEC_PREFILL_STREAM = torch.cuda.Stream(device=gpu_id)
     logger.info(
-        "[spec-pdmux] green-ctx stream pair created on gpu %d: "
-        "large=%d SMs, small=%d SMs (total=%d)",
-        gpu_id,
+        "[spec-pdmux] green-ctx allocation requested=(%d,%d) "
+        "allocated=(%d,%d) physical=%d gpu=%d",
         large_sm,
         small_sm,
+        allocated_large,
+        allocated_small,
         spatial.get_sm_available(gpu_id),
+        gpu_id,
     )
     return SPEC_STREAM_PAIR
 
@@ -284,8 +297,13 @@ def get_current_stream_idx() -> int:
 
 
 def get_spec_sm_split() -> Optional[Tuple[int, int]]:
-    """The (large, small) SM split of the spec-pdmux pair; None before init."""
+    """The requested (large, small) SM split; None before initialization."""
     return SPEC_SM_SPLIT
+
+
+def get_spec_sm_allocated_split() -> Optional[Tuple[int, int]]:
+    """The CUDA-allocated (large, small) SM split; None before initialization."""
+    return SPEC_SM_ALLOCATED_SPLIT
 
 
 # --- Design-SMHint (TODO-15 rebuild) ----------------------------------------
@@ -306,8 +324,12 @@ def _cublas_lib():
         import ctypes
 
         last_err = None
-        for name in ("libcublas.so.13", "libcublas.so.12", "libcublas.so.11",
-                     "libcublas.so"):
+        for name in (
+            "libcublas.so.13",
+            "libcublas.so.12",
+            "libcublas.so.11",
+            "libcublas.so",
+        ):
             try:
                 _CUBLAS_LIB = ctypes.CDLL(name)
                 break
@@ -362,8 +384,8 @@ def spec_pdmux_sm_hint_capture(model_runner):
             "captures to SMALL)"
         )
     width = None
-    if hint and SPEC_SM_SPLIT is not None:
-        large, small = SPEC_SM_SPLIT
+    if hint and SPEC_SM_ALLOCATED_SPLIT is not None:
+        large, small = SPEC_SM_ALLOCATED_SPLIT
         if not getattr(model_runner, "is_draft_worker", False):
             width = large
         elif hint >= 2:

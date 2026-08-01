@@ -554,6 +554,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # drafter (step 3). One pair per process — the target and draft
             # model runners share it (initialize_spec_stream_pair is idempotent).
             from sglang.srt.multiplex.pdmux_context import (
+                get_spec_sm_allocated_split,
                 initialize_spec_stream_pair,
                 resolve_spec_sm_split,
             )
@@ -564,9 +565,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.forward_stream = initialize_spec_stream_pair(
                 self.gpu_id, large_sm, small_sm
             )[0]
+            allocated_split = get_spec_sm_allocated_split()
+            assert allocated_split is not None
             logger.info(
                 "[spec-pdmux] forward_stream -> LARGE green-ctx stream "
-                "(%d SMs; gpu=%d tp_rank=%d is_draft_worker=%s)",
+                "(%d allocated SMs; %d requested; gpu=%d tp_rank=%d "
+                "is_draft_worker=%s)",
+                allocated_split[0],
                 large_sm,
                 self.gpu_id,
                 self.tp_rank,
@@ -1397,11 +1402,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     (
                         "off"
                         if _ps._TP.ca_comm is None
-                        else (
-                            "disabled"
-                            if _ps._TP.ca_comm.disabled
-                            else "enabled"
-                        )
+                        else ("disabled" if _ps._TP.ca_comm.disabled else "enabled")
                     ),
                 )
             initialize_dp_attention(

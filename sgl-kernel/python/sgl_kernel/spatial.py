@@ -25,12 +25,33 @@ def create_greenctx_stream_by_value(
     Returns:
         tuple[ExternalStream, ExternalStream]: The two streams.
     """
+    stream_a, stream_b, _, _ = create_greenctx_stream_by_value_with_sm_counts(
+        SM_a, SM_b, device_id
+    )
+    return stream_a, stream_b
+
+
+def create_greenctx_stream_by_value_with_sm_counts(
+    SM_a: int, SM_b: int, device_id: int = None
+) -> tuple[ExternalStream, ExternalStream, int, int]:
+    """Create two green-context streams and return their allocated SM counts.
+
+    CUDA may allocate a different split from the requested minimum counts. The
+    lower-level operator has always returned those realized counts; keep them
+    visible to callers that need to size partition-aware libraries while the
+    legacy two-stream helper above remains source-compatible.
+    """
     if _spatial_import_error is not None:
         raise _IMPORT_ERROR from _spatial_import_error
     if device_id is None:
         device_id = torch.cuda.current_device()
 
     res = torch.ops.sgl_kernel.create_greenctx_stream_by_value(SM_a, SM_b, device_id)
+
+    if len(res) != 4:
+        raise RuntimeError(
+            f"green-context operator returned {len(res)} values; expected 4"
+        )
 
     stream_a = ExternalStream(
         stream_ptr=res[0], device=torch.device(f"cuda:{device_id}")
@@ -39,7 +60,7 @@ def create_greenctx_stream_by_value(
         stream_ptr=res[1], device=torch.device(f"cuda:{device_id}")
     )
 
-    return stream_a, stream_b
+    return stream_a, stream_b, int(res[2]), int(res[3])
 
 
 def get_sm_available(device_id: int = None) -> int:
