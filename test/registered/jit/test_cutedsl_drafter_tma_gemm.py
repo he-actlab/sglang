@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from sglang.jit_kernel.cutedsl_drafter_tma_gemm import (
     DRAFTER_TMA_GEMM_MKN,
+    drafter_tma_persistent_gate_up,
     drafter_tma_single_stage_gate_up,
     drafter_tma_three_stage_gate_up,
 )
@@ -20,8 +21,12 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 @pytest.mark.parametrize("seed", [17, 20260801])
 @pytest.mark.parametrize(
     "implementation",
-    [drafter_tma_single_stage_gate_up, drafter_tma_three_stage_gate_up],
-    ids=["one-stage", "three-stage"],
+    [
+        drafter_tma_single_stage_gate_up,
+        drafter_tma_three_stage_gate_up,
+        drafter_tma_persistent_gate_up,
+    ],
+    ids=["one-stage", "three-stage", "three-stage-persistent"],
 )
 def test_drafter_tma_gate_up_matches_production_linear(seed, implementation):
     if torch.cuda.get_device_capability() != (12, 0):

@@ -34,7 +34,8 @@ Qwen3 drafter's fused gate-up projection at M=32, K=1024, N=6144 with BF16
 inputs, FP32 accumulation, and BF16 output.  A and W are loaded by TMA into
 shared-memory stages; four consumer warps issue ``mma.sync`` operations.  Gate
 1B retains a one-stage diagnostic and Gate 1C adds a three-stage circular
-producer/consumer pipeline.  Neither variant uses a persistent tile scheduler.
+producer/consumer pipeline. Gate 1D limits that pipeline to 52 persistent
+workers using CUTLASS's static persistent tile scheduler.
 
 The SM120 TMA/MMA layouts, pipeline protocol, and epilogue are reduced from
 NVIDIA CUTLASS 4.5.2's
@@ -60,6 +61,8 @@ DRAFTER_TMA_GEMM_MKN = (32, 1024, 6144)
 _TILE_MNK = (32, 64, 64)
 DRAFTER_TMA_GEMM_SINGLE_STAGE = 1
 DRAFTER_TMA_GEMM_PIPELINED_STAGES = 3
+DRAFTER_TMA_GEMM_OUTPUT_TILES = 96
+DRAFTER_TMA_GEMM_PERSISTENT_WORKERS = 52
 _EPILOGUE_STAGES = 8
 _ATOM_LAYOUT = (2, 2, 1)
 _MMA_WARPS = 4
@@ -67,14 +70,17 @@ _THREADS_PER_CTA = (_MMA_WARPS + 1) * 32
 
 
 class _DrafterTmaGemm:
-    def __init__(self, ab_stages: int):
+    def __init__(self, ab_stages: int, worker_limit: int):
         if ab_stages not in (
             DRAFTER_TMA_GEMM_SINGLE_STAGE,
             DRAFTER_TMA_GEMM_PIPELINED_STAGES,
         ):
             raise ValueError(f"unsupported A/B stage count: {ab_stages}")
+        if worker_limit <= 0 or worker_limit > DRAFTER_TMA_GEMM_OUTPUT_TILES:
+            raise ValueError(f"unsupported worker limit: {worker_limit}")
         self.tile_shape_mnk = _TILE_MNK
         self.ab_stages = ab_stages
+        self.worker_limit = worker_limit
         self.epilogue_stages = _EPILOGUE_STAGES
         self.acc_dtype = cutlass.Float32
         self.buffer_align_bytes = 1024
@@ -156,6 +162,17 @@ class _DrafterTmaGemm:
             output_smem_layout_staged,
             epilogue_tile,
         )
+        output_tile_shape = cute.slice_(self.tile_shape_mnk, (None, None, 0))
+        tiled_output = cute.zipped_divide(output, tiler=output_tile_shape)
+        num_ctas_mnl = tiled_output[(0, (None, None, None))].shape
+        tile_scheduler_params = utils.PersistentTileSchedulerParams(
+            num_ctas_mnl,
+            (1, 1, 1),
+        )
+        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+            tile_scheduler_params,
+            self.worker_limit,
+        )
 
         @cute.struct
         class SharedStorage:
@@ -195,8 +212,9 @@ class _DrafterTmaGemm:
             a_smem_layout_staged,
             weight_smem_layout_staged,
             output_smem_layout_staged,
+            tile_scheduler_params,
         ).launch(
-            grid=(1, DRAFTER_TMA_GEMM_MKN[2] // self.tile_shape_mnk[1], 1),
+            grid=grid,
             block=(_THREADS_PER_CTA, 1, 1),
             cluster=(1, 1, 1),
             stream=stream,
@@ -245,10 +263,10 @@ class _DrafterTmaGemm:
         a_smem_layout_staged: cute.ComposedLayout,
         weight_smem_layout_staged: cute.ComposedLayout,
         output_smem_layout_staged: cute.ComposedLayout,
+        tile_scheduler_params: utils.PersistentTileSchedulerParams,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        block_m, block_n, _ = cute.arch.block_idx()
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -332,6 +350,20 @@ class _DrafterTmaGemm:
 
         pipeline.sync(barrier_id=1)
         k_tile_count = cute.size(g_a, mode=[3])
+        tile_scheduler = utils.StaticPersistentTileScheduler.create(
+            tile_scheduler_params,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+        )
+        work_tile = tile_scheduler.initial_work_tile_info()
+        producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer,
+            self.ab_stages,
+        )
+        consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer,
+            self.ab_stages,
+        )
 
         if warp_idx < _MMA_WARPS:
             copy_atom_a = cute.make_copy_atom(
@@ -357,38 +389,6 @@ class _DrafterTmaGemm:
             t_cs_weight_copy = thread_copy_weight.partition_S(s_weight)
             t_cr_weight_copy = thread_copy_weight.retile(t_cr_weight)
 
-            accumulators.fill(0.0)
-            consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer,
-                self.ab_stages,
-            )
-            for _ in range(0, k_tile_count, 1, unroll=1):
-                ready = mainloop.consumer_try_wait(consumer_state)
-                mainloop.consumer_wait(consumer_state, ready)
-                stage = consumer_state.index
-                num_k_blocks = cute.size(t_cr_a, mode=[2])
-                for k_block in cutlass.range_constexpr(num_k_blocks):
-                    cute.copy(
-                        tiled_copy_a,
-                        t_cs_a_copy[None, None, k_block, stage],
-                        t_cr_a_copy[None, None, k_block],
-                    )
-                    cute.copy(
-                        tiled_copy_weight,
-                        t_cs_weight_copy[None, None, k_block, stage],
-                        t_cr_weight_copy[None, None, k_block],
-                    )
-                    cute.gemm(
-                        tiled_mma,
-                        accumulators,
-                        t_cr_a[None, None, k_block],
-                        t_cr_weight[None, None, k_block],
-                        accumulators,
-                    )
-                mainloop.consumer_release(consumer_state)
-                consumer_state.advance()
-
-            output_tile = g_output[(None, None, block_m, block_n, 0)]
             copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
                 self.output_layout,
                 elem_ty_d=self.output_dtype,
@@ -420,95 +420,136 @@ class _DrafterTmaGemm:
                 r_output_layout.shape, self.output_dtype
             )
 
-            tma_smem_output, tma_gmem_output = cpasync.tma_partition(
-                tma_atom_output,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(s_output, 0, 2),
-                cute.zipped_divide(output_tile, self.epilogue_tile),
-            )
-            epilogue_tiles = cute.zipped_divide(
-                output_tile, self.epilogue_tile
-            )
-            epilogue_tile_count = cute.size(epilogue_tiles, mode=[1])
-            epilogue_tile_layout = cute.make_layout(
-                epilogue_tiles.shape[1],
-                stride=(1, epilogue_tiles.shape[1][0]),
-            )
-            store_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=self.epilogue_stages,
-                producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, _MMA_WARPS * 32
-                ),
-            )
-
             r_output_size = cute.size(r_output_acc)
-            for epilogue_index in cutlass.range_constexpr(epilogue_tile_count):
-                for value_index in cutlass.range_constexpr(r_output_size):
-                    r_output_acc[value_index] = t_rs_acc[
-                        epilogue_index * r_output_size + value_index
-                    ]
-                r_output.store(r_output_acc.load().to(self.output_dtype))
-                output_stage = epilogue_index % cute.size(
-                    t_rs_s_output, mode=[3]
-                )
-                cute.copy(
-                    tiled_copy_r2s,
-                    r_output,
-                    t_rs_s_output[(None, None, None, output_stage)],
-                )
-                cute.arch.fence_proxy("async.shared", space="cta")
-                self.epilogue_barrier.arrive_and_wait()
+            num_k_blocks = cute.size(t_cr_a, mode=[2])
+            while work_tile.is_valid_tile:
+                tile_coord_mnl = work_tile.tile_idx
+                accumulators.fill(0.0)
+                consumer_state.reset_count()
+                for _ in range(0, k_tile_count, 1, unroll=1):
+                    ready = mainloop.consumer_try_wait(consumer_state)
+                    mainloop.consumer_wait(consumer_state, ready)
+                    stage = consumer_state.index
+                    for k_block in cutlass.range_constexpr(num_k_blocks):
+                        cute.copy(
+                            tiled_copy_a,
+                            t_cs_a_copy[None, None, k_block, stage],
+                            t_cr_a_copy[None, None, k_block],
+                        )
+                        cute.copy(
+                            tiled_copy_weight,
+                            t_cs_weight_copy[None, None, k_block, stage],
+                            t_cr_weight_copy[None, None, k_block],
+                        )
+                        cute.gemm(
+                            tiled_mma,
+                            accumulators,
+                            t_cr_a[None, None, k_block],
+                            t_cr_weight[None, None, k_block],
+                            accumulators,
+                        )
+                    mainloop.consumer_release(consumer_state)
+                    consumer_state.advance()
 
-                output_coord = epilogue_tile_layout.get_hier_coord(
-                    epilogue_index
+                output_tile = g_output[(None, None, *tile_coord_mnl)]
+                tiled_epilogue = cute.zipped_divide(
+                    output_tile,
+                    self.epilogue_tile,
                 )
-                if warp_idx == 0:
-                    cute.copy(
-                        tma_atom_output,
-                        tma_smem_output[(None, output_stage)],
-                        tma_gmem_output[(None, output_coord)],
+                tma_smem_output, tma_gmem_output = cpasync.tma_partition(
+                    tma_atom_output,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(s_output, 0, 2),
+                    tiled_epilogue,
+                )
+                epilogue_tile_count = cute.size(tiled_epilogue, mode=[1])
+                epilogue_tile_layout = cute.make_layout(
+                    tiled_epilogue.shape[1],
+                    stride=(1, tiled_epilogue.shape[1][0]),
+                )
+                store_pipeline = pipeline.PipelineTmaStore.create(
+                    num_stages=self.epilogue_stages,
+                    producer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread, _MMA_WARPS * 32
+                    ),
+                )
+
+                for epilogue_index in cutlass.range_constexpr(
+                    epilogue_tile_count
+                ):
+                    for value_index in cutlass.range_constexpr(r_output_size):
+                        r_output_acc[value_index] = t_rs_acc[
+                            epilogue_index * r_output_size + value_index
+                        ]
+                    r_output.store(r_output_acc.load().to(self.output_dtype))
+                    output_stage = epilogue_index % cute.size(
+                        t_rs_s_output, mode=[3]
                     )
-                    store_pipeline.producer_commit()
-                    store_pipeline.producer_acquire()
-            store_pipeline.producer_tail()
+                    cute.copy(
+                        tiled_copy_r2s,
+                        r_output,
+                        t_rs_s_output[(None, None, None, output_stage)],
+                    )
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    self.epilogue_barrier.arrive_and_wait()
+
+                    output_coord = epilogue_tile_layout.get_hier_coord(
+                        epilogue_index
+                    )
+                    if warp_idx == 0:
+                        cute.copy(
+                            tma_atom_output,
+                            tma_smem_output[(None, output_stage)],
+                            tma_gmem_output[(None, output_coord)],
+                        )
+                        store_pipeline.producer_commit()
+                        store_pipeline.producer_acquire()
+                store_pipeline.producer_tail()
+                tile_scheduler.advance_to_next_work()
+                work_tile = tile_scheduler.get_current_work()
 
         elif warp_idx == _MMA_WARPS:
-            producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer,
-                self.ab_stages,
-            )
-            tiled_a = tma_gmem_a[(None, block_m, None, 0)]
-            tiled_weight = tma_gmem_weight[(None, block_n, None, 0)]
-            for _ in range(0, k_tile_count, 1, unroll=1):
-                mainloop.producer_acquire(producer_state)
-                barrier = mainloop.producer_get_barrier(producer_state)
-                cute.copy(
-                    tma_atom_a,
-                    tiled_a[(None, producer_state.count)],
-                    tma_smem_a[(None, producer_state.index)],
-                    tma_bar_ptr=barrier,
-                )
-                cute.copy(
-                    tma_atom_weight,
-                    tiled_weight[(None, producer_state.count)],
-                    tma_smem_weight[(None, producer_state.index)],
-                    tma_bar_ptr=barrier,
-                )
-                mainloop.producer_commit(producer_state)
-                producer_state.advance()
+            while work_tile.is_valid_tile:
+                tile_coord_mnl = work_tile.tile_idx
+                tiled_a = tma_gmem_a[
+                    (None, tile_coord_mnl[0], None, tile_coord_mnl[2])
+                ]
+                tiled_weight = tma_gmem_weight[
+                    (None, tile_coord_mnl[1], None, tile_coord_mnl[2])
+                ]
+                producer_state.reset_count()
+                for _ in range(0, k_tile_count, 1, unroll=1):
+                    mainloop.producer_acquire(producer_state)
+                    barrier = mainloop.producer_get_barrier(producer_state)
+                    cute.copy(
+                        tma_atom_a,
+                        tiled_a[(None, producer_state.count)],
+                        tma_smem_a[(None, producer_state.index)],
+                        tma_bar_ptr=barrier,
+                    )
+                    cute.copy(
+                        tma_atom_weight,
+                        tiled_weight[(None, producer_state.count)],
+                        tma_smem_weight[(None, producer_state.index)],
+                        tma_bar_ptr=barrier,
+                    )
+                    mainloop.producer_commit(producer_state)
+                    producer_state.advance()
+                tile_scheduler.advance_to_next_work()
+                work_tile = tile_scheduler.get_current_work()
             mainloop.producer_tail(producer_state)
 
 
-_compiled: dict[tuple[int, int], object] = {}
+_compiled: dict[tuple[int, int, int], object] = {}
 
 
 def _as_cute_3d(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor.unsqueeze(-1), assumed_align=16)
 
 
-def _compiled_kernel(device_index: int, ab_stages: int):
-    cache_key = (device_index, ab_stages)
+def _compiled_kernel(device_index: int, ab_stages: int, worker_limit: int):
+    cache_key = (device_index, ab_stages, worker_limit)
     if cache_key not in _compiled:
         m, k, n = DRAFTER_TMA_GEMM_MKN
         with torch.cuda.device(device_index):
@@ -525,7 +566,7 @@ def _compiled_kernel(device_index: int, ab_stages: int):
                 torch.cuda.current_stream(device_index).cuda_stream
             )
             _compiled[cache_key] = cute.compile(
-                _DrafterTmaGemm(ab_stages),
+                _DrafterTmaGemm(ab_stages, worker_limit),
                 _as_cute_3d(activation),
                 _as_cute_3d(weight),
                 _as_cute_3d(output),
@@ -564,6 +605,7 @@ def _drafter_tma_gate_up(
     activation: torch.Tensor,
     weight: torch.Tensor,
     ab_stages: int,
+    worker_limit: int,
 ) -> torch.Tensor:
     device_index = _validate_inputs(activation, weight)
     m, _, n = DRAFTER_TMA_GEMM_MKN
@@ -572,7 +614,7 @@ def _drafter_tma_gate_up(
         (m, n), dtype=torch.bfloat16, device=activation.device
     )
     stream = cuda.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
-    _compiled_kernel(device_index, ab_stages)(
+    _compiled_kernel(device_index, ab_stages, worker_limit)(
         _as_cute_3d(activation),
         _as_cute_3d(weight),
         _as_cute_3d(output),
@@ -588,7 +630,10 @@ def drafter_tma_single_stage_gate_up(
     """Run the exact Gate-1B fused gate-up GEMM on the current CUDA stream."""
 
     return _drafter_tma_gate_up(
-        activation, weight, DRAFTER_TMA_GEMM_SINGLE_STAGE
+        activation,
+        weight,
+        DRAFTER_TMA_GEMM_SINGLE_STAGE,
+        DRAFTER_TMA_GEMM_OUTPUT_TILES,
     )
 
 
@@ -599,5 +644,22 @@ def drafter_tma_three_stage_gate_up(
     """Run the Gate-1C three-stage fused gate-up GEMM on the current stream."""
 
     return _drafter_tma_gate_up(
-        activation, weight, DRAFTER_TMA_GEMM_PIPELINED_STAGES
+        activation,
+        weight,
+        DRAFTER_TMA_GEMM_PIPELINED_STAGES,
+        DRAFTER_TMA_GEMM_OUTPUT_TILES,
+    )
+
+
+def drafter_tma_persistent_gate_up(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run the Gate-1D three-stage 52-worker persistent GEMM."""
+
+    return _drafter_tma_gate_up(
+        activation,
+        weight,
+        DRAFTER_TMA_GEMM_PIPELINED_STAGES,
+        DRAFTER_TMA_GEMM_PERSISTENT_WORKERS,
     )
