@@ -735,6 +735,12 @@ class Envs:
     # the draft-worker captures to the SMALL width. Target prefill is never
     # hinted: it captures on the full-device stream (Design-FullChipPrefill).
     SGLANG_SPEC_PDMUX_SM_HINT = EnvInt(0)
+    # Design-DrafterTMA (TODO-44): enable the exact Qwen3-0.6B TP1 BF16
+    # projection family on the realized 52-SM spec-pdmux SMALL partition.
+    # ModelRunner applies this only to the speculative draft worker; unsupported
+    # models, shapes, dtypes, layouts, widths, and architectures keep the
+    # production linear path. Experimental and default-off.
+    SGLANG_ENABLE_QWEN3_DRAFTER_TMA = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

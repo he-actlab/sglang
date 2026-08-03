@@ -624,6 +624,67 @@ def _validate_inputs(
     return device_index
 
 
+def can_run_drafter_tma_persistent_projection(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    """Return whether the strict fixed-width kernel can consume these tensors.
+
+    Runtime model integration uses this non-throwing predicate to select the
+    experimental path. Unsupported calls must stay on the production linear
+    implementation; failures after a supported launch is selected remain loud.
+    """
+
+    if not isinstance(activation, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        return False
+    if not activation.is_cuda or not weight.is_cuda:
+        return False
+    if activation.device != weight.device:
+        return False
+    if activation.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return False
+    if activation.ndim != 2 or weight.ndim != 2:
+        return False
+    if activation.shape[1] != weight.shape[1]:
+        return False
+    shape_mkn = (
+        activation.shape[0],
+        activation.shape[1],
+        weight.shape[0],
+    )
+    if shape_mkn not in _TILE_MNK_BY_SHAPE:
+        return False
+    if not activation.is_contiguous() or not weight.is_contiguous():
+        return False
+    if activation.data_ptr() % 16 or weight.data_ptr() % 16:
+        return False
+    device_index = activation.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return torch.cuda.get_device_capability(device_index) == (12, 0)
+
+
+def precompile_drafter_tma_persistent_projections(device_index: int) -> None:
+    """Compile all eight fixed-width projection specializations on ``device``.
+
+    SGLang calls this after draft-model weights load and before CUDA graph
+    capture. The compiled callables still receive the live activation, weight,
+    output, and current stream at dispatch time.
+    """
+
+    if torch.cuda.get_device_capability(device_index) != (12, 0):
+        raise RuntimeError("drafter TMA GEMM requires SM120")
+    with torch.cuda.device(device_index):
+        for shape_mkn in DRAFTER_TMA_GEMM_MKNS:
+            _compiled_kernel(
+                device_index,
+                shape_mkn,
+                _TILE_MNK_BY_SHAPE[shape_mkn],
+                DRAFTER_TMA_GEMM_PIPELINED_STAGES,
+                DRAFTER_TMA_GEMM_PERSISTENT_WORKERS,
+            )
+
+
 def _drafter_tma_projection(
     activation: torch.Tensor,
     weight: torch.Tensor,

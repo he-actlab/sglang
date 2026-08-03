@@ -14,6 +14,7 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
@@ -30,8 +31,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
-from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -59,6 +59,110 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+
+
+class _Qwen3DrafterTmaDispatch:
+    """Per-draft-model adapter for the exact fixed-width TMA projections."""
+
+    def __init__(self, device_index: int) -> None:
+        from sglang.jit_kernel.cutedsl_drafter_tma_gemm import (
+            can_run_drafter_tma_persistent_projection,
+            drafter_tma_persistent_projection,
+            precompile_drafter_tma_persistent_projections,
+        )
+
+        precompile_drafter_tma_persistent_projections(device_index)
+        self._can_run = can_run_drafter_tma_persistent_projection
+        self._run = drafter_tma_persistent_projection
+
+    @staticmethod
+    def supports_linear(linear: nn.Module) -> bool:
+        weight = getattr(linear, "weight", None)
+        return bool(
+            getattr(linear, "tp_size", None) == 1
+            and isinstance(
+                getattr(linear, "quant_method", None), UnquantizedLinearMethod
+            )
+            and getattr(linear, "bias", None) is None
+            and not getattr(linear, "gather_output", False)
+            and getattr(linear, "input_is_parallel", True)
+            and not getattr(linear, "use_dp_attention_reduce", False)
+            and isinstance(weight, torch.Tensor)
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+            and weight.data_ptr() % 16 == 0
+        )
+
+    def __call__(
+        self, linear: nn.Module, activation: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not self.supports_linear(linear):
+            return None
+        weight = linear.weight
+        if not self._can_run(activation, weight):
+            return None
+        return self._run(activation, weight)
+
+
+def _qwen3_drafter_tma_or_linear(
+    dispatch: Optional[_Qwen3DrafterTmaDispatch],
+    linear: nn.Module,
+    activation: torch.Tensor,
+    **linear_kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if dispatch is not None:
+        output = dispatch(linear, activation)
+        if output is not None:
+            return output, None
+    return linear(activation, **linear_kwargs)
+
+
+class Qwen3MLP(Qwen2MLP):
+    """Qwen3-local MLP with an optional per-instance drafter TMA seam."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            hidden_act=hidden_act,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self._drafter_tma_dispatch: Optional[_Qwen3DrafterTmaDispatch] = None
+
+    def set_drafter_tma_dispatch(self, dispatch: _Qwen3DrafterTmaDispatch) -> None:
+        self._drafter_tma_dispatch = dispatch
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch = None,
+    ) -> torch.Tensor:
+        if get_global_server_args().rl_on_policy_target is not None:
+            x = x.bfloat16()
+
+        gate_up, _ = _qwen3_drafter_tma_or_linear(
+            self._drafter_tma_dispatch,
+            self.gate_up_proj,
+            x,
+        )
+        x = self.act_fn(gate_up)
+        x, _ = _qwen3_drafter_tma_or_linear(
+            self._drafter_tma_dispatch,
+            self.down_proj,
+            x,
+            forward_batch=forward_batch,
+        )
+        return x
 
 
 class Qwen3Attention(nn.Module):
@@ -156,6 +260,7 @@ class Qwen3Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
+        self._drafter_tma_dispatch: Optional[_Qwen3DrafterTmaDispatch] = None
 
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
@@ -170,8 +275,15 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
+    def set_drafter_tma_dispatch(self, dispatch: _Qwen3DrafterTmaDispatch) -> None:
+        self._drafter_tma_dispatch = dispatch
+
     def forward_prepare_native(self, positions, hidden_states):
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = _qwen3_drafter_tma_or_linear(
+            self._drafter_tma_dispatch,
+            self.qkv_proj,
+            hidden_states,
+        )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -304,7 +416,11 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
-        output, _ = self.o_proj(attn_output)
+        output, _ = _qwen3_drafter_tma_or_linear(
+            self._drafter_tma_dispatch,
+            self.o_proj,
+            attn_output,
+        )
         return output
 
 
@@ -449,6 +565,53 @@ class Qwen3Model(Qwen2Model):
             alt_stream=alt_stream,
         )
 
+    def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
+        """Install TMA dispatch only for the exact Qwen3-0.6B TP1 model."""
+
+        if (
+            self.config.hidden_size != 1024
+            or self.config.intermediate_size != 3072
+            or self.config.num_hidden_layers != 28
+            or self.start_layer != 0
+            or self.end_layer != 28
+        ):
+            return False
+
+        expected_weight_shapes = (
+            (4096, 1024),
+            (1024, 2048),
+            (6144, 1024),
+            (1024, 3072),
+        )
+        layer_projections = []
+        for layer in self.layers:
+            if not isinstance(layer, Qwen3DecoderLayer):
+                return False
+            projections = (
+                layer.self_attn.qkv_proj,
+                layer.self_attn.o_proj,
+                layer.mlp.gate_up_proj,
+                layer.mlp.down_proj,
+            )
+            if (
+                tuple(tuple(item.weight.shape) for item in projections)
+                != expected_weight_shapes
+            ):
+                return False
+            if not all(
+                _Qwen3DrafterTmaDispatch.supports_linear(item) for item in projections
+            ):
+                return False
+            if any(item.weight.device.index != device_index for item in projections):
+                return False
+            layer_projections.append(layer)
+
+        dispatch = _Qwen3DrafterTmaDispatch(device_index)
+        for layer in layer_projections:
+            layer.self_attn.set_drafter_tma_dispatch(dispatch)
+            layer.mlp.set_drafter_tma_dispatch(dispatch)
+        return True
+
 
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -505,6 +668,9 @@ class Qwen3ForCausalLM(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
+        return self.model.enable_qwen3_drafter_tma(device_index)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()

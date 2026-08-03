@@ -13,6 +13,7 @@ from sglang.jit_kernel.cutedsl_drafter_tma_gemm import (
     drafter_tma_persistent_projection,
     drafter_tma_single_stage_gate_up,
     drafter_tma_three_stage_gate_up,
+    precompile_drafter_tma_persistent_projections,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -115,6 +116,61 @@ def test_drafter_tma_projection_rejects_unsupported_inputs():
     assert unaligned.data_ptr() % 16
     with pytest.raises(ValueError, match="at least 16-byte aligned"):
         drafter_tma_persistent_projection(unaligned, weight)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_drafter_tma_projection_family_captures_on_small_greenctx_stream():
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 required")
+
+    from sglang.srt.multiplex.pdmux_context import (
+        get_spec_sm_allocated_split,
+        initialize_spec_stream_pair,
+    )
+
+    device_index = torch.cuda.current_device()
+    _, small_stream = initialize_spec_stream_pair(device_index, 132, 56)
+    assert get_spec_sm_allocated_split() == (136, 52)
+    with torch.cuda.stream(small_stream):
+        precompile_drafter_tma_persistent_projections(device_index)
+
+    torch.manual_seed(20260803)
+    inputs = [
+        (
+            torch.randn((m, k), dtype=torch.bfloat16, device="cuda"),
+            torch.randn((n, k), dtype=torch.bfloat16, device="cuda"),
+        )
+        for m, k, n in DRAFTER_TMA_GEMM_MKNS
+    ]
+    with torch.cuda.stream(small_stream):
+        warmup = [
+            drafter_tma_persistent_projection(activation, weight)
+            for activation, weight in inputs
+        ]
+    torch.cuda.synchronize()
+    assert all(torch.isfinite(output).all() for output in warmup)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=small_stream):
+        outputs = [
+            drafter_tma_persistent_projection(activation, weight)
+            for activation, weight in inputs
+        ]
+    graph.replay()
+    torch.cuda.synchronize()
+    first_replay = [output.clone() for output in outputs]
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for output, first, (activation, weight) in zip(outputs, first_replay, inputs):
+        assert torch.isfinite(output).all()
+        assert torch.equal(output.view(torch.int16), first.view(torch.int16))
+        torch.testing.assert_close(
+            output,
+            F.linear(activation, weight),
+            rtol=2e-2,
+            atol=2.5,
+        )
 
 
 if __name__ == "__main__":
