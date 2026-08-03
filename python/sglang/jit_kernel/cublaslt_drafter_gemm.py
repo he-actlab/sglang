@@ -8,6 +8,7 @@ no heuristic lookup and is CUDA-graph capturable.
 
 from __future__ import annotations
 
+import os
 import secrets
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -31,7 +32,17 @@ DEFAULT_WORKSPACE_BYTES = 32 * 1024 * 1024
 MAX_ALGORITHMS = 100
 _ALGORITHM_BYTES = 64
 _METADATA_FIELDS = 12
+_PROCESS_CACHE_PID = os.getpid()
 _PROCESS_CACHE_TOKEN = secrets.token_hex(16)
+
+
+def _require_originating_process() -> None:
+    if os.getpid() != _PROCESS_CACHE_PID:
+        raise RuntimeError(
+            "the cuBLASLt drafter tuner cannot be used after fork because its "
+            "native handle and opaque algorithms are process-local; exec a fresh "
+            "process and rediscover algorithms"
+        )
 
 
 def _device_index(tensor: torch.Tensor) -> int:
@@ -79,6 +90,8 @@ class CublasLtDrafterAlgorithm:
     k: int
     n: int
     sm_count_target: int
+    process_id: int
+    process_cache_token: str = field(repr=False)
     device_index: int
     compute_capability: tuple[int, int]
     activation_alignment: int
@@ -108,13 +121,15 @@ class CublasLtDrafterAlgorithm:
     def to_dict(self) -> dict[str, Any]:
         """Return JSON-compatible metadata including the opaque descriptor."""
 
+        _require_originating_process()
         return {
             "m": self.m,
             "k": self.k,
             "n": self.n,
             "sm_count_target": self.sm_count_target,
             "cache_scope": "process-local",
-            "process_cache_token": _PROCESS_CACHE_TOKEN,
+            "process_id": self.process_id,
+            "process_cache_token": self.process_cache_token,
             "device_index": self.device_index,
             "compute_capability": list(self.compute_capability),
             "cuda_runtime": torch.version.cuda,
@@ -151,8 +166,10 @@ class CublasLtDrafterAlgorithm:
         after process restart, CUDA/cuBLASLt update, or device change.
         """
 
+        _require_originating_process()
         if (
             value.get("cache_scope") != "process-local"
+            or value.get("process_id") != _PROCESS_CACHE_PID
             or value.get("process_cache_token") != _PROCESS_CACHE_TOKEN
         ):
             raise ValueError(
@@ -169,6 +186,8 @@ class CublasLtDrafterAlgorithm:
             k=int(value["k"]),
             n=int(value["n"]),
             sm_count_target=int(value["sm_count_target"]),
+            process_id=int(value["process_id"]),
+            process_cache_token=str(value["process_cache_token"]),
             device_index=int(value["device_index"]),
             compute_capability=capability,
             activation_alignment=int(value["activation_alignment"]),
@@ -252,6 +271,7 @@ def discover_algorithms(
     matmul descriptor used for both this query and later execution.
     """
 
+    _require_originating_process()
     m, k, n = _validate_problem(activation, weight, workspace)
     if isinstance(sm_count_target, bool) or not isinstance(sm_count_target, int):
         raise TypeError("sm_count_target must be an int")
@@ -309,6 +329,8 @@ def discover_algorithms(
                 k=k,
                 n=n,
                 sm_count_target=sm_count_target,
+                process_id=_PROCESS_CACHE_PID,
+                process_cache_token=_PROCESS_CACHE_TOKEN,
                 device_index=device_index,
                 compute_capability=compute_capability,
                 activation_alignment=_alignment_class(activation),
@@ -346,9 +368,18 @@ def matmul(
 ) -> torch.Tensor:
     """Run a cached algorithm on the current CUDA stream without a query."""
 
+    _require_originating_process()
     shape_mkn = _validate_problem(activation, weight, workspace)
     if not isinstance(algorithm, CublasLtDrafterAlgorithm):
         raise TypeError("algorithm must be a CublasLtDrafterAlgorithm")
+    if (
+        algorithm.process_id != _PROCESS_CACHE_PID
+        or algorithm.process_cache_token != _PROCESS_CACHE_TOKEN
+    ):
+        raise ValueError(
+            "cuBLASLt algorithms are process-local; rediscover the algorithm in "
+            "this process"
+        )
     if shape_mkn != algorithm.shape_mkn:
         raise ValueError(
             f"algorithm shape {algorithm.shape_mkn} does not match input shape {shape_mkn}"

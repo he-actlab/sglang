@@ -179,6 +179,23 @@ def test_cublaslt_drafter_rejects_workspace_output_and_algorithm_mismatches():
     with pytest.raises(ValueError, match="process-local"):
         CublasLtDrafterAlgorithm.from_dict(wrong_process)
 
+    wrong_pid = algorithm.to_dict()
+    wrong_pid["process_id"] = algorithm.process_id + 1
+    with pytest.raises(ValueError, match="process-local"):
+        CublasLtDrafterAlgorithm.from_dict(wrong_pid)
+
+    inherited_algorithm = replace(
+        algorithm, process_cache_token="different-process"
+    )
+    with pytest.raises(ValueError, match="process-local"):
+        matmul(
+            activation,
+            weight,
+            algorithm=inherited_algorithm,
+            sm_count_target=52,
+            workspace=workspace,
+        )
+
     bad_algorithm_buffer = replace(
         algorithm, _buffer=torch.empty(63, dtype=torch.uint8)
     )
