@@ -30,12 +30,12 @@
 """Exact-shape TMA/Tensor-Core drafter GEMM construction kernels for SM120.
 
 This is a construction gate, not the production dispatch.  It implements the
-Qwen3 drafter's fused gate-up projection at M=32, K=1024, N=6144 with BF16
-inputs, FP32 accumulation, and BF16 output.  A and W are loaded by TMA into
+physical Qwen3-0.6B TP1 projection family at M=32 and M=128 with BF16 inputs,
+FP32 accumulation, and BF16 output.  A and W are loaded by TMA into
 shared-memory stages; four consumer warps issue ``mma.sync`` operations.  Gate
-1B retains a one-stage diagnostic and Gate 1C adds a three-stage circular
-producer/consumer pipeline. Gate 1D limits that pipeline to 52 persistent
-workers using CUTLASS's static persistent tile scheduler.
+1B retains a one-stage fused-gate-up diagnostic, Gate 1C adds a three-stage
+circular producer/consumer pipeline, and Gate 1D limits that pipeline to 52
+persistent workers using CUTLASS's static persistent tile scheduler.
 
 The SM120 TMA/MMA layouts, pipeline protocol, and epilogue are reduced from
 NVIDIA CUTLASS 4.5.2's
@@ -56,9 +56,23 @@ import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
-
 DRAFTER_TMA_GEMM_MKN = (32, 1024, 6144)
-_TILE_MNK = (32, 64, 64)
+DRAFTER_TMA_GEMM_MKNS = (
+    (32, 1024, 4096),
+    (32, 2048, 1024),
+    DRAFTER_TMA_GEMM_MKN,
+    (32, 3072, 1024),
+    (128, 1024, 4096),
+    (128, 2048, 1024),
+    (128, 1024, 6144),
+    (128, 3072, 1024),
+)
+_WIDE_TILE_MNK = (32, 64, 64)
+_NARROW_TILE_MNK = (16, 32, 64)
+_TILE_MNK_BY_SHAPE = {
+    shape_mkn: (_WIDE_TILE_MNK if shape_mkn[2] > 1024 else _NARROW_TILE_MNK)
+    for shape_mkn in DRAFTER_TMA_GEMM_MKNS
+}
 DRAFTER_TMA_GEMM_SINGLE_STAGE = 1
 DRAFTER_TMA_GEMM_PIPELINED_STAGES = 3
 DRAFTER_TMA_GEMM_OUTPUT_TILES = 96
@@ -70,15 +84,32 @@ _THREADS_PER_CTA = (_MMA_WARPS + 1) * 32
 
 
 class _DrafterTmaGemm:
-    def __init__(self, ab_stages: int, worker_limit: int):
+    def __init__(
+        self,
+        shape_mkn: tuple[int, int, int],
+        tile_shape_mnk: tuple[int, int, int],
+        ab_stages: int,
+        worker_limit: int,
+    ):
         if ab_stages not in (
             DRAFTER_TMA_GEMM_SINGLE_STAGE,
             DRAFTER_TMA_GEMM_PIPELINED_STAGES,
         ):
             raise ValueError(f"unsupported A/B stage count: {ab_stages}")
-        if worker_limit <= 0 or worker_limit > DRAFTER_TMA_GEMM_OUTPUT_TILES:
+        if any(
+            problem_extent % tile_extent
+            for problem_extent, tile_extent in zip(shape_mkn, tile_shape_mnk)
+        ):
+            raise ValueError(
+                f"shape {shape_mkn} must be divisible by tile {tile_shape_mnk}"
+            )
+        output_tiles = (shape_mkn[0] // tile_shape_mnk[0]) * (
+            shape_mkn[2] // tile_shape_mnk[1]
+        )
+        if worker_limit <= 0 or worker_limit > output_tiles:
             raise ValueError(f"unsupported worker limit: {worker_limit}")
-        self.tile_shape_mnk = _TILE_MNK
+        self.shape_mkn = shape_mkn
+        self.tile_shape_mnk = tile_shape_mnk
         self.ab_stages = ab_stages
         self.worker_limit = worker_limit
         self.epilogue_stages = _EPILOGUE_STAGES
@@ -176,13 +207,9 @@ class _DrafterTmaGemm:
 
         @cute.struct
         class SharedStorage:
-            mainloop_barriers: cute.struct.MemRange[
-                cutlass.Int64, self.ab_stages * 2
-            ]
+            mainloop_barriers: cute.struct.MemRange[cutlass.Int64, self.ab_stages * 2]
             a: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(a_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.a_dtype, cute.cosize(a_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             weight: cute.struct.Align[
@@ -274,9 +301,7 @@ class _DrafterTmaGemm:
             cpasync.prefetch_descriptor(tma_atom_output)
 
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
-        weight_smem_layout = cute.slice_(
-            weight_smem_layout_staged, (None, None, 0)
-        )
+        weight_smem_layout = cute.slice_(weight_smem_layout_staged, (None, None, 0))
         tma_copy_bytes = cute.size_in_bytes(
             self.a_dtype, a_smem_layout
         ) + cute.size_in_bytes(self.weight_dtype, weight_smem_layout)
@@ -286,9 +311,7 @@ class _DrafterTmaGemm:
         mainloop = pipeline.PipelineTmaAsync.create(
             num_stages=self.ab_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, _MMA_WARPS
-            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, _MMA_WARPS),
             tx_count=tma_copy_bytes,
             barrier_storage=storage.mainloop_barriers.data_ptr(),
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
@@ -342,9 +365,7 @@ class _DrafterTmaGemm:
         t_cs_a = thr_mma.partition_A(s_a)
         t_cs_weight = thr_mma.partition_B(s_weight)
         t_cr_a = tiled_mma.make_fragment_A(t_cs_a[None, None, None, 0])
-        t_cr_weight = tiled_mma.make_fragment_B(
-            t_cs_weight[None, None, None, 0]
-        )
+        t_cr_weight = tiled_mma.make_fragment_B(t_cs_weight[None, None, None, 0])
         t_cg_output = thr_mma.partition_C(g_output)
         accumulators = cute.make_rmem_tensor(t_cg_output.shape[:3], self.acc_dtype)
 
@@ -367,21 +388,15 @@ class _DrafterTmaGemm:
 
         if warp_idx < _MMA_WARPS:
             copy_atom_a = cute.make_copy_atom(
-                cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                    self.a_layout.is_m_major_a(), 4
-                ),
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 4),
                 self.a_dtype,
             )
             copy_atom_weight = cute.make_copy_atom(
-                cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                    self.weight_layout.is_n_major_b(), 4
-                ),
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(self.weight_layout.is_n_major_b(), 4),
                 self.weight_dtype,
             )
             tiled_copy_a = cute.make_tiled_copy_A(copy_atom_a, tiled_mma)
-            tiled_copy_weight = cute.make_tiled_copy_B(
-                copy_atom_weight, tiled_mma
-            )
+            tiled_copy_weight = cute.make_tiled_copy_B(copy_atom_weight, tiled_mma)
             thread_copy_a = tiled_copy_a.get_slice(tidx)
             thread_copy_weight = tiled_copy_weight.get_slice(tidx)
             t_cs_a_copy = thread_copy_a.partition_S(s_a)
@@ -395,9 +410,7 @@ class _DrafterTmaGemm:
                 elem_ty_acc=self.acc_dtype,
             )
             copy_atom_output = cute.make_copy_atom(
-                cute.nvgpu.warp.StMatrix8x8x16bOp(
-                    self.output_layout.is_m_major_c(), 4
-                ),
+                cute.nvgpu.warp.StMatrix8x8x16bOp(self.output_layout.is_m_major_c(), 4),
                 self.output_dtype,
             )
             tiled_copy_output_atom = cute.make_tiled_copy_C_atom(
@@ -413,12 +426,8 @@ class _DrafterTmaGemm:
 
             r_output_shape = cute.shape(thread_copy_r2s.partition_S(s_output))
             r_output_layout = cute.make_layout(r_output_shape[:3])
-            r_output_acc = cute.make_rmem_tensor(
-                r_output_layout.shape, self.acc_dtype
-            )
-            r_output = cute.make_rmem_tensor(
-                r_output_layout.shape, self.output_dtype
-            )
+            r_output_acc = cute.make_rmem_tensor(r_output_layout.shape, self.acc_dtype)
+            r_output = cute.make_rmem_tensor(r_output_layout.shape, self.output_dtype)
 
             r_output_size = cute.size(r_output_acc)
             num_k_blocks = cute.size(t_cr_a, mode=[2])
@@ -475,17 +484,13 @@ class _DrafterTmaGemm:
                     ),
                 )
 
-                for epilogue_index in cutlass.range_constexpr(
-                    epilogue_tile_count
-                ):
+                for epilogue_index in cutlass.range_constexpr(epilogue_tile_count):
                     for value_index in cutlass.range_constexpr(r_output_size):
                         r_output_acc[value_index] = t_rs_acc[
                             epilogue_index * r_output_size + value_index
                         ]
                     r_output.store(r_output_acc.load().to(self.output_dtype))
-                    output_stage = epilogue_index % cute.size(
-                        t_rs_s_output, mode=[3]
-                    )
+                    output_stage = epilogue_index % cute.size(t_rs_s_output, mode=[3])
                     cute.copy(
                         tiled_copy_r2s,
                         r_output,
@@ -494,9 +499,7 @@ class _DrafterTmaGemm:
                     cute.arch.fence_proxy("async.shared", space="cta")
                     self.epilogue_barrier.arrive_and_wait()
 
-                    output_coord = epilogue_tile_layout.get_hier_coord(
-                        epilogue_index
-                    )
+                    output_coord = epilogue_tile_layout.get_hier_coord(epilogue_index)
                     if warp_idx == 0:
                         cute.copy(
                             tma_atom_output,
@@ -512,9 +515,7 @@ class _DrafterTmaGemm:
         elif warp_idx == _MMA_WARPS:
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
-                tiled_a = tma_gmem_a[
-                    (None, tile_coord_mnl[0], None, tile_coord_mnl[2])
-                ]
+                tiled_a = tma_gmem_a[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
                 tiled_weight = tma_gmem_weight[
                     (None, tile_coord_mnl[1], None, tile_coord_mnl[2])
                 ]
@@ -541,17 +542,31 @@ class _DrafterTmaGemm:
             mainloop.producer_tail(producer_state)
 
 
-_compiled: dict[tuple[int, int, int], object] = {}
+_compiled: dict[tuple, object] = {}
 
 
 def _as_cute_3d(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor.unsqueeze(-1), assumed_align=16)
 
 
-def _compiled_kernel(device_index: int, ab_stages: int, worker_limit: int):
-    cache_key = (device_index, ab_stages, worker_limit)
+def _compiled_kernel(
+    device_index: int,
+    shape_mkn: tuple[int, int, int],
+    tile_shape_mnk: tuple[int, int, int],
+    ab_stages: int,
+    worker_limit: int,
+):
+    capability = torch.cuda.get_device_capability(device_index)
+    cache_key = (
+        device_index,
+        capability,
+        shape_mkn,
+        tile_shape_mnk,
+        ab_stages,
+        worker_limit,
+    )
     if cache_key not in _compiled:
-        m, k, n = DRAFTER_TMA_GEMM_MKN
+        m, k, n = shape_mkn
         with torch.cuda.device(device_index):
             activation = torch.empty(
                 (m, k), dtype=torch.bfloat16, device=f"cuda:{device_index}"
@@ -562,11 +577,14 @@ def _compiled_kernel(device_index: int, ab_stages: int, worker_limit: int):
             output = torch.empty(
                 (m, n), dtype=torch.bfloat16, device=f"cuda:{device_index}"
             )
-            stream = cuda.CUstream(
-                torch.cuda.current_stream(device_index).cuda_stream
-            )
+            stream = cuda.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
             _compiled[cache_key] = cute.compile(
-                _DrafterTmaGemm(ab_stages, worker_limit),
+                _DrafterTmaGemm(
+                    shape_mkn,
+                    tile_shape_mnk,
+                    ab_stages,
+                    worker_limit,
+                ),
                 _as_cute_3d(activation),
                 _as_cute_3d(weight),
                 _as_cute_3d(output),
@@ -578,20 +596,25 @@ def _compiled_kernel(device_index: int, ab_stages: int, worker_limit: int):
 def _validate_inputs(
     activation: torch.Tensor,
     weight: torch.Tensor,
+    shape_mkn: tuple[int, int, int],
 ) -> int:
-    m, k, n = DRAFTER_TMA_GEMM_MKN
+    m, k, n = shape_mkn
     if not activation.is_cuda or not weight.is_cuda:
         raise ValueError("activation and weight must be CUDA tensors")
     if activation.device != weight.device:
         raise ValueError("activation and weight must be on the same CUDA device")
     if activation.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise TypeError("activation and weight must use torch.bfloat16")
+    if activation.ndim != 2 or weight.ndim != 2:
+        raise ValueError("activation and weight must be rank-2 tensors")
     if tuple(activation.shape) != (m, k):
         raise ValueError(f"activation shape must be {(m, k)}")
     if tuple(weight.shape) != (n, k):
         raise ValueError(f"weight shape must be {(n, k)}")
     if not activation.is_contiguous() or not weight.is_contiguous():
         raise ValueError("activation and weight must be contiguous")
+    if activation.data_ptr() % 16 or weight.data_ptr() % 16:
+        raise ValueError("activation and weight must be at least 16-byte aligned")
 
     device_index = activation.device.index
     if device_index is None:
@@ -601,26 +624,82 @@ def _validate_inputs(
     return device_index
 
 
-def _drafter_tma_gate_up(
+def _drafter_tma_projection(
     activation: torch.Tensor,
     weight: torch.Tensor,
+    shape_mkn: tuple[int, int, int],
+    tile_shape_mnk: tuple[int, int, int],
     ab_stages: int,
     worker_limit: int,
 ) -> torch.Tensor:
-    device_index = _validate_inputs(activation, weight)
-    m, _, n = DRAFTER_TMA_GEMM_MKN
+    device_index = _validate_inputs(activation, weight, shape_mkn)
+    m, _, n = shape_mkn
 
-    output = torch.empty(
-        (m, n), dtype=torch.bfloat16, device=activation.device
-    )
+    output = torch.empty((m, n), dtype=torch.bfloat16, device=activation.device)
     stream = cuda.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
-    _compiled_kernel(device_index, ab_stages, worker_limit)(
+    _compiled_kernel(
+        device_index,
+        shape_mkn,
+        tile_shape_mnk,
+        ab_stages,
+        worker_limit,
+    )(
         _as_cute_3d(activation),
         _as_cute_3d(weight),
         _as_cute_3d(output),
         stream,
     )
     return output
+
+
+def _drafter_tma_gate_up(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    ab_stages: int,
+    worker_limit: int,
+) -> torch.Tensor:
+    return _drafter_tma_projection(
+        activation,
+        weight,
+        DRAFTER_TMA_GEMM_MKN,
+        _WIDE_TILE_MNK,
+        ab_stages,
+        worker_limit,
+    )
+
+
+def drafter_tma_persistent_projection(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run a supported Qwen3-0.6B projection with a 52-worker cap.
+
+    The strict standalone API accepts only the eight physical TP1 projection
+    shapes in :data:`DRAFTER_TMA_GEMM_MKNS`. Runtime fallback and dispatch
+    remain separate integration work.
+    """
+
+    if activation.ndim != 2 or weight.ndim != 2:
+        raise ValueError("activation and weight must be rank-2 tensors")
+    if activation.shape[1] != weight.shape[1]:
+        raise ValueError("activation and weight K dimensions must match")
+    shape_mkn = (
+        activation.shape[0],
+        activation.shape[1],
+        weight.shape[0],
+    )
+    tile_shape_mnk = _TILE_MNK_BY_SHAPE.get(shape_mkn)
+    if tile_shape_mnk is None:
+        raise ValueError(f"unsupported drafter TMA GEMM shape: {shape_mkn}")
+
+    return _drafter_tma_projection(
+        activation,
+        weight,
+        shape_mkn,
+        tile_shape_mnk,
+        DRAFTER_TMA_GEMM_PIPELINED_STAGES,
+        DRAFTER_TMA_GEMM_PERSISTENT_WORKERS,
+    )
 
 
 def drafter_tma_single_stage_gate_up(
