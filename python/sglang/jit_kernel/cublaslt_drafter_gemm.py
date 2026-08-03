@@ -1,5 +1,7 @@
-"""Cached cuBLASLt heuristic candidates for exact Qwen3 drafter GEMMs.
+"""Cached cuBLASLt heuristic candidates for exact Qwen3 projection GEMMs.
 
+The supported shapes cover the Qwen3-0.6B drafter (draft M=32 and draft-extend
+M=128) and the Qwen3-8B verifier (verify M=128, TODO-45) projection families.
 Discovery is an out-of-graph setup operation.  Each returned candidate owns a
 persistent CPU copy of the opaque cuBLASLt algorithm descriptor, while callers
 own the CUDA workspace used by both discovery and execution.  ``matmul`` does
@@ -38,6 +40,19 @@ DRAFTER_CUBLASLT_PORTFOLIO_MKNS = (
     (128, 1024, 6144),
     (128, 3072, 1024),
 )
+
+# Exact Qwen3-8B TP1 verifier projections at verify M=128 (32 requests x 4
+# draft tokens per serialized slot): fused QKV, output, fused gate-up, down.
+# Census: TRACE-verify.json under the drafter cuBLASLt model-integration
+# experiment in the research repository (TODO-45).
+VERIFIER_CUBLASLT_MKNS = (
+    (128, 4096, 6144),
+    (128, 4096, 4096),
+    (128, 4096, 24576),
+    (128, 12288, 4096),
+)
+
+SUPPORTED_CUBLASLT_MKNS = DRAFTER_CUBLASLT_MKNS + VERIFIER_CUBLASLT_MKNS
 
 DEFAULT_WORKSPACE_BYTES = 32 * 1024 * 1024
 MAX_ALGORITHMS = 100
@@ -322,7 +337,7 @@ def _validate_problem(
     if weight_k != k:
         raise ValueError(f"weight K dimension mismatch: expected {k}, got {weight_k}")
     shape_mkn = (m, k, n)
-    if shape_mkn not in DRAFTER_CUBLASLT_MKNS:
+    if shape_mkn not in SUPPORTED_CUBLASLT_MKNS:
         raise ValueError(f"unsupported drafter cuBLASLt shape (M,K,N)={shape_mkn}")
     if workspace.dtype is not torch.uint8 or workspace.ndim != 1:
         raise TypeError("workspace must be a one-dimensional torch.uint8 tensor")
@@ -542,6 +557,8 @@ __all__ = [
     "DRAFTER_CUBLASLT_PORTFOLIO_MKNS",
     "DRAFTER_CUBLASLT_PORTFOLIO_TACTICS",
     "MAX_ALGORITHMS",
+    "SUPPORTED_CUBLASLT_MKNS",
+    "VERIFIER_CUBLASLT_MKNS",
     "allocate_workspace",
     "discover_algorithms",
     "matmul",

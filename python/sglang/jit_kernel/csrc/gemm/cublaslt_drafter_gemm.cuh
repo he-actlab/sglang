@@ -151,8 +151,15 @@ struct GemmDescriptors {
 };
 
 inline bool is_supported_shape(int64_t m, int64_t k, int64_t n) {
-  return (m == 32 && k == 1024 && (n == 4096 || n == 6144)) || (m == 32 && n == 1024 && (k == 2048 || k == 3072)) ||
-         (m == 128 && k == 1024 && (n == 4096 || n == 6144)) || (m == 128 && n == 1024 && (k == 2048 || k == 3072));
+  // Qwen3-0.6B drafter projections: draft M=32 and draft-extend M=128.
+  const bool drafter = (m == 32 && k == 1024 && (n == 4096 || n == 6144)) ||
+                       (m == 32 && n == 1024 && (k == 2048 || k == 3072)) ||
+                       (m == 128 && k == 1024 && (n == 4096 || n == 6144)) ||
+                       (m == 128 && n == 1024 && (k == 2048 || k == 3072));
+  // Qwen3-8B verifier projections at verify M=128 (TODO-45).
+  const bool verifier =
+      (m == 128 && k == 4096 && (n == 6144 || n == 4096 || n == 24576)) || (m == 128 && k == 12288 && n == 4096);
+  return drafter || verifier;
 }
 
 inline uint32_t pointer_alignment(const void* pointer) {

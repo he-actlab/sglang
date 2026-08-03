@@ -13,6 +13,8 @@ from sglang.jit_kernel.cublaslt_drafter_gemm import (
     DRAFTER_CUBLASLT_PORTFOLIO_MKNS,
     DRAFTER_CUBLASLT_PORTFOLIO_TACTICS,
     MAX_ALGORITHMS,
+    SUPPORTED_CUBLASLT_MKNS,
+    VERIFIER_CUBLASLT_MKNS,
     CublasLtDrafterAlgorithm,
     allocate_workspace,
     discover_algorithms,
@@ -87,12 +89,7 @@ def test_drafter_portfolio_retained_shapes_are_not_selected(shape_mkn):
         select_drafter_portfolio_algorithm(shape_mkn, [])
 
 
-@pytest.mark.parametrize("shape_mkn", DRAFTER_CUBLASLT_MKNS, ids=_SHAPE_IDS)
-@pytest.mark.parametrize("sm_count_target", [0, 52], ids=["full-device", "target-52"])
-def test_cublaslt_drafter_candidate_matches_linear_and_is_deterministic(
-    shape_mkn, sm_count_target
-):
-    _require_sm120()
+def _assert_candidate_matches_linear_and_is_deterministic(shape_mkn, sm_count_target):
     m, k, n = shape_mkn
     torch.manual_seed(20260803 + m + k + n)
     activation = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
@@ -162,6 +159,38 @@ def test_cublaslt_drafter_candidate_matches_linear_and_is_deterministic(
     )
     torch.cuda.synchronize()
     assert torch.equal(output.view(torch.int16), restored_output.view(torch.int16))
+
+
+@pytest.mark.parametrize("shape_mkn", DRAFTER_CUBLASLT_MKNS, ids=_SHAPE_IDS)
+@pytest.mark.parametrize("sm_count_target", [0, 52], ids=["full-device", "target-52"])
+def test_cublaslt_drafter_candidate_matches_linear_and_is_deterministic(
+    shape_mkn, sm_count_target
+):
+    _require_sm120()
+    _assert_candidate_matches_linear_and_is_deterministic(shape_mkn, sm_count_target)
+
+
+_VERIFIER_SHAPE_IDS = [
+    "verify-qkv",
+    "verify-output",
+    "verify-gate-up",
+    "verify-down",
+]
+
+
+def test_verifier_shapes_extend_but_do_not_change_drafter_registry():
+    assert SUPPORTED_CUBLASLT_MKNS == DRAFTER_CUBLASLT_MKNS + VERIFIER_CUBLASLT_MKNS
+    assert not set(DRAFTER_CUBLASLT_MKNS) & set(VERIFIER_CUBLASLT_MKNS)
+    assert set(DRAFTER_CUBLASLT_PORTFOLIO_MKNS) <= set(DRAFTER_CUBLASLT_MKNS)
+
+
+@pytest.mark.parametrize("shape_mkn", VERIFIER_CUBLASLT_MKNS, ids=_VERIFIER_SHAPE_IDS)
+@pytest.mark.parametrize("sm_count_target", [0, 136], ids=["full-device", "target-136"])
+def test_cublaslt_verifier_candidate_matches_linear_and_is_deterministic(
+    shape_mkn, sm_count_target
+):
+    _require_sm120()
+    _assert_candidate_matches_linear_and_is_deterministic(shape_mkn, sm_count_target)
 
 
 def test_cublaslt_drafter_rejects_workspace_output_and_algorithm_mismatches():
