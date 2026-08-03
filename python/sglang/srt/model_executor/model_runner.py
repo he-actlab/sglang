@@ -856,15 +856,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _maybe_enable_qwen3_drafter_projection_dispatch(self) -> bool:
         self._maybe_enable_qwen3_verifier_cublaslt_portfolio()
-        tma = envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get()
-        portfolio = envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get()
-        if tma and portfolio:
-            raise RuntimeError(
-                "Qwen3 drafter TMA and cuBLASLt portfolio flags are mutually exclusive"
-            )
-        if portfolio:
-            return self._maybe_enable_qwen3_drafter_cublaslt_portfolio()
-        return self._maybe_enable_qwen3_drafter_tma()
+        # The Stage-2 TMA winners and the cuBLASLt portfolio compose per
+        # exact shape (chained dispatch: TMA specialization -> retained
+        # tactic -> production); enable the portfolio first so the TMA
+        # install prepends ahead of it.
+        enabled = False
+        if envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get():
+            enabled = self._maybe_enable_qwen3_drafter_cublaslt_portfolio() or enabled
+        if envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get():
+            enabled = self._maybe_enable_qwen3_drafter_tma() or enabled
+        return enabled
 
     def _maybe_enable_qwen3_verifier_cublaslt_portfolio(self) -> bool:
         """Enable selected target-0 verifier tactics on the exact target worker."""
