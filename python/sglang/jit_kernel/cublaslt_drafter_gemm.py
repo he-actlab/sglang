@@ -28,6 +28,9 @@ DRAFTER_CUBLASLT_MKNS = (
     (128, 2048, 1024),
     (128, 1024, 6144),
     (128, 3072, 1024),
+    # Tied-embedding LM head at draft-extend M=128 (vocab 151936):
+    # discovery-eligible only, deliberately not in the portfolio set.
+    (128, 1024, 151936),
 )
 
 # Exact target-52 portfolio selected for the Qwen3-0.6B drafter. Shapes not
