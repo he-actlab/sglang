@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from sglang.jit_kernel.cutedsl_drafter_tma_gemm import (
     DRAFTER_TMA_GEMM_MKN,
     DRAFTER_TMA_GEMM_MKNS,
+    DRAFTER_TMA_MODEL_BACKEND_BY_MKN,
+    DRAFTER_TMA_MODEL_MKNS,
+    can_run_drafter_tma_model_projection,
     drafter_tma_persistent_gate_up,
     drafter_tma_persistent_projection,
     drafter_tma_single_stage_gate_up,
@@ -30,6 +33,19 @@ _PROJECTION_IDS = [
     "extend-gate-up",
     "extend-down",
 ]
+
+
+def test_drafter_tma_model_policy_preserves_production_per_shape():
+    expected_tma = {
+        (32, 1024, 4096),
+        (32, 1024, 6144),
+    }
+
+    assert set(DRAFTER_TMA_MODEL_BACKEND_BY_MKN) == set(DRAFTER_TMA_GEMM_MKNS)
+    assert set(DRAFTER_TMA_MODEL_MKNS) == expected_tma
+    for shape_mkn in DRAFTER_TMA_GEMM_MKNS:
+        expected = "tma" if shape_mkn in expected_tma else "production"
+        assert DRAFTER_TMA_MODEL_BACKEND_BY_MKN[shape_mkn] == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -116,6 +132,25 @@ def test_drafter_tma_projection_rejects_unsupported_inputs():
     assert unaligned.data_ptr() % 16
     with pytest.raises(ValueError, match="at least 16-byte aligned"):
         drafter_tma_persistent_projection(unaligned, weight)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "shape_mkn",
+    DRAFTER_TMA_GEMM_MKNS,
+    ids=_PROJECTION_IDS,
+)
+def test_drafter_tma_model_predicate_matches_shape_policy(shape_mkn):
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 required")
+
+    m, k, n = shape_mkn
+    activation = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+
+    assert can_run_drafter_tma_model_projection(activation, weight) == (
+        shape_mkn in DRAFTER_TMA_MODEL_MKNS
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

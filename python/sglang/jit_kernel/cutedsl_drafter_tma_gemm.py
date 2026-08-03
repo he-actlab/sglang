@@ -67,6 +67,26 @@ DRAFTER_TMA_GEMM_MKNS = (
     (128, 1024, 6144),
     (128, 3072, 1024),
 )
+# The standalone kernel family remains available for correctness and tuning on
+# all eight shapes.  Model integration is deliberately selective: production
+# linear keeps its per-shape cuBLASLt algorithm everywhere the current TMA
+# mapping has not demonstrated a latency win.  New TMA variants must earn entry
+# into this table independently; a universal fixed-grid dispatch is forbidden.
+DRAFTER_TMA_MODEL_BACKEND_BY_MKN = {
+    (32, 1024, 4096): "tma",
+    (32, 2048, 1024): "production",
+    DRAFTER_TMA_GEMM_MKN: "tma",
+    (32, 3072, 1024): "production",
+    (128, 1024, 4096): "production",
+    (128, 2048, 1024): "production",
+    (128, 1024, 6144): "production",
+    (128, 3072, 1024): "production",
+}
+DRAFTER_TMA_MODEL_MKNS = tuple(
+    shape_mkn
+    for shape_mkn in DRAFTER_TMA_GEMM_MKNS
+    if DRAFTER_TMA_MODEL_BACKEND_BY_MKN[shape_mkn] == "tma"
+)
 _WIDE_TILE_MNK = (32, 64, 64)
 _NARROW_TILE_MNK = (16, 32, 64)
 _TILE_MNK_BY_SHAPE = {
@@ -664,18 +684,40 @@ def can_run_drafter_tma_persistent_projection(
     return torch.cuda.get_device_capability(device_index) == (12, 0)
 
 
-def precompile_drafter_tma_persistent_projections(device_index: int) -> None:
-    """Compile all eight fixed-width projection specializations on ``device``.
+def can_run_drafter_tma_model_projection(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    """Return whether model integration selects TMA for this exact call.
 
-    SGLang calls this after draft-model weights load and before CUDA graph
-    capture. The compiled callables still receive the live activation, weight,
-    output, and current stream at dispatch time.
+    This is intentionally stricter than
+    :func:`can_run_drafter_tma_persistent_projection`: a shape can be a valid
+    standalone TMA tuning target while the model keeps its production linear
+    implementation for that shape.
     """
 
+    if not isinstance(activation, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        return False
+    if activation.ndim != 2 or weight.ndim != 2:
+        return False
+    shape_mkn = (
+        activation.shape[0],
+        activation.shape[1],
+        weight.shape[0],
+    )
+    if DRAFTER_TMA_MODEL_BACKEND_BY_MKN.get(shape_mkn) != "tma":
+        return False
+    return can_run_drafter_tma_persistent_projection(activation, weight)
+
+
+def _precompile_drafter_tma_projections(
+    device_index: int,
+    shapes_mkn: tuple[tuple[int, int, int], ...],
+) -> None:
     if torch.cuda.get_device_capability(device_index) != (12, 0):
         raise RuntimeError("drafter TMA GEMM requires SM120")
     with torch.cuda.device(device_index):
-        for shape_mkn in DRAFTER_TMA_GEMM_MKNS:
+        for shape_mkn in shapes_mkn:
             _compiled_kernel(
                 device_index,
                 shape_mkn,
@@ -683,6 +725,23 @@ def precompile_drafter_tma_persistent_projections(device_index: int) -> None:
                 DRAFTER_TMA_GEMM_PIPELINED_STAGES,
                 DRAFTER_TMA_GEMM_PERSISTENT_WORKERS,
             )
+
+
+def precompile_drafter_tma_model_projections(device_index: int) -> None:
+    """Compile only the TMA shapes selected by the draft-model policy."""
+
+    _precompile_drafter_tma_projections(device_index, DRAFTER_TMA_MODEL_MKNS)
+
+
+def precompile_drafter_tma_persistent_projections(device_index: int) -> None:
+    """Compile all eight standalone projection specializations on ``device``.
+
+    This full-family entry point is retained for correctness tests and per-shape
+    tuning. Model integration calls
+    :func:`precompile_drafter_tma_model_projections` instead.
+    """
+
+    _precompile_drafter_tma_projections(device_index, DRAFTER_TMA_GEMM_MKNS)
 
 
 def _drafter_tma_projection(

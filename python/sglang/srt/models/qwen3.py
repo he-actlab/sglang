@@ -66,13 +66,13 @@ class _Qwen3DrafterTmaDispatch:
 
     def __init__(self, device_index: int) -> None:
         from sglang.jit_kernel.cutedsl_drafter_tma_gemm import (
-            can_run_drafter_tma_persistent_projection,
+            can_run_drafter_tma_model_projection,
             drafter_tma_persistent_projection,
-            precompile_drafter_tma_persistent_projections,
+            precompile_drafter_tma_model_projections,
         )
 
-        precompile_drafter_tma_persistent_projections(device_index)
-        self._can_run = can_run_drafter_tma_persistent_projection
+        precompile_drafter_tma_model_projections(device_index)
+        self._can_run = can_run_drafter_tma_model_projection
         self._run = drafter_tma_persistent_projection
 
     @staticmethod
