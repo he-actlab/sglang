@@ -101,6 +101,13 @@ _EPILOGUE_STAGES = 8
 _ATOM_LAYOUT = (2, 2, 1)
 _MMA_WARPS = 4
 _THREADS_PER_CTA = (_MMA_WARPS + 1) * 32
+# Consumer geometry per MMA warp count: atom layout (m, n, k) warps and the
+# matching tiled-MMA permutation. 8 warps double atom-M coverage for
+# CTA-M-covering tiles.
+_ATOM_LAYOUT_BY_MMA_WARPS = {
+    4: ((2, 2, 1), (32, 32, 16)),
+    8: ((4, 2, 1), (64, 32, 16)),
+}
 
 
 class _DrafterTmaGemm:
@@ -110,9 +117,15 @@ class _DrafterTmaGemm:
         tile_shape_mnk: tuple[int, int, int],
         ab_stages: int,
         worker_limit: int,
+        epilogue_stages: int = _EPILOGUE_STAGES,
+        mma_warps: int = _MMA_WARPS,
     ):
         if not 1 <= ab_stages <= 8:
             raise ValueError(f"unsupported A/B stage count: {ab_stages}")
+        if not 1 <= epilogue_stages <= _EPILOGUE_STAGES:
+            raise ValueError(f"unsupported epilogue stage count: {epilogue_stages}")
+        if mma_warps not in _ATOM_LAYOUT_BY_MMA_WARPS:
+            raise ValueError(f"unsupported MMA warp count: {mma_warps}")
         m, k, n = shape_mkn
         tile_m, tile_n, tile_k = tile_shape_mnk
         if m % tile_m or n % tile_n or k % tile_k:
@@ -129,12 +142,14 @@ class _DrafterTmaGemm:
         self.tile_shape_mnk = tile_shape_mnk
         self.ab_stages = ab_stages
         self.worker_limit = worker_limit
-        self.epilogue_stages = _EPILOGUE_STAGES
+        self.epilogue_stages = epilogue_stages
+        self.mma_warps = mma_warps
+        self.atom_layout, self.mma_permutation = _ATOM_LAYOUT_BY_MMA_WARPS[mma_warps]
         self.acc_dtype = cutlass.Float32
         self.buffer_align_bytes = 1024
         self.epilogue_barrier = pipeline.NamedBarrier(
             barrier_id=2,
-            num_threads=_MMA_WARPS * 32,
+            num_threads=mma_warps * 32,
         )
 
     @cute.jit
@@ -166,8 +181,8 @@ class _DrafterTmaGemm:
         )
         tiled_mma = cute.make_tiled_mma(
             mma_op,
-            cute.make_layout(_ATOM_LAYOUT),
-            permutation_mnk=(32, 32, 16),
+            cute.make_layout(self.atom_layout),
+            permutation_mnk=self.mma_permutation,
         )
 
         a_smem_layout_staged = sm90_utils.make_smem_layout_a(
@@ -259,7 +274,7 @@ class _DrafterTmaGemm:
             tile_scheduler_params,
         ).launch(
             grid=grid,
-            block=(_THREADS_PER_CTA, 1, 1),
+            block=((self.mma_warps + 1) * 32, 1, 1),
             cluster=(1, 1, 1),
             stream=stream,
         )
@@ -328,7 +343,7 @@ class _DrafterTmaGemm:
         mainloop = pipeline.PipelineTmaAsync.create(
             num_stages=self.ab_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, _MMA_WARPS),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.mma_warps),
             tx_count=tma_copy_bytes,
             barrier_storage=storage.mainloop_barriers.data_ptr(),
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
@@ -403,7 +418,7 @@ class _DrafterTmaGemm:
             self.ab_stages,
         )
 
-        if warp_idx < _MMA_WARPS:
+        if warp_idx < self.mma_warps:
             copy_atom_a = cute.make_copy_atom(
                 cute.nvgpu.warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 4),
                 self.a_dtype,
@@ -497,7 +512,7 @@ class _DrafterTmaGemm:
                 store_pipeline = pipeline.PipelineTmaStore.create(
                     num_stages=self.epilogue_stages,
                     producer_group=pipeline.CooperativeGroup(
-                        pipeline.Agent.Thread, _MMA_WARPS * 32
+                        pipeline.Agent.Thread, self.mma_warps * 32
                     ),
                 )
 
@@ -529,7 +544,7 @@ class _DrafterTmaGemm:
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
 
-        elif warp_idx == _MMA_WARPS:
+        elif warp_idx == self.mma_warps:
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 tiled_a = tma_gmem_a[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
@@ -572,6 +587,8 @@ def _compiled_kernel(
     tile_shape_mnk: tuple[int, int, int],
     ab_stages: int,
     worker_limit: int,
+    epilogue_stages: int = _EPILOGUE_STAGES,
+    mma_warps: int = _MMA_WARPS,
 ):
     capability = torch.cuda.get_device_capability(device_index)
     cache_key = (
@@ -581,6 +598,8 @@ def _compiled_kernel(
         tile_shape_mnk,
         ab_stages,
         worker_limit,
+        epilogue_stages,
+        mma_warps,
     )
     if cache_key not in _compiled:
         m, k, n = shape_mkn
@@ -601,6 +620,8 @@ def _compiled_kernel(
                     tile_shape_mnk,
                     ab_stages,
                     worker_limit,
+                    epilogue_stages,
+                    mma_warps,
                 ),
                 _as_cute_3d(activation),
                 _as_cute_3d(weight),
@@ -748,6 +769,8 @@ def _drafter_tma_projection(
     tile_shape_mnk: tuple[int, int, int],
     ab_stages: int,
     worker_limit: int,
+    epilogue_stages: int = _EPILOGUE_STAGES,
+    mma_warps: int = _MMA_WARPS,
 ) -> torch.Tensor:
     device_index = _validate_inputs(activation, weight, shape_mkn)
     m, _, n = shape_mkn
@@ -760,6 +783,8 @@ def _drafter_tma_projection(
         tile_shape_mnk,
         ab_stages,
         worker_limit,
+        epilogue_stages,
+        mma_warps,
     )(
         _as_cute_3d(activation),
         _as_cute_3d(weight),
@@ -826,6 +851,8 @@ def drafter_tma_shape_projection(
     tile_shape_mnk: tuple[int, int, int],
     ab_stages: int,
     worker_limit: int,
+    epilogue_stages: int = _EPILOGUE_STAGES,
+    mma_warps: int = _MMA_WARPS,
 ) -> torch.Tensor:
     """Run a supported projection under an explicit per-shape configuration.
 
@@ -854,6 +881,8 @@ def drafter_tma_shape_projection(
         tuple(tile_shape_mnk),
         ab_stages,
         worker_limit,
+        epilogue_stages,
+        mma_warps,
     )
 
 
