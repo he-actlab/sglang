@@ -86,6 +86,9 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
 
+    from sglang.srt.layers.attention.flashinfer_decode_width import (
+        fast_decode_plan_colo,
+    )
     from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
 
     # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
@@ -679,6 +682,39 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.spec_pdmux_colocated_reserve,
                 )
 
+        # Design-FlashInferDecodeWidth (TODO-47): sm_count_override for the
+        # fa2 CUDA-cores decode plans of the draft worker, through the
+        # fork-vendored plan-only module. The tensor-cores decode path rides
+        # the prefill template (and TODO-8's reserve); the stock CUDA-cores
+        # plan has no width argument at all.
+        self.spec_pdmux_decode_sm_width = 0
+        decode_width_mode = envs.SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH.get()
+        if (
+            decode_width_mode > 0
+            and self.enable_spec_pdmux
+            and model_runner.is_draft_worker
+        ):
+            if self.decode_use_tensor_cores:
+                logger.warning(
+                    "SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH requested but "
+                    "decode uses tensor cores (prefill template); the knob "
+                    "only covers the CUDA-cores decode plan and stays off"
+                )
+            else:
+                from sglang.srt.multiplex.pdmux_context import (
+                    get_spec_sm_allocated_split,
+                )
+
+                allocated = get_spec_sm_allocated_split()
+                if allocated is not None:
+                    self.spec_pdmux_decode_sm_width = allocated[1]
+                    logger.info(
+                        "FlashInfer decode width armed: draft worker "
+                        "allocated SMALL width=%d (fa2 CUDA-cores decode "
+                        "plans, sm_count_override)",
+                        self.spec_pdmux_decode_sm_width,
+                    )
+
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
@@ -704,14 +740,24 @@ class FlashInferAttnBackend(AttentionBackend):
                         backend=self.prefill_backend,
                     )
                 )
-            self.decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    backend=self.decode_backend,
-                    use_tensor_cores=self.decode_use_tensor_cores,
+            decode_wrapper_cls = BatchDecodeWithPagedKVCacheWrapper
+            if self.spec_pdmux_decode_sm_width > 0:
+                from sglang.srt.layers.attention.flashinfer_decode_width import (
+                    WidthAwareDecodeWrapper,
                 )
+
+                decode_wrapper_cls = WidthAwareDecodeWrapper
+            decode_wrapper = decode_wrapper_cls(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_tensor_cores=self.decode_use_tensor_cores,
             )
+            if self.spec_pdmux_decode_sm_width > 0:
+                decode_wrapper._spec_pdmux_decode_sm_width = (
+                    self.spec_pdmux_decode_sm_width
+                )
+            self.decode_wrappers.append(decode_wrapper)
 
         # Create indices updater
         if not skip_prefill:
@@ -953,7 +999,13 @@ class FlashInferAttnBackend(AttentionBackend):
             # fast_decode_plan needs _cached_module from the initial begin_forward
             # above, so install it only after that first plan has run.
             for w in self.decode_cuda_graph_metadata[bs]:
-                w.begin_forward = partial(fast_decode_plan, w)
+                if getattr(w, "_spec_pdmux_decode_sm_width", 0) > 0:
+                    # Armed wrappers must also plan armed on replays, or the
+                    # captured grid and the replay partition diverge
+                    # (Design-FlashInferDecodeWidth, TODO-47).
+                    w.begin_forward = partial(fast_decode_plan_colo, w)
+                else:
+                    w.begin_forward = partial(fast_decode_plan, w)
 
         if (
             in_capture
@@ -1134,8 +1186,15 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
-        return [
-            BatchDecodeWithPagedKVCacheWrapper(
+        decode_wrapper_cls = BatchDecodeWithPagedKVCacheWrapper
+        if self.spec_pdmux_decode_sm_width > 0:
+            from sglang.srt.layers.attention.flashinfer_decode_width import (
+                WidthAwareDecodeWrapper,
+            )
+
+            decode_wrapper_cls = WidthAwareDecodeWrapper
+        wrappers = [
+            decode_wrapper_cls(
                 self.workspace_buffer,
                 "NHD",
                 backend=self.decode_backend,
@@ -1147,6 +1206,12 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for i in range(self.num_wrappers)
         ]
+        if self.spec_pdmux_decode_sm_width > 0:
+            for wrapper in wrappers:
+                wrapper._spec_pdmux_decode_sm_width = (
+                    self.spec_pdmux_decode_sm_width
+                )
+        return wrappers
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
@@ -1631,10 +1696,9 @@ class FlashInferIndicesUpdaterDecode:
 
         # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
         # by checking if it's a partial function with fast_decode_plan as the func
-        wrapper_uses_fast_decode_plan = (
-            hasattr(wrapper.begin_forward, "func")
-            and wrapper.begin_forward.func == fast_decode_plan
-        )
+        wrapper_uses_fast_decode_plan = hasattr(
+            wrapper.begin_forward, "func"
+        ) and wrapper.begin_forward.func in (fast_decode_plan, fast_decode_plan_colo)
 
         if self.attn_backend.enable_spec_pdmux:
             # spec-pdmux M2.6: pinned staging guard (see plan_pinned_ws_rotate)

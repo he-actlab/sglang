@@ -763,6 +763,14 @@ class Envs:
     # verify plans (allocated LARGE). Draft decode has no plan-level hook and
     # is unaffected. Experimental and default-off.
     SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH = EnvInt(0)
+    # Design-FlashInferDecodeWidth (TODO-47): give the fa2 CUDA-cores decode
+    # planner the realized green-context SM width via the fork-vendored
+    # plan-only module (sm_count_override). The stock decode plan has no
+    # width argument and splits KV for the full die. 0 = off (stock
+    # planning); 1 = arm the draft worker's decode plans with the allocated
+    # SMALL width. No effect when decode uses tensor cores (that path rides
+    # the prefill template and TODO-8's knob). Experimental and default-off.
+    SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH = EnvInt(0)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
