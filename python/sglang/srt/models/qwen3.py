@@ -269,7 +269,11 @@ def _qwen3_drafter_projection_or_linear(
     activation: torch.Tensor,
     **linear_kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if dispatch is not None:
+    # Dispatch predicates read data_ptr alignment and are not Dynamo-traceable;
+    # torch.compile regions (the target's tc_piecewise prefill graphs) always
+    # take the production linear, which keeps the portfolio surface confined to
+    # the plainly captured decode/verify graphs it was selected on.
+    if dispatch is not None and not torch.compiler.is_compiling():
         output = dispatch(linear, activation)
         if output is not None:
             return output, None
