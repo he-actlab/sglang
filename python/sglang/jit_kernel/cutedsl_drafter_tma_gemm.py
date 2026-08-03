@@ -111,17 +111,14 @@ class _DrafterTmaGemm:
         ab_stages: int,
         worker_limit: int,
     ):
-        if ab_stages not in (
-            DRAFTER_TMA_GEMM_SINGLE_STAGE,
-            DRAFTER_TMA_GEMM_PIPELINED_STAGES,
-        ):
+        if not 1 <= ab_stages <= 8:
             raise ValueError(f"unsupported A/B stage count: {ab_stages}")
-        if any(
-            problem_extent % tile_extent
-            for problem_extent, tile_extent in zip(shape_mkn, tile_shape_mnk)
-        ):
+        m, k, n = shape_mkn
+        tile_m, tile_n, tile_k = tile_shape_mnk
+        if m % tile_m or n % tile_n or k % tile_k:
             raise ValueError(
-                f"shape {shape_mkn} must be divisible by tile {tile_shape_mnk}"
+                f"shape (M,K,N)={shape_mkn} must be divisible by tile "
+                f"(m,n,k)={tile_shape_mnk}"
             )
         output_tiles = (shape_mkn[0] // tile_shape_mnk[0]) * (
             shape_mkn[2] // tile_shape_mnk[1]
@@ -819,6 +816,44 @@ def drafter_tma_persistent_projection(
         tile_shape_mnk,
         DRAFTER_TMA_GEMM_PIPELINED_STAGES,
         DRAFTER_TMA_GEMM_PERSISTENT_WORKERS,
+    )
+
+
+def drafter_tma_shape_projection(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    tile_shape_mnk: tuple[int, int, int],
+    ab_stages: int,
+    worker_limit: int,
+) -> torch.Tensor:
+    """Run a supported projection under an explicit per-shape configuration.
+
+    Design-TMAPortfolio Stage-2 tuning entry: the caller owns the CTA tile,
+    pipeline depth, and worker count for one exact shape. The universal
+    fixed configuration of :func:`drafter_tma_persistent_projection` is not
+    consulted. Configurations that exceed shared memory fail at compile
+    time; the sweep treats that as config rejection.
+    """
+
+    if activation.ndim != 2 or weight.ndim != 2:
+        raise ValueError("activation and weight must be rank-2 tensors")
+    if activation.shape[1] != weight.shape[1]:
+        raise ValueError("activation and weight K dimensions must match")
+    shape_mkn = (
+        activation.shape[0],
+        activation.shape[1],
+        weight.shape[0],
+    )
+    if shape_mkn not in _TILE_MNK_BY_SHAPE:
+        raise ValueError(f"unsupported drafter TMA GEMM shape: {shape_mkn}")
+    return _drafter_tma_projection(
+        activation,
+        weight,
+        shape_mkn,
+        tuple(tile_shape_mnk),
+        ab_stages,
+        worker_limit,
     )
 
 
