@@ -66,6 +66,11 @@ DRAFTER_TMA_GEMM_MKNS = (
     (128, 2048, 1024),
     (128, 1024, 6144),
     (128, 3072, 1024),
+    # Tied-embedding LM head at draft-extend M=128 (vocab 151936): the widest
+    # streaming shape in the drafter; occupancy-bound at 52 SMs and outside
+    # cuBLASLt's tactic space (row-39 census), so TMA is its only remaining
+    # mechanism.
+    (128, 1024, 151936),
 )
 # The standalone kernel family remains available for correctness and tuning on
 # all eight shapes.  Model integration is deliberately selective: production
@@ -81,6 +86,7 @@ DRAFTER_TMA_MODEL_BACKEND_BY_MKN = {
     (128, 2048, 1024): "production",
     (128, 1024, 6144): "production",
     (128, 3072, 1024): "production",
+    (128, 1024, 151936): "production",
 }
 DRAFTER_TMA_MODEL_MKNS = tuple(
     shape_mkn
