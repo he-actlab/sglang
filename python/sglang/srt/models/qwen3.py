@@ -67,13 +67,13 @@ class _Qwen3DrafterTmaDispatch:
     def __init__(self, device_index: int) -> None:
         from sglang.jit_kernel.cutedsl_drafter_tma_gemm import (
             can_run_drafter_tma_model_projection,
-            drafter_tma_persistent_projection,
+            drafter_tma_model_projection,
             precompile_drafter_tma_model_projections,
         )
 
         precompile_drafter_tma_model_projections(device_index)
         self._can_run = can_run_drafter_tma_model_projection
-        self._run = drafter_tma_persistent_projection
+        self._run = drafter_tma_model_projection
 
     @staticmethod
     def supports_linear(linear: nn.Module) -> bool:
@@ -261,6 +261,35 @@ class _Qwen3VerifierCublasLtDispatch(_Qwen3CublasLtPortfolioDispatch):
 
 
 _DrafterProjectionDispatch = Callable[[nn.Module, torch.Tensor], Optional[torch.Tensor]]
+
+
+class _Qwen3ChainedProjectionDispatch:
+    """Try projection dispatches in priority order; first non-None wins.
+
+    Composition per exact call is TMA specialization -> retained cuBLASLt
+    tactic -> production linear (the fallthrough when every dispatch
+    returns None).
+    """
+
+    def __init__(self, *dispatches: _DrafterProjectionDispatch) -> None:
+        flat: list = []
+        for dispatch in dispatches:
+            if dispatch is None:
+                continue
+            if isinstance(dispatch, _Qwen3ChainedProjectionDispatch):
+                flat.extend(dispatch._dispatches)
+            else:
+                flat.append(dispatch)
+        self._dispatches = tuple(flat)
+
+    def __call__(
+        self, linear: nn.Module, activation: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        for dispatch in self._dispatches:
+            output = dispatch(linear, activation)
+            if output is not None:
+                return output
+        return None
 
 
 def _qwen3_drafter_projection_or_linear(
@@ -815,11 +844,21 @@ class Qwen3Model(Qwen2Model):
 
     @staticmethod
     def _install_drafter_projection_dispatch(
-        layers: List[Qwen3DecoderLayer], dispatch: _DrafterProjectionDispatch
+        layers: List[Qwen3DecoderLayer],
+        dispatch: _DrafterProjectionDispatch,
+        prepend: bool = False,
     ) -> None:
         for layer in layers:
-            layer.self_attn.set_drafter_projection_dispatch(dispatch)
-            layer.mlp.set_drafter_projection_dispatch(dispatch)
+            for module in (layer.self_attn, layer.mlp):
+                existing = module._drafter_projection_dispatch
+                combined = (
+                    dispatch
+                    if existing is None
+                    else _Qwen3ChainedProjectionDispatch(
+                        *((dispatch, existing) if prepend else (existing, dispatch))
+                    )
+                )
+                module.set_drafter_projection_dispatch(combined)
 
     def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
         """Install TMA dispatch only for the exact Qwen3-0.6B TP1 model."""
@@ -830,7 +869,9 @@ class Qwen3Model(Qwen2Model):
         if layers is None:
             return False
         dispatch = _Qwen3DrafterTmaDispatch(device_index)
-        self._install_drafter_projection_dispatch(layers, dispatch)
+        # TMA specializations take priority over any installed cuBLASLt
+        # portfolio; unsupported shapes fall through to it, then production.
+        self._install_drafter_projection_dispatch(layers, dispatch, prepend=True)
         return True
 
     def enable_qwen3_drafter_cublaslt_portfolio(self, device_index: int) -> bool:

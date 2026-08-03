@@ -80,13 +80,21 @@ DRAFTER_TMA_GEMM_MKNS = (
 DRAFTER_TMA_MODEL_BACKEND_BY_MKN = {
     (32, 1024, 4096): "tma",
     (32, 2048, 1024): "production",
-    DRAFTER_TMA_GEMM_MKN: "tma",
+    DRAFTER_TMA_GEMM_MKN: "production",
     (32, 3072, 1024): "production",
-    (128, 1024, 4096): "production",
+    (128, 1024, 4096): "tma",
     (128, 2048, 1024): "production",
     (128, 1024, 6144): "production",
     (128, 3072, 1024): "production",
     (128, 1024, 151936): "production",
+}
+# Stage-2 per-shape winners (NCU-gated: >=5% p50 and >=15% DRAM read
+# bandwidth vs each shape's retained control): (tile_mnk, ab_stages,
+# epilogue_stages, mma_warps, worker_limit). Shapes absent here keep their
+# cuBLASLt tactic or production linear.
+DRAFTER_TMA_MODEL_CONFIG_BY_MKN = {
+    (32, 1024, 4096): ((32, 32, 128), 5, 8, 4, 52),
+    (128, 1024, 4096): ((64, 64, 64), 5, 2, 8, 52),
 }
 DRAFTER_TMA_MODEL_MKNS = tuple(
     shape_mkn
@@ -132,6 +140,19 @@ class _DrafterTmaGemm:
             raise ValueError(f"unsupported epilogue stage count: {epilogue_stages}")
         if mma_warps not in _ATOM_LAYOUT_BY_MMA_WARPS:
             raise ValueError(f"unsupported MMA warp count: {mma_warps}")
+        # Empirically verified correctness envelope (Stage-2 sweep): the
+        # 8-warp (4,2,1) geometry is wrong outside tile_m>=64, tile_n<=64;
+        # the 4-warp (2,2,1) geometry is wrong at tile_m>64. Reject rather
+        # than silently produce wrong numbers.
+        if mma_warps == 8 and (tile_shape_mnk[0] < 64 or tile_shape_mnk[1] > 64):
+            raise ValueError(
+                f"8-warp geometry requires tile_m>=64 and tile_n<=64, got "
+                f"{tile_shape_mnk}"
+            )
+        if mma_warps == 4 and tile_shape_mnk[0] > 64:
+            raise ValueError(
+                f"4-warp geometry requires tile_m<=64, got {tile_shape_mnk}"
+            )
         m, k, n = shape_mkn
         tile_m, tile_n, tile_k = tile_shape_mnk
         if m % tile_m or n % tile_n or k % tile_k:
@@ -752,9 +773,52 @@ def _precompile_drafter_tma_projections(
 
 
 def precompile_drafter_tma_model_projections(device_index: int) -> None:
-    """Compile only the TMA shapes selected by the draft-model policy."""
+    """Compile only the TMA shapes selected by the draft-model policy,
+    each under its Stage-2 winner configuration."""
 
-    _precompile_drafter_tma_projections(device_index, DRAFTER_TMA_MODEL_MKNS)
+    if torch.cuda.get_device_capability(device_index) != (12, 0):
+        raise RuntimeError("drafter TMA GEMM requires SM120")
+    with torch.cuda.device(device_index):
+        for shape_mkn in DRAFTER_TMA_MODEL_MKNS:
+            tile, ab_stages, epilogue_stages, mma_warps, worker_limit = (
+                DRAFTER_TMA_MODEL_CONFIG_BY_MKN[shape_mkn]
+            )
+            _compiled_kernel(
+                device_index,
+                shape_mkn,
+                tile,
+                ab_stages,
+                worker_limit,
+                epilogue_stages,
+                mma_warps,
+            )
+
+
+def drafter_tma_model_projection(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run a model-selected shape under its Stage-2 winner configuration."""
+
+    shape_mkn = (
+        activation.shape[0],
+        activation.shape[1],
+        weight.shape[0],
+    )
+    config = DRAFTER_TMA_MODEL_CONFIG_BY_MKN.get(shape_mkn)
+    if config is None:
+        raise ValueError(f"no model TMA configuration for shape {shape_mkn}")
+    tile, ab_stages, epilogue_stages, mma_warps, worker_limit = config
+    return _drafter_tma_projection(
+        activation,
+        weight,
+        shape_mkn,
+        tile,
+        ab_stages,
+        worker_limit,
+        epilogue_stages,
+        mma_warps,
+    )
 
 
 def precompile_drafter_tma_persistent_projections(device_index: int) -> None:

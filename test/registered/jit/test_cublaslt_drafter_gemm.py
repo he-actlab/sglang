@@ -38,6 +38,7 @@ _SHAPE_IDS = [
     "extend-output",
     "extend-gate-up",
     "extend-down",
+    "extend-lm-head",
 ]
 
 
@@ -481,6 +482,9 @@ def test_qwen3_drafter_portfolio_dispatch_captures_allocated_outputs():
         (1024, 2048),
         (6144, 1024),
         (1024, 3072),
+        # Discovery-only LM head shape: the dispatch must decline it (not in
+        # the portfolio), exercising the production fallthrough.
+        (151936, 1024),
     )
     linears = {}
     for n, k in weight_shapes:
