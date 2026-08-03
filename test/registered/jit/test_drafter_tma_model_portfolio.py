@@ -33,7 +33,8 @@ def _require_sm120():
 
 
 def test_every_model_tma_shape_has_a_winner_configuration():
-    assert DRAFTER_TMA_MODEL_MKNS == ((32, 1024, 4096), (128, 1024, 4096))
+    # qkv128 won standalone but regressed in the model A/B; only qkv32 ships.
+    assert DRAFTER_TMA_MODEL_MKNS == ((32, 1024, 4096),)
     for shape in DRAFTER_TMA_MODEL_MKNS:
         assert shape in DRAFTER_TMA_MODEL_CONFIG_BY_MKN
         assert DRAFTER_TMA_MODEL_BACKEND_BY_MKN[shape] == "tma"

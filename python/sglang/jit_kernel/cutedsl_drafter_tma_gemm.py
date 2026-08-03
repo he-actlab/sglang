@@ -82,7 +82,7 @@ DRAFTER_TMA_MODEL_BACKEND_BY_MKN = {
     (32, 2048, 1024): "production",
     DRAFTER_TMA_GEMM_MKN: "production",
     (32, 3072, 1024): "production",
-    (128, 1024, 4096): "tma",
+    (128, 1024, 4096): "production",
     (128, 2048, 1024): "production",
     (128, 1024, 6144): "production",
     (128, 3072, 1024): "production",
@@ -94,7 +94,9 @@ DRAFTER_TMA_MODEL_BACKEND_BY_MKN = {
 # cuBLASLt tactic or production linear.
 DRAFTER_TMA_MODEL_CONFIG_BY_MKN = {
     (32, 1024, 4096): ((32, 32, 128), 5, 8, 4, 52),
-    (128, 1024, 4096): ((64, 64, 64), 5, 2, 8, 52),
+    # qkv128 ((64, 64, 64), 5, 2, 8, 52) won standalone (+16.8% p50, +19.9%
+    # NCU read bw) but REGRESSED draft_extend +0.35% in the dt0-vs-dt1 model
+    # A/B; it retains the cuBLASLt portfolio pending a mechanism explanation.
 }
 DRAFTER_TMA_MODEL_MKNS = tuple(
     shape_mkn
