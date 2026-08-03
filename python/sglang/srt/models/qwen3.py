@@ -1,6 +1,6 @@
 # Adapted from qwen2.py
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -106,8 +106,122 @@ class _Qwen3DrafterTmaDispatch:
         return self._run(activation, weight)
 
 
-def _qwen3_drafter_tma_or_linear(
-    dispatch: Optional[_Qwen3DrafterTmaDispatch],
+class _Qwen3DrafterCublasLtDispatch:
+    """Fresh-process cached target-52 tactics for selected draft projections."""
+
+    _SM_COUNT_TARGET = 52
+
+    def __init__(
+        self, device_index: int, representative_linears: Tuple[nn.Module, ...]
+    ) -> None:
+        # Keep this import after the worker fork. The helper owns a process-local
+        # native handle and rejects inherited opaque algorithms.
+        from sglang.jit_kernel.cublaslt_drafter_gemm import (
+            DRAFTER_CUBLASLT_PORTFOLIO_MKNS,
+            MAX_ALGORITHMS,
+            allocate_workspace,
+            discover_algorithms,
+            matmul,
+            select_drafter_portfolio_algorithm,
+        )
+
+        weights = {
+            (int(linear.weight.shape[0]), int(linear.weight.shape[1])): linear.weight
+            for linear in representative_linears
+        }
+        self._workspace = allocate_workspace(device_index)
+        if self._workspace.data_ptr() % 256:
+            raise RuntimeError("drafter cuBLASLt workspace must be 256-byte aligned")
+        self._algorithms = {}
+        self._matmul = matmul
+        for shape_mkn in DRAFTER_CUBLASLT_PORTFOLIO_MKNS:
+            m, k, n = shape_mkn
+            weight = weights.get((n, k))
+            if weight is None:
+                raise RuntimeError(
+                    f"missing representative weight for cuBLASLt shape {shape_mkn}"
+                )
+            activation = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
+            if activation.data_ptr() % 256:
+                raise RuntimeError(
+                    "drafter cuBLASLt discovery activation must be 256-byte aligned"
+                )
+            candidates = discover_algorithms(
+                activation,
+                weight,
+                sm_count_target=self._SM_COUNT_TARGET,
+                top_n=MAX_ALGORITHMS,
+                workspace=self._workspace,
+            )
+            algorithm = select_drafter_portfolio_algorithm(shape_mkn, candidates)
+            # Exercise the run path once before any CUDA-graph warmup/capture.
+            matmul(
+                activation,
+                weight,
+                algorithm=algorithm,
+                sm_count_target=self._SM_COUNT_TARGET,
+                workspace=self._workspace,
+            )
+            self._algorithms[shape_mkn] = algorithm
+        torch.cuda.current_stream(device_index).synchronize()
+
+    @staticmethod
+    def supports_linear(linear: nn.Module) -> bool:
+        weight = getattr(linear, "weight", None)
+        return bool(
+            getattr(linear, "tp_size", None) == 1
+            and isinstance(
+                getattr(linear, "quant_method", None), UnquantizedLinearMethod
+            )
+            and getattr(linear, "bias", None) is None
+            and not getattr(linear, "gather_output", False)
+            and getattr(linear, "input_is_parallel", True)
+            and not getattr(linear, "use_dp_attention_reduce", False)
+            and isinstance(weight, torch.Tensor)
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+            and weight.data_ptr() % 256 == 0
+        )
+
+    def __call__(
+        self, linear: nn.Module, activation: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not self.supports_linear(linear):
+            return None
+        weight = linear.weight
+        if (
+            activation.ndim != 2
+            or not activation.is_cuda
+            or activation.device != weight.device
+            or activation.dtype != torch.bfloat16
+            or not activation.is_contiguous()
+            or activation.data_ptr() % 256
+        ):
+            return None
+        shape_mkn = (
+            int(activation.shape[0]),
+            int(activation.shape[1]),
+            int(weight.shape[0]),
+        )
+        algorithm = self._algorithms.get(shape_mkn)
+        if algorithm is None:
+            return None
+        return self._matmul(
+            activation,
+            weight,
+            algorithm=algorithm,
+            sm_count_target=self._SM_COUNT_TARGET,
+            workspace=self._workspace,
+        )
+
+
+_DrafterProjectionDispatch = Callable[[nn.Module, torch.Tensor], Optional[torch.Tensor]]
+
+
+def _qwen3_drafter_projection_or_linear(
+    dispatch: Optional[_DrafterProjectionDispatch],
     linear: nn.Module,
     activation: torch.Tensor,
     **linear_kwargs,
@@ -119,8 +233,12 @@ def _qwen3_drafter_tma_or_linear(
     return linear(activation, **linear_kwargs)
 
 
+# Compatibility alias for the earlier private TMA-only seam.
+_qwen3_drafter_tma_or_linear = _qwen3_drafter_projection_or_linear
+
+
 class Qwen3MLP(Qwen2MLP):
-    """Qwen3-local MLP with an optional per-instance drafter TMA seam."""
+    """Qwen3-local MLP with an optional per-instance projection-dispatch seam."""
 
     def __init__(
         self,
@@ -137,10 +255,15 @@ class Qwen3MLP(Qwen2MLP):
             quant_config=quant_config,
             prefix=prefix,
         )
-        self._drafter_tma_dispatch: Optional[_Qwen3DrafterTmaDispatch] = None
+        self._drafter_projection_dispatch: Optional[_DrafterProjectionDispatch] = None
+
+    def set_drafter_projection_dispatch(
+        self, dispatch: _DrafterProjectionDispatch
+    ) -> None:
+        self._drafter_projection_dispatch = dispatch
 
     def set_drafter_tma_dispatch(self, dispatch: _Qwen3DrafterTmaDispatch) -> None:
-        self._drafter_tma_dispatch = dispatch
+        self.set_drafter_projection_dispatch(dispatch)
 
     def forward(
         self,
@@ -150,14 +273,14 @@ class Qwen3MLP(Qwen2MLP):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
-        gate_up, _ = _qwen3_drafter_tma_or_linear(
-            self._drafter_tma_dispatch,
+        gate_up, _ = _qwen3_drafter_projection_or_linear(
+            self._drafter_projection_dispatch,
             self.gate_up_proj,
             x,
         )
         x = self.act_fn(gate_up)
-        x, _ = _qwen3_drafter_tma_or_linear(
-            self._drafter_tma_dispatch,
+        x, _ = _qwen3_drafter_projection_or_linear(
+            self._drafter_projection_dispatch,
             self.down_proj,
             x,
             forward_batch=forward_batch,
@@ -260,7 +383,7 @@ class Qwen3Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
-        self._drafter_tma_dispatch: Optional[_Qwen3DrafterTmaDispatch] = None
+        self._drafter_projection_dispatch: Optional[_DrafterProjectionDispatch] = None
 
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
@@ -275,12 +398,17 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
+    def set_drafter_projection_dispatch(
+        self, dispatch: _DrafterProjectionDispatch
+    ) -> None:
+        self._drafter_projection_dispatch = dispatch
+
     def set_drafter_tma_dispatch(self, dispatch: _Qwen3DrafterTmaDispatch) -> None:
-        self._drafter_tma_dispatch = dispatch
+        self.set_drafter_projection_dispatch(dispatch)
 
     def forward_prepare_native(self, positions, hidden_states):
-        qkv, _ = _qwen3_drafter_tma_or_linear(
-            self._drafter_tma_dispatch,
+        qkv, _ = _qwen3_drafter_projection_or_linear(
+            self._drafter_projection_dispatch,
             self.qkv_proj,
             hidden_states,
         )
@@ -416,8 +544,8 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
-        output, _ = _qwen3_drafter_tma_or_linear(
-            self._drafter_tma_dispatch,
+        output, _ = _qwen3_drafter_projection_or_linear(
+            self._drafter_projection_dispatch,
             self.o_proj,
             attn_output,
         )
@@ -565,9 +693,11 @@ class Qwen3Model(Qwen2Model):
             alt_stream=alt_stream,
         )
 
-    def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
-        """Install TMA dispatch only for the exact Qwen3-0.6B TP1 model."""
-
+    def _eligible_qwen3_drafter_layers(
+        self,
+        device_index: int,
+        supports_linear: Callable[[nn.Module], bool],
+    ) -> Optional[List[Qwen3DecoderLayer]]:
         if (
             self.config.hidden_size != 1024
             or self.config.intermediate_size != 3072
@@ -575,7 +705,7 @@ class Qwen3Model(Qwen2Model):
             or self.start_layer != 0
             or self.end_layer != 28
         ):
-            return False
+            return None
 
         expected_weight_shapes = (
             (4096, 1024),
@@ -583,10 +713,10 @@ class Qwen3Model(Qwen2Model):
             (6144, 1024),
             (1024, 3072),
         )
-        layer_projections = []
+        eligible_layers = []
         for layer in self.layers:
             if not isinstance(layer, Qwen3DecoderLayer):
-                return False
+                return None
             projections = (
                 layer.self_attn.qkv_proj,
                 layer.self_attn.o_proj,
@@ -597,19 +727,51 @@ class Qwen3Model(Qwen2Model):
                 tuple(tuple(item.weight.shape) for item in projections)
                 != expected_weight_shapes
             ):
-                return False
-            if not all(
-                _Qwen3DrafterTmaDispatch.supports_linear(item) for item in projections
-            ):
-                return False
+                return None
+            if not all(supports_linear(item) for item in projections):
+                return None
             if any(item.weight.device.index != device_index for item in projections):
-                return False
-            layer_projections.append(layer)
+                return None
+            eligible_layers.append(layer)
+        return eligible_layers if len(eligible_layers) == 28 else None
 
+    @staticmethod
+    def _install_drafter_projection_dispatch(
+        layers: List[Qwen3DecoderLayer], dispatch: _DrafterProjectionDispatch
+    ) -> None:
+        for layer in layers:
+            layer.self_attn.set_drafter_projection_dispatch(dispatch)
+            layer.mlp.set_drafter_projection_dispatch(dispatch)
+
+    def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
+        """Install TMA dispatch only for the exact Qwen3-0.6B TP1 model."""
+
+        layers = self._eligible_qwen3_drafter_layers(
+            device_index, _Qwen3DrafterTmaDispatch.supports_linear
+        )
+        if layers is None:
+            return False
         dispatch = _Qwen3DrafterTmaDispatch(device_index)
-        for layer in layer_projections:
-            layer.self_attn.set_drafter_tma_dispatch(dispatch)
-            layer.mlp.set_drafter_tma_dispatch(dispatch)
+        self._install_drafter_projection_dispatch(layers, dispatch)
+        return True
+
+    def enable_qwen3_drafter_cublaslt_portfolio(self, device_index: int) -> bool:
+        """Install selected target-52 tactics for the exact drafter model."""
+
+        layers = self._eligible_qwen3_drafter_layers(
+            device_index, _Qwen3DrafterCublasLtDispatch.supports_linear
+        )
+        if layers is None:
+            return False
+        first = layers[0]
+        representative_linears = (
+            first.self_attn.qkv_proj,
+            first.self_attn.o_proj,
+            first.mlp.gate_up_proj,
+            first.mlp.down_proj,
+        )
+        dispatch = _Qwen3DrafterCublasLtDispatch(device_index, representative_linears)
+        self._install_drafter_projection_dispatch(layers, dispatch)
         return True
 
 
@@ -671,6 +833,9 @@ class Qwen3ForCausalLM(nn.Module):
 
     def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
         return self.model.enable_qwen3_drafter_tma(device_index)
+
+    def enable_qwen3_drafter_cublaslt_portfolio(self, device_index: int) -> bool:
+        return self.model.enable_qwen3_drafter_cublaslt_portfolio(device_index)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()

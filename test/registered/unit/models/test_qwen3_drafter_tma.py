@@ -92,12 +92,12 @@ class Qwen3DrafterTmaDispatchTests(CustomTestCase):
                 self.self_attn = SimpleNamespace(
                     qkv_proj=projection((4096, 1024)),
                     o_proj=projection((1024, 2048)),
-                    set_drafter_tma_dispatch=Mock(),
+                    set_drafter_projection_dispatch=Mock(),
                 )
                 self.mlp = SimpleNamespace(
                     gate_up_proj=projection((6144, 1024)),
                     down_proj=projection((1024, 3072)),
-                    set_drafter_tma_dispatch=Mock(),
+                    set_drafter_projection_dispatch=Mock(),
                 )
 
         model = SimpleNamespace(
@@ -110,6 +110,12 @@ class Qwen3DrafterTmaDispatchTests(CustomTestCase):
             end_layer=28,
             layers=[FakeLayer() for _ in range(28)],
         )
+        model._eligible_qwen3_drafter_layers = lambda device_index, supports_linear: Qwen3Model._eligible_qwen3_drafter_layers(
+            model, device_index, supports_linear
+        )
+        model._install_drafter_projection_dispatch = (
+            Qwen3Model._install_drafter_projection_dispatch
+        )
         with (
             patch("sglang.srt.models.qwen3.Qwen3DecoderLayer", FakeLayer),
             patch("sglang.srt.models.qwen3._Qwen3DrafterTmaDispatch", FakeDispatch),
@@ -120,8 +126,10 @@ class Qwen3DrafterTmaDispatchTests(CustomTestCase):
         self.assertIsNotNone(dispatch)
         self.assertEqual(dispatch.device_index, 0)
         for layer in model.layers:
-            layer.self_attn.set_drafter_tma_dispatch.assert_called_once_with(dispatch)
-            layer.mlp.set_drafter_tma_dispatch.assert_called_once_with(dispatch)
+            layer.self_attn.set_drafter_projection_dispatch.assert_called_once_with(
+                dispatch
+            )
+            layer.mlp.set_drafter_projection_dispatch.assert_called_once_with(dispatch)
 
 
 class ModelRunnerQwen3DrafterTmaRoleTests(CustomTestCase):

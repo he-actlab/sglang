@@ -741,6 +741,13 @@ class Envs:
     # models, shapes, dtypes, layouts, widths, and architectures keep the
     # production linear path. Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_TMA = EnvBool(False)
+    # Selected per-shape cuBLASLt tactics for the exact Qwen3-0.6B TP1 BF16
+    # draft worker on an allocated 52-SM SMALL context. Discovery happens once
+    # after worker creation; six exact shapes use cached target-52 algorithms,
+    # while down32, qkv128, and unsupported calls retain production linear.
+    # Requires SGLANG_SPEC_PDMUX_SM_HINT=2 so production fallbacks use the same
+    # target-52 baseline. Experimental and default-off.
+    SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

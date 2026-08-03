@@ -28,6 +28,17 @@ DRAFTER_CUBLASLT_MKNS = (
     (128, 3072, 1024),
 )
 
+# Exact target-52 portfolio selected for the Qwen3-0.6B drafter. Shapes not
+# listed here deliberately remain on the production linear implementation.
+DRAFTER_CUBLASLT_PORTFOLIO_MKNS = (
+    (32, 1024, 4096),
+    (32, 2048, 1024),
+    (32, 1024, 6144),
+    (128, 2048, 1024),
+    (128, 1024, 6144),
+    (128, 3072, 1024),
+)
+
 DEFAULT_WORKSPACE_BYTES = 32 * 1024 * 1024
 MAX_ALGORITHMS = 100
 _ALGORITHM_BYTES = 64
@@ -210,6 +221,72 @@ class CublasLtDrafterAlgorithm:
             serialized_algo=serialized,
             _buffer=_algorithm_tensor(serialized),
         )
+
+
+@dataclass(frozen=True)
+class CublasLtDrafterTactic:
+    """Stable cuBLASLt configuration fields for one portfolio entry.
+
+    The opaque algorithm bytes and heuristic rank are process-local discovery
+    results. These configuration attributes identify the selected tactic
+    after every fresh-process query without treating the rank as an API.
+    """
+
+    algorithm_id: int
+    tile_id: int
+    split_k: int
+    reduction_scheme: int
+    cta_swizzle: int
+    custom_option: int
+    stages_id: int
+    inner_shape_id: int
+    cluster_shape_id: int
+    workspace_size: int
+    state: int
+
+    def matches(self, algorithm: CublasLtDrafterAlgorithm) -> bool:
+        return all(
+            getattr(algorithm, field_name) == getattr(self, field_name)
+            for field_name in self.__dataclass_fields__
+        )
+
+
+DRAFTER_CUBLASLT_PORTFOLIO_TACTICS = {
+    (32, 1024, 4096): CublasLtDrafterTactic(21, 15, 1, 0, 0, 0, 12, 0, 0, 0, 0),
+    (32, 2048, 1024): CublasLtDrafterTactic(21, 15, 3, 2, 0, 0, 25, 0, 0, 393216, 0),
+    (32, 1024, 6144): CublasLtDrafterTactic(21, 15, 1, 0, 0, 0, 12, 0, 0, 0, 0),
+    (128, 2048, 1024): CublasLtDrafterTactic(21, 15, 1, 0, 0, 0, 25, 0, 0, 0, 0),
+    (128, 1024, 6144): CublasLtDrafterTactic(21, 20, 1, 0, 0, 0, 10, 0, 0, 0, 0),
+    (128, 3072, 1024): CublasLtDrafterTactic(21, 18, 3, 4, 0, 0, 15, 0, 0, 786432, 0),
+}
+
+
+def select_drafter_portfolio_algorithm(
+    shape_mkn: tuple[int, int, int],
+    candidates: list[CublasLtDrafterAlgorithm],
+) -> CublasLtDrafterAlgorithm:
+    """Bind one fresh-process query to the selected target-52 tactic."""
+
+    tactic = DRAFTER_CUBLASLT_PORTFOLIO_TACTICS.get(shape_mkn)
+    if tactic is None:
+        raise ValueError(f"shape {shape_mkn} is not selected by the drafter portfolio")
+    matches = [
+        candidate
+        for candidate in candidates
+        if candidate.shape_mkn == shape_mkn
+        and candidate.sm_count_target == 52
+        and candidate.activation_alignment == 256
+        and candidate.weight_alignment == 256
+        and candidate.workspace_alignment == 256
+        and candidate.output_alignment == 256
+        and tactic.matches(candidate)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "selected target-52 cuBLASLt tactic must rediscover exactly once for "
+            f"shape {shape_mkn}; matches={len(matches)}"
+        )
+    return matches[0]
 
 
 def allocate_workspace(
@@ -459,10 +536,14 @@ def matmul(
 
 __all__ = [
     "CublasLtDrafterAlgorithm",
+    "CublasLtDrafterTactic",
     "DEFAULT_WORKSPACE_BYTES",
     "DRAFTER_CUBLASLT_MKNS",
+    "DRAFTER_CUBLASLT_PORTFOLIO_MKNS",
+    "DRAFTER_CUBLASLT_PORTFOLIO_TACTICS",
     "MAX_ALGORITHMS",
     "allocate_workspace",
     "discover_algorithms",
     "matmul",
+    "select_drafter_portfolio_algorithm",
 ]

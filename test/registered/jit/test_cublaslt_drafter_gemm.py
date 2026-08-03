@@ -10,10 +10,14 @@ import torch.nn.functional as F
 
 from sglang.jit_kernel.cublaslt_drafter_gemm import (
     DRAFTER_CUBLASLT_MKNS,
+    DRAFTER_CUBLASLT_PORTFOLIO_MKNS,
+    DRAFTER_CUBLASLT_PORTFOLIO_TACTICS,
+    MAX_ALGORITHMS,
     CublasLtDrafterAlgorithm,
     allocate_workspace,
     discover_algorithms,
     matmul,
+    select_drafter_portfolio_algorithm,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -37,6 +41,50 @@ def _require_sm120():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("SM120 required")
+
+
+def _fake_portfolio_algorithm(shape_mkn):
+    m, k, n = shape_mkn
+    tactic = DRAFTER_CUBLASLT_PORTFOLIO_TACTICS[shape_mkn]
+    return CublasLtDrafterAlgorithm(
+        m=m,
+        k=k,
+        n=n,
+        sm_count_target=52,
+        process_id=0,
+        process_cache_token="unit-test",
+        device_index=0,
+        compute_capability=(12, 0),
+        activation_alignment=256,
+        weight_alignment=256,
+        workspace_alignment=256,
+        output_alignment=256,
+        heuristic_rank=99,
+        waves_count=-1.0,
+        serialized_algo=bytes(64),
+        _buffer=torch.zeros(64, dtype=torch.uint8),
+        **vars(tactic),
+    )
+
+
+@pytest.mark.parametrize("shape_mkn", DRAFTER_CUBLASLT_PORTFOLIO_MKNS)
+def test_drafter_portfolio_selector_uses_stable_tactic_metadata(shape_mkn):
+    candidate = _fake_portfolio_algorithm(shape_mkn)
+    assert select_drafter_portfolio_algorithm(shape_mkn, [candidate]) is candidate
+
+    wrong_tactic = replace(candidate, algorithm_id=candidate.algorithm_id + 1)
+    with pytest.raises(RuntimeError, match="rediscover exactly once"):
+        select_drafter_portfolio_algorithm(shape_mkn, [wrong_tactic])
+    with pytest.raises(RuntimeError, match="matches=2"):
+        select_drafter_portfolio_algorithm(shape_mkn, [candidate, candidate])
+
+
+@pytest.mark.parametrize("shape_mkn", [(32, 3072, 1024), (128, 1024, 4096)])
+def test_drafter_portfolio_retained_shapes_are_not_selected(shape_mkn):
+    assert shape_mkn in DRAFTER_CUBLASLT_MKNS
+    assert shape_mkn not in DRAFTER_CUBLASLT_PORTFOLIO_MKNS
+    with pytest.raises(ValueError, match="not selected"):
+        select_drafter_portfolio_algorithm(shape_mkn, [])
 
 
 @pytest.mark.parametrize("shape_mkn", DRAFTER_CUBLASLT_MKNS, ids=_SHAPE_IDS)
@@ -184,9 +232,7 @@ def test_cublaslt_drafter_rejects_workspace_output_and_algorithm_mismatches():
     with pytest.raises(ValueError, match="process-local"):
         CublasLtDrafterAlgorithm.from_dict(wrong_pid)
 
-    inherited_algorithm = replace(
-        algorithm, process_cache_token="different-process"
-    )
+    inherited_algorithm = replace(algorithm, process_cache_token="different-process")
     with pytest.raises(ValueError, match="process-local"):
         matmul(
             activation,
@@ -278,7 +324,7 @@ def test_cublaslt_drafter_full_device_and_targeted_queries_are_distinct_plans():
         )
 
 
-def test_cublaslt_drafter_algorithms_capture_on_small_greenctx_stream():
+def test_cublaslt_drafter_portfolio_captures_on_small_greenctx_stream():
     _require_sm120()
     from sglang.srt.multiplex.pdmux_context import (
         get_spec_sm_allocated_split,
@@ -299,16 +345,25 @@ def test_cublaslt_drafter_algorithms_capture_on_small_greenctx_stream():
     ]
 
     with torch.cuda.stream(small_stream):
-        algorithms = [
-            discover_algorithms(
+        algorithms = []
+        for activation, weight in inputs:
+            shape_mkn = (
+                int(activation.shape[0]),
+                int(activation.shape[1]),
+                int(weight.shape[0]),
+            )
+            candidates = discover_algorithms(
                 activation,
                 weight,
                 sm_count_target=52,
-                top_n=16,
+                top_n=MAX_ALGORITHMS,
                 workspace=workspace,
-            )[0]
-            for activation, weight in inputs
-        ]
+            )
+            algorithms.append(
+                select_drafter_portfolio_algorithm(shape_mkn, candidates)
+                if shape_mkn in DRAFTER_CUBLASLT_PORTFOLIO_MKNS
+                else candidates[0]
+            )
         outputs = [
             torch.empty(
                 (activation.shape[0], weight.shape[0]),
@@ -350,6 +405,84 @@ def test_cublaslt_drafter_algorithms_capture_on_small_greenctx_stream():
         torch.testing.assert_close(
             output, F.linear(activation, weight), rtol=2e-2, atol=2.5
         )
+
+
+def test_qwen3_drafter_portfolio_dispatch_captures_allocated_outputs():
+    _require_sm120()
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from sglang.srt.models.qwen3 import _Qwen3DrafterCublasLtDispatch
+    from sglang.srt.multiplex.pdmux_context import initialize_spec_stream_pair
+
+    device_index = torch.cuda.current_device()
+    _, small_stream = initialize_spec_stream_pair(device_index, 132, 56)
+    weight_shapes = (
+        (4096, 1024),
+        (1024, 2048),
+        (6144, 1024),
+        (1024, 3072),
+    )
+    linears = {}
+    for n, k in weight_shapes:
+        weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+        linears[(n, k)] = SimpleNamespace(
+            tp_size=1,
+            quant_method=UnquantizedLinearMethod(),
+            bias=None,
+            gather_output=False,
+            input_is_parallel=True,
+            use_dp_attention_reduce=False,
+            weight=weight,
+        )
+
+    with torch.cuda.stream(small_stream):
+        dispatch = _Qwen3DrafterCublasLtDispatch(device_index, tuple(linears.values()))
+        activations = {
+            (m, k, n): torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+            for m, k, n in DRAFTER_CUBLASLT_MKNS
+        }
+        eager_outputs = {
+            shape_mkn: dispatch(
+                linears[(shape_mkn[2], shape_mkn[1])],
+                activation,
+            )
+            for shape_mkn, activation in activations.items()
+        }
+    small_stream.synchronize()
+
+    for shape_mkn, output in eager_outputs.items():
+        if shape_mkn in DRAFTER_CUBLASLT_PORTFOLIO_MKNS:
+            assert output is not None
+            torch.testing.assert_close(
+                output,
+                F.linear(
+                    activations[shape_mkn],
+                    linears[(shape_mkn[2], shape_mkn[1])].weight,
+                ),
+                rtol=2e-2,
+                atol=2.5,
+            )
+        else:
+            assert output is None
+
+    graph = torch.cuda.CUDAGraph()
+    graph_outputs = []
+    with torch.cuda.graph(graph, stream=small_stream):
+        for shape_mkn in DRAFTER_CUBLASLT_PORTFOLIO_MKNS:
+            graph_outputs.append(
+                dispatch(
+                    linears[(shape_mkn[2], shape_mkn[1])],
+                    activations[shape_mkn],
+                )
+            )
+    graph.replay()
+    small_stream.synchronize()
+    first_replay = [output.clone() for output in graph_outputs]
+    graph.replay()
+    small_stream.synchronize()
+    for output, first in zip(graph_outputs, first_replay):
+        assert torch.equal(output.view(torch.int16), first.view(torch.int16))
 
 
 if __name__ == "__main__":

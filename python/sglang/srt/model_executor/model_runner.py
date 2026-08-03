@@ -849,10 +849,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Default-off model integration: run after every weight/model transform
         # and before any backend or CUDA-graph initialization.
-        self._maybe_enable_qwen3_drafter_tma()
+        self._maybe_enable_qwen3_drafter_projection_dispatch()
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
+
+    def _maybe_enable_qwen3_drafter_projection_dispatch(self) -> bool:
+        tma = envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get()
+        portfolio = envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get()
+        if tma and portfolio:
+            raise RuntimeError(
+                "Qwen3 drafter TMA and cuBLASLt portfolio flags are mutually exclusive"
+            )
+        if portfolio:
+            return self._maybe_enable_qwen3_drafter_cublaslt_portfolio()
+        return self._maybe_enable_qwen3_drafter_tma()
 
     def _maybe_enable_qwen3_drafter_tma(self) -> bool:
         """Enable the fixed-width Qwen3 TMA path on the draft worker only.
@@ -916,6 +927,75 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             "Qwen3 drafter TMA enabled: 28 layers, eight exact M=32/M=128 "
             "projection shapes, allocated SMALL width=52; target model untouched."
+        )
+        return True
+
+    def _maybe_enable_qwen3_drafter_cublaslt_portfolio(self) -> bool:
+        """Enable selected target-52 tactics on the exact draft worker."""
+
+        if (
+            not envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get()
+            or not self.is_draft_worker
+        ):
+            return False
+
+        def fallback(reason: str) -> bool:
+            logger.warning(
+                "Qwen3 drafter cuBLASLt portfolio requested but unsupported "
+                "(%s); keeping the production linear path.",
+                reason,
+            )
+            return False
+
+        if self.device != "cuda":
+            return fallback(f"device={self.device}")
+        capability = torch.cuda.get_device_capability(self.gpu_id)
+        if capability != (12, 0):
+            return fallback(f"compute capability={capability}")
+        if not self.server_args.enable_spec_pdmux:
+            return fallback("--enable-spec-pdmux is off")
+        if not self.spec_algorithm.is_standalone():
+            return fallback(
+                f"speculative algorithm={self.server_args.speculative_algorithm}"
+            )
+        if self.tp_size != 1 or self.pp_size != 1:
+            return fallback(f"tp_size={self.tp_size}, pp_size={self.pp_size}")
+        if self.dtype != torch.bfloat16 or self.model_config.quantization is not None:
+            return fallback(
+                f"dtype={self.dtype}, quantization={self.model_config.quantization}"
+            )
+        if envs.SGLANG_SPEC_PDMUX_SM_HINT.get() != 2:
+            return fallback(
+                "SGLANG_SPEC_PDMUX_SM_HINT must be 2 so production fallbacks "
+                "retain target-52 selection"
+            )
+
+        from sglang.srt.multiplex.pdmux_context import (
+            get_spec_sm_allocated_split,
+            get_spec_streams,
+        )
+
+        allocated_split = get_spec_sm_allocated_split()
+        if allocated_split is None or allocated_split[1] != 52:
+            return fallback(f"allocated SM split={allocated_split}")
+
+        enable = getattr(self.model, "enable_qwen3_drafter_cublaslt_portfolio", None)
+        if not callable(enable):
+            return fallback(f"model type={type(self.model).__name__}")
+
+        small_stream = get_spec_streams()[1]
+        with torch.cuda.stream(small_stream):
+            enabled = enable(self.gpu_id)
+        if not enabled:
+            return fallback(
+                "model is not the exact unquantized 256-byte-aligned "
+                "Qwen3-0.6B projection family"
+            )
+
+        logger.info(
+            "Qwen3 drafter cuBLASLt portfolio enabled: six cached target-52 "
+            "shapes across 28 layers; down32 and qkv128 retain production "
+            "linear; allocated SMALL width=52; target model untouched."
         )
         return True
 
