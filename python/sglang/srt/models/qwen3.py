@@ -106,10 +106,19 @@ class _Qwen3DrafterTmaDispatch:
         return self._run(activation, weight)
 
 
-class _Qwen3DrafterCublasLtDispatch:
-    """Fresh-process cached target-52 tactics for selected draft projections."""
+class _Qwen3CublasLtPortfolioDispatch:
+    """Fresh-process cached exact-shape cuBLASLt tactics for one worker.
 
-    _SM_COUNT_TARGET = 52
+    Subclasses pin the worker's portfolio shapes, its frozen tactic selector,
+    and the SM-count target its tactics were discovered under.
+    """
+
+    _SM_COUNT_TARGET: int
+    _FAMILY: str
+
+    @staticmethod
+    def _portfolio():
+        raise NotImplementedError
 
     def __init__(
         self, device_index: int, representative_linears: Tuple[nn.Module, ...]
@@ -117,24 +126,25 @@ class _Qwen3DrafterCublasLtDispatch:
         # Keep this import after the worker fork. The helper owns a process-local
         # native handle and rejects inherited opaque algorithms.
         from sglang.jit_kernel.cublaslt_drafter_gemm import (
-            DRAFTER_CUBLASLT_PORTFOLIO_MKNS,
             MAX_ALGORITHMS,
             allocate_workspace,
             discover_algorithms,
             matmul,
-            select_drafter_portfolio_algorithm,
         )
 
+        portfolio_mkns, select_algorithm = self._portfolio()
         weights = {
             (int(linear.weight.shape[0]), int(linear.weight.shape[1])): linear.weight
             for linear in representative_linears
         }
         self._workspace = allocate_workspace(device_index)
         if self._workspace.data_ptr() % 256:
-            raise RuntimeError("drafter cuBLASLt workspace must be 256-byte aligned")
+            raise RuntimeError(
+                f"{self._FAMILY} cuBLASLt workspace must be 256-byte aligned"
+            )
         self._algorithms = {}
         self._matmul = matmul
-        for shape_mkn in DRAFTER_CUBLASLT_PORTFOLIO_MKNS:
+        for shape_mkn in portfolio_mkns:
             m, k, n = shape_mkn
             weight = weights.get((n, k))
             if weight is None:
@@ -144,7 +154,8 @@ class _Qwen3DrafterCublasLtDispatch:
             activation = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
             if activation.data_ptr() % 256:
                 raise RuntimeError(
-                    "drafter cuBLASLt discovery activation must be 256-byte aligned"
+                    f"{self._FAMILY} cuBLASLt discovery activation must be "
+                    "256-byte aligned"
                 )
             candidates = discover_algorithms(
                 activation,
@@ -153,7 +164,7 @@ class _Qwen3DrafterCublasLtDispatch:
                 top_n=MAX_ALGORITHMS,
                 workspace=self._workspace,
             )
-            algorithm = select_drafter_portfolio_algorithm(shape_mkn, candidates)
+            algorithm = select_algorithm(shape_mkn, candidates)
             # Exercise the run path once before any CUDA-graph warmup/capture.
             matmul(
                 activation,
@@ -215,6 +226,38 @@ class _Qwen3DrafterCublasLtDispatch:
             sm_count_target=self._SM_COUNT_TARGET,
             workspace=self._workspace,
         )
+
+
+class _Qwen3DrafterCublasLtDispatch(_Qwen3CublasLtPortfolioDispatch):
+    """Selected target-52 tactics for the Qwen3-0.6B draft worker."""
+
+    _SM_COUNT_TARGET = 52
+    _FAMILY = "drafter"
+
+    @staticmethod
+    def _portfolio():
+        from sglang.jit_kernel.cublaslt_drafter_gemm import (
+            DRAFTER_CUBLASLT_PORTFOLIO_MKNS,
+            select_drafter_portfolio_algorithm,
+        )
+
+        return DRAFTER_CUBLASLT_PORTFOLIO_MKNS, select_drafter_portfolio_algorithm
+
+
+class _Qwen3VerifierCublasLtDispatch(_Qwen3CublasLtPortfolioDispatch):
+    """Selected target-0 tactics for the Qwen3-8B target/verifier worker."""
+
+    _SM_COUNT_TARGET = 0
+    _FAMILY = "verifier"
+
+    @staticmethod
+    def _portfolio():
+        from sglang.jit_kernel.cublaslt_drafter_gemm import (
+            VERIFIER_CUBLASLT_PORTFOLIO_MKNS,
+            select_verifier_portfolio_algorithm,
+        )
+
+        return VERIFIER_CUBLASLT_PORTFOLIO_MKNS, select_verifier_portfolio_algorithm
 
 
 _DrafterProjectionDispatch = Callable[[nn.Module, torch.Tensor], Optional[torch.Tensor]]
@@ -698,21 +741,52 @@ class Qwen3Model(Qwen2Model):
         device_index: int,
         supports_linear: Callable[[nn.Module], bool],
     ) -> Optional[List[Qwen3DecoderLayer]]:
+        return self._eligible_qwen3_layers(
+            device_index,
+            supports_linear,
+            expected_config=(1024, 3072, 28),
+            expected_weight_shapes=(
+                (4096, 1024),
+                (1024, 2048),
+                (6144, 1024),
+                (1024, 3072),
+            ),
+        )
+
+    def _eligible_qwen3_verifier_layers(
+        self,
+        device_index: int,
+        supports_linear: Callable[[nn.Module], bool],
+    ) -> Optional[List[Qwen3DecoderLayer]]:
+        return self._eligible_qwen3_layers(
+            device_index,
+            supports_linear,
+            expected_config=(4096, 12288, 36),
+            expected_weight_shapes=(
+                (6144, 4096),
+                (4096, 4096),
+                (24576, 4096),
+                (4096, 12288),
+            ),
+        )
+
+    def _eligible_qwen3_layers(
+        self,
+        device_index: int,
+        supports_linear: Callable[[nn.Module], bool],
+        expected_config: Tuple[int, int, int],
+        expected_weight_shapes: Tuple[Tuple[int, int], ...],
+    ) -> Optional[List[Qwen3DecoderLayer]]:
+        hidden_size, intermediate_size, num_layers = expected_config
         if (
-            self.config.hidden_size != 1024
-            or self.config.intermediate_size != 3072
-            or self.config.num_hidden_layers != 28
+            self.config.hidden_size != hidden_size
+            or self.config.intermediate_size != intermediate_size
+            or self.config.num_hidden_layers != num_layers
             or self.start_layer != 0
-            or self.end_layer != 28
+            or self.end_layer != num_layers
         ):
             return None
 
-        expected_weight_shapes = (
-            (4096, 1024),
-            (1024, 2048),
-            (6144, 1024),
-            (1024, 3072),
-        )
         eligible_layers = []
         for layer in self.layers:
             if not isinstance(layer, Qwen3DecoderLayer):
@@ -733,7 +807,7 @@ class Qwen3Model(Qwen2Model):
             if any(item.weight.device.index != device_index for item in projections):
                 return None
             eligible_layers.append(layer)
-        return eligible_layers if len(eligible_layers) == 28 else None
+        return eligible_layers if len(eligible_layers) == num_layers else None
 
     @staticmethod
     def _install_drafter_projection_dispatch(
@@ -771,6 +845,23 @@ class Qwen3Model(Qwen2Model):
             first.mlp.down_proj,
         )
         dispatch = _Qwen3DrafterCublasLtDispatch(device_index, representative_linears)
+        self._install_drafter_projection_dispatch(layers, dispatch)
+        return True
+
+    def enable_qwen3_verifier_cublaslt_portfolio(self, device_index: int) -> bool:
+        """Install selected target-0 tactics for the exact Qwen3-8B verifier."""
+
+        layers = self._eligible_qwen3_verifier_layers(
+            device_index, _Qwen3VerifierCublasLtDispatch.supports_linear
+        )
+        if layers is None:
+            return False
+        first = layers[0]
+        representative_linears = (
+            first.self_attn.qkv_proj,
+            first.mlp.down_proj,
+        )
+        dispatch = _Qwen3VerifierCublasLtDispatch(device_index, representative_linears)
         self._install_drafter_projection_dispatch(layers, dispatch)
         return True
 
@@ -836,6 +927,9 @@ class Qwen3ForCausalLM(nn.Module):
 
     def enable_qwen3_drafter_cublaslt_portfolio(self, device_index: int) -> bool:
         return self.model.enable_qwen3_drafter_cublaslt_portfolio(device_index)
+
+    def enable_qwen3_verifier_cublaslt_portfolio(self, device_index: int) -> bool:
+        return self.model.enable_qwen3_verifier_cublaslt_portfolio(device_index)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()

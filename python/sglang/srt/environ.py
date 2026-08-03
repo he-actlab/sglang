@@ -748,6 +748,13 @@ class Envs:
     # Requires SGLANG_SPEC_PDMUX_SM_HINT=2 so production fallbacks use the same
     # target-52 baseline. Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO = EnvBool(False)
+    # Selected per-shape cuBLASLt tactics for the exact Qwen3-8B TP1 BF16
+    # target/verifier worker on an allocated 136-SM LARGE context (TODO-45).
+    # Two exact verify M=128 shapes (fused QKV and down) use cached target-0
+    # algorithms — the gate selected no target-136 tactic — while output,
+    # fused gate-up, and unsupported calls retain production linear under the
+    # SMHint capture. Experimental and default-off.
+    SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

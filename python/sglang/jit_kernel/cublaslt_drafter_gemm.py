@@ -276,20 +276,39 @@ DRAFTER_CUBLASLT_PORTFOLIO_TACTICS = {
 }
 
 
-def select_drafter_portfolio_algorithm(
+# Exact full-device (target-0) portfolio selected by the TODO-45 verifier
+# baseline-headroom gate (PROVENANCE row 33). out8b and gate_up8b deliberately
+# retain the production torch-sm136 path; no target-136 tactic was selected.
+VERIFIER_CUBLASLT_PORTFOLIO_MKNS = (
+    (128, 4096, 6144),
+    (128, 12288, 4096),
+)
+
+VERIFIER_CUBLASLT_PORTFOLIO_TACTICS = {
+    (128, 4096, 6144): CublasLtDrafterTactic(21, 18, 1, 0, 0, 0, 12, 0, 0, 0, 0),
+    (128, 12288, 4096): CublasLtDrafterTactic(
+        21, 20, 3, 4, 0, 0, 11, 0, 0, 3145728, 0
+    ),
+}
+
+VERIFIER_CUBLASLT_SM_COUNT_TARGET = 0
+
+
+def _select_portfolio_algorithm(
     shape_mkn: tuple[int, int, int],
     candidates: list[CublasLtDrafterAlgorithm],
+    tactics: dict[tuple[int, int, int], CublasLtDrafterTactic],
+    sm_count_target: int,
+    family: str,
 ) -> CublasLtDrafterAlgorithm:
-    """Bind one fresh-process query to the selected target-52 tactic."""
-
-    tactic = DRAFTER_CUBLASLT_PORTFOLIO_TACTICS.get(shape_mkn)
+    tactic = tactics.get(shape_mkn)
     if tactic is None:
-        raise ValueError(f"shape {shape_mkn} is not selected by the drafter portfolio")
+        raise ValueError(f"shape {shape_mkn} is not selected by the {family} portfolio")
     matches = [
         candidate
         for candidate in candidates
         if candidate.shape_mkn == shape_mkn
-        and candidate.sm_count_target == 52
+        and candidate.sm_count_target == sm_count_target
         and candidate.activation_alignment == 256
         and candidate.weight_alignment == 256
         and candidate.workspace_alignment == 256
@@ -298,10 +317,36 @@ def select_drafter_portfolio_algorithm(
     ]
     if len(matches) != 1:
         raise RuntimeError(
-            "selected target-52 cuBLASLt tactic must rediscover exactly once for "
-            f"shape {shape_mkn}; matches={len(matches)}"
+            f"selected target-{sm_count_target} cuBLASLt tactic must rediscover "
+            f"exactly once for shape {shape_mkn}; matches={len(matches)}"
         )
     return matches[0]
+
+
+def select_drafter_portfolio_algorithm(
+    shape_mkn: tuple[int, int, int],
+    candidates: list[CublasLtDrafterAlgorithm],
+) -> CublasLtDrafterAlgorithm:
+    """Bind one fresh-process query to the selected target-52 drafter tactic."""
+
+    return _select_portfolio_algorithm(
+        shape_mkn, candidates, DRAFTER_CUBLASLT_PORTFOLIO_TACTICS, 52, "drafter"
+    )
+
+
+def select_verifier_portfolio_algorithm(
+    shape_mkn: tuple[int, int, int],
+    candidates: list[CublasLtDrafterAlgorithm],
+) -> CublasLtDrafterAlgorithm:
+    """Bind one fresh-process query to the selected target-0 verifier tactic."""
+
+    return _select_portfolio_algorithm(
+        shape_mkn,
+        candidates,
+        VERIFIER_CUBLASLT_PORTFOLIO_TACTICS,
+        VERIFIER_CUBLASLT_SM_COUNT_TARGET,
+        "verifier",
+    )
 
 
 def allocate_workspace(
@@ -559,8 +604,12 @@ __all__ = [
     "MAX_ALGORITHMS",
     "SUPPORTED_CUBLASLT_MKNS",
     "VERIFIER_CUBLASLT_MKNS",
+    "VERIFIER_CUBLASLT_PORTFOLIO_MKNS",
+    "VERIFIER_CUBLASLT_PORTFOLIO_TACTICS",
+    "VERIFIER_CUBLASLT_SM_COUNT_TARGET",
     "allocate_workspace",
     "discover_algorithms",
     "matmul",
     "select_drafter_portfolio_algorithm",
+    "select_verifier_portfolio_algorithm",
 ]

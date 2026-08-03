@@ -855,6 +855,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
     def _maybe_enable_qwen3_drafter_projection_dispatch(self) -> bool:
+        self._maybe_enable_qwen3_verifier_cublaslt_portfolio()
         tma = envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get()
         portfolio = envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get()
         if tma and portfolio:
@@ -864,6 +865,78 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if portfolio:
             return self._maybe_enable_qwen3_drafter_cublaslt_portfolio()
         return self._maybe_enable_qwen3_drafter_tma()
+
+    def _maybe_enable_qwen3_verifier_cublaslt_portfolio(self) -> bool:
+        """Enable selected target-0 verifier tactics on the exact target worker."""
+
+        if (
+            not envs.SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO.get()
+            or self.is_draft_worker
+        ):
+            return False
+
+        def fallback(reason: str) -> bool:
+            logger.warning(
+                "Qwen3 verifier cuBLASLt portfolio requested but unsupported "
+                "(%s); keeping the production linear path.",
+                reason,
+            )
+            return False
+
+        if self.device != "cuda":
+            return fallback(f"device={self.device}")
+        capability = torch.cuda.get_device_capability(self.gpu_id)
+        if capability != (12, 0):
+            return fallback(f"compute capability={capability}")
+        if not self.server_args.enable_spec_pdmux:
+            return fallback("--enable-spec-pdmux is off")
+        if not self.spec_algorithm.is_standalone():
+            return fallback(
+                f"speculative algorithm={self.server_args.speculative_algorithm}"
+            )
+        if self.tp_size != 1 or self.pp_size != 1:
+            return fallback(f"tp_size={self.tp_size}, pp_size={self.pp_size}")
+        if self.dtype != torch.bfloat16 or self.model_config.quantization is not None:
+            return fallback(
+                f"dtype={self.dtype}, quantization={self.model_config.quantization}"
+            )
+        if envs.SGLANG_SPEC_PDMUX_SM_HINT.get() not in (1, 2):
+            return fallback(
+                "SGLANG_SPEC_PDMUX_SM_HINT must be 1 or 2 so production "
+                "fallbacks retain the target-side SMHint selection"
+            )
+
+        from sglang.srt.multiplex.pdmux_context import (
+            get_spec_sm_allocated_split,
+            get_spec_streams,
+        )
+
+        allocated_split = get_spec_sm_allocated_split()
+        if allocated_split is None or allocated_split[0] != 136:
+            return fallback(f"allocated SM split={allocated_split}")
+
+        enable = getattr(
+            self.model, "enable_qwen3_verifier_cublaslt_portfolio", None
+        )
+        if not callable(enable):
+            return fallback(f"model type={type(self.model).__name__}")
+
+        large_stream = get_spec_streams()[0]
+        with torch.cuda.stream(large_stream):
+            enabled = enable(self.gpu_id)
+        if not enabled:
+            return fallback(
+                "model is not the exact unquantized 256-byte-aligned "
+                "Qwen3-8B projection family"
+            )
+
+        logger.info(
+            "Qwen3 verifier cuBLASLt portfolio enabled: two cached target-0 "
+            "shapes (fused QKV, down) across 36 layers; output and fused "
+            "gate-up retain production linear; allocated LARGE width=136; "
+            "draft model untouched."
+        )
+        return True
 
     def _maybe_enable_qwen3_drafter_tma(self) -> bool:
         """Enable the fixed-width Qwen3 TMA path on the draft worker only.

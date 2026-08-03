@@ -15,11 +15,14 @@ from sglang.jit_kernel.cublaslt_drafter_gemm import (
     MAX_ALGORITHMS,
     SUPPORTED_CUBLASLT_MKNS,
     VERIFIER_CUBLASLT_MKNS,
+    VERIFIER_CUBLASLT_PORTFOLIO_MKNS,
+    VERIFIER_CUBLASLT_PORTFOLIO_TACTICS,
     CublasLtDrafterAlgorithm,
     allocate_workspace,
     discover_algorithms,
     matmul,
     select_drafter_portfolio_algorithm,
+    select_verifier_portfolio_algorithm,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -45,14 +48,16 @@ def _require_sm120():
         pytest.skip("SM120 required")
 
 
-def _fake_portfolio_algorithm(shape_mkn):
+def _fake_portfolio_algorithm(
+    shape_mkn, tactics=DRAFTER_CUBLASLT_PORTFOLIO_TACTICS, sm_count_target=52
+):
     m, k, n = shape_mkn
-    tactic = DRAFTER_CUBLASLT_PORTFOLIO_TACTICS[shape_mkn]
+    tactic = tactics[shape_mkn]
     return CublasLtDrafterAlgorithm(
         m=m,
         k=k,
         n=n,
-        sm_count_target=52,
+        sm_count_target=sm_count_target,
         process_id=0,
         process_cache_token="unit-test",
         device_index=0,
@@ -87,6 +92,31 @@ def test_drafter_portfolio_retained_shapes_are_not_selected(shape_mkn):
     assert shape_mkn not in DRAFTER_CUBLASLT_PORTFOLIO_MKNS
     with pytest.raises(ValueError, match="not selected"):
         select_drafter_portfolio_algorithm(shape_mkn, [])
+
+
+@pytest.mark.parametrize("shape_mkn", VERIFIER_CUBLASLT_PORTFOLIO_MKNS)
+def test_verifier_portfolio_selector_uses_stable_target0_metadata(shape_mkn):
+    candidate = _fake_portfolio_algorithm(
+        shape_mkn, tactics=VERIFIER_CUBLASLT_PORTFOLIO_TACTICS, sm_count_target=0
+    )
+    assert select_verifier_portfolio_algorithm(shape_mkn, [candidate]) is candidate
+
+    wrong_target = replace(candidate, sm_count_target=136)
+    with pytest.raises(RuntimeError, match="rediscover exactly once"):
+        select_verifier_portfolio_algorithm(shape_mkn, [wrong_target])
+    wrong_tactic = replace(candidate, tile_id=candidate.tile_id + 1)
+    with pytest.raises(RuntimeError, match="rediscover exactly once"):
+        select_verifier_portfolio_algorithm(shape_mkn, [wrong_tactic])
+    with pytest.raises(RuntimeError, match="matches=2"):
+        select_verifier_portfolio_algorithm(shape_mkn, [candidate, candidate])
+
+
+@pytest.mark.parametrize("shape_mkn", [(128, 4096, 4096), (128, 4096, 24576)])
+def test_verifier_portfolio_retained_shapes_are_not_selected(shape_mkn):
+    assert shape_mkn in VERIFIER_CUBLASLT_MKNS
+    assert shape_mkn not in VERIFIER_CUBLASLT_PORTFOLIO_MKNS
+    with pytest.raises(ValueError, match="not selected"):
+        select_verifier_portfolio_algorithm(shape_mkn, [])
 
 
 def _assert_candidate_matches_linear_and_is_deterministic(shape_mkn, sm_count_target):
@@ -510,6 +540,91 @@ def test_qwen3_drafter_portfolio_dispatch_captures_allocated_outputs():
     first_replay = [output.clone() for output in graph_outputs]
     graph.replay()
     small_stream.synchronize()
+    for output, first in zip(graph_outputs, first_replay):
+        assert torch.equal(output.view(torch.int16), first.view(torch.int16))
+
+
+def test_qwen3_verifier_portfolio_dispatch_captures_on_large_greenctx_stream():
+    _require_sm120()
+    from types import SimpleNamespace
+
+    import torch.nn.functional as F  # noqa: F811 - explicit for clarity
+
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from sglang.srt.models.qwen3 import _Qwen3VerifierCublasLtDispatch
+    from sglang.srt.multiplex.pdmux_context import (
+        get_spec_sm_allocated_split,
+        initialize_spec_stream_pair,
+    )
+
+    device_index = torch.cuda.current_device()
+    large_stream, _ = initialize_spec_stream_pair(device_index, 132, 56)
+    assert get_spec_sm_allocated_split() == (136, 52)
+    torch.manual_seed(20260803)
+    weight_shapes = (
+        (6144, 4096),
+        (4096, 4096),
+        (24576, 4096),
+        (4096, 12288),
+    )
+    linears = {}
+    for n, k in weight_shapes:
+        weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+        linears[(n, k)] = SimpleNamespace(
+            tp_size=1,
+            quant_method=UnquantizedLinearMethod(),
+            bias=None,
+            gather_output=False,
+            input_is_parallel=True,
+            use_dp_attention_reduce=False,
+            weight=weight,
+        )
+
+    with torch.cuda.stream(large_stream):
+        dispatch = _Qwen3VerifierCublasLtDispatch(
+            device_index,
+            (linears[(6144, 4096)], linears[(4096, 12288)]),
+        )
+        activations = {
+            (m, k, n): torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+            for m, k, n in VERIFIER_CUBLASLT_MKNS
+        }
+        eager_outputs = {
+            shape_mkn: dispatch(linears[(shape_mkn[2], shape_mkn[1])], activation)
+            for shape_mkn, activation in activations.items()
+        }
+    large_stream.synchronize()
+
+    for shape_mkn, output in eager_outputs.items():
+        if shape_mkn in VERIFIER_CUBLASLT_PORTFOLIO_MKNS:
+            assert output is not None
+            torch.testing.assert_close(
+                output,
+                F.linear(
+                    activations[shape_mkn],
+                    linears[(shape_mkn[2], shape_mkn[1])].weight,
+                ),
+                rtol=2e-2,
+                atol=2.5,
+            )
+        else:
+            assert output is None
+
+    graph = torch.cuda.CUDAGraph()
+    graph_outputs = []
+    with torch.cuda.graph(graph, stream=large_stream):
+        for shape_mkn in VERIFIER_CUBLASLT_PORTFOLIO_MKNS:
+            graph_outputs.append(
+                dispatch(
+                    linears[(shape_mkn[2], shape_mkn[1])],
+                    activations[shape_mkn],
+                )
+            )
+    graph.replay()
+    large_stream.synchronize()
+    first_replay = [output.clone() for output in graph_outputs]
+    graph.replay()
+    large_stream.synchronize()
     for output, first in zip(graph_outputs, first_replay):
         assert torch.equal(output.view(torch.int16), first.view(torch.int16))
 

@@ -141,6 +141,11 @@ class Qwen3DrafterCublasLtModelTests(CustomTestCase):
         model._eligible_qwen3_drafter_layers = lambda device_index, supports_linear: Qwen3Model._eligible_qwen3_drafter_layers(
             model, device_index, supports_linear
         )
+        model._eligible_qwen3_layers = (
+            lambda *args, **kwargs: Qwen3Model._eligible_qwen3_layers(
+                model, *args, **kwargs
+            )
+        )
         model._install_drafter_projection_dispatch = (
             Qwen3Model._install_drafter_projection_dispatch
         )
