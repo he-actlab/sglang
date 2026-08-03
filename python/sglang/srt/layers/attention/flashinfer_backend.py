@@ -384,6 +384,13 @@ class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
         )
         return result
 
+    # Upstream aliases ``begin_forward = plan`` at class-definition time, which
+    # binds the PARENT's plan function; without re-aliasing here, callers using
+    # the deprecated name would capture unarmed while replays plan armed — a
+    # captured-grid/replay-partition mismatch (observed as an illegal memory
+    # access in the first collection attempt).
+    begin_forward = plan
+
 
 def plan_pinned_ws_rotate(wrapper) -> None:
     """spec-pdmux M2.6: protect flashinfer's per-wrapper pinned int-workspace.

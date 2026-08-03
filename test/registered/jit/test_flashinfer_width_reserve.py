@@ -147,5 +147,34 @@ def test_replay_fast_plan_uses_the_same_reserve():
     )
 
 
+def test_begin_forward_alias_routes_through_the_armed_override():
+    """Upstream binds ``begin_forward = plan`` at class definition; the
+    subclass must re-alias or capture-time callers using the deprecated name
+    plan unarmed while replays plan armed (the illegal-access failure mode of
+    the first collection attempt)."""
+
+    assert (
+        WidthAwarePrefillWrapper.begin_forward
+        is WidthAwarePrefillWrapper.plan
+    )
+    _require_cuda()
+    device_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    reserve = 2 * (device_sms - 52)
+    via_begin = _make_wrapper(reserve)
+    via_begin.begin_forward = via_begin.begin_forward  # touch the bound attr
+    qo = torch.arange(0, (_BS + 1) * _QO_PER_REQ, _QO_PER_REQ, dtype=torch.int32, device="cuda")
+    kvp = torch.arange(0, (_BS + 1) * _KV_LEN, _KV_LEN, dtype=torch.int32, device="cuda")
+    kvi = torch.arange(_BS * _KV_LEN, dtype=torch.int32, device="cuda")
+    lpl = torch.full((_BS,), _PAGE_SIZE, dtype=torch.int32, device="cuda")
+    via_begin.begin_forward(
+        qo, kvp, kvi, lpl, _NUM_QO_HEADS, _NUM_KV_HEADS, _HEAD_DIM, _PAGE_SIZE,
+        causal=True, q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16,
+    )
+    armed_info = [
+        v.tolist() if hasattr(v, "tolist") else v for v in via_begin._plan_info
+    ]
+    assert armed_info == _plan(_make_wrapper(reserve))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
