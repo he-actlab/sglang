@@ -755,6 +755,14 @@ class Envs:
     # fused gate-up, and unsupported calls retain production linear under the
     # SMHint capture. Experimental and default-off.
     SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO = EnvBool(False)
+    # Design-FlashInferWidth (TODO-8): give FlashInfer's fa2 prefill-template
+    # cuda-graph plans the realized green-context width via the PrefillPlan
+    # num_colocated_ctas CTA-budget argument. 0 = off (stock full-device
+    # planning); 1 = arm the draft worker's extend plans (reserve
+    # 2*(device_sms - allocated SMALL)); 2 = also arm the target worker's
+    # verify plans (allocated LARGE). Draft decode has no plan-level hook and
+    # is unaffected. Experimental and default-off.
+    SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH = EnvInt(0)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

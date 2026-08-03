@@ -9,6 +9,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -310,9 +311,78 @@ def fast_prefill_plan(
         window_left,
         fixed_split_size if fixed_split_size is not None else -1,
         False,  # disable_split_kv
-        0,  # num_colocated_ctas
+        getattr(self, "_spec_pdmux_colocated_reserve", 0),  # num_colocated_ctas
     ]
     self._plan_info = self._cached_module.plan(*args)
+
+
+class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
+    """fa2 cuda-graph prefill wrapper that re-plans with a green-context CTA
+    reserve (Design-FlashInferWidth, TODO-8).
+
+    Upstream ``plan()`` hardcodes ``num_colocated_ctas=0`` at the module ABI,
+    so its work partition is sized for the full device even when execution is
+    confined to a green context. After the real plan initializes the cached
+    module and cuda-graph buffers, re-plan through ``fast_prefill_plan`` with
+    the identical layout and the armed reserve so the captured grid and every
+    replay plan share the reduced CTA budget.
+    """
+
+    _spec_pdmux_colocated_reserve = 0
+
+    def plan(self, *args, **kwargs):
+        result = super().plan(*args, **kwargs)
+        reserve = self._spec_pdmux_colocated_reserve
+        if reserve <= 0 or getattr(self, "_backend", None) != "fa2":
+            return result
+        from flashinfer.page import get_seq_lens
+
+        bound = inspect.signature(
+            BatchPrefillWithPagedKVCacheWrapper.plan
+        ).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        p = bound.arguments
+        qo_indptr_host = p["qo_indptr"].to("cpu")
+        kv_indptr_host = p["paged_kv_indptr"].to("cpu")
+        if p.get("seq_lens") is not None:
+            kv_lens_host = p["seq_lens"].cpu().flatten()
+        else:
+            kv_lens_host = get_seq_lens(
+                kv_indptr_host,
+                p["paged_kv_last_page_len"].to("cpu"),
+                p["page_size"],
+            )
+        fast_prefill_plan(
+            self,
+            p["qo_indptr"],
+            p["paged_kv_indptr"],
+            p["paged_kv_indices"],
+            p["paged_kv_last_page_len"],
+            p["num_qo_heads"],
+            p["num_kv_heads"],
+            p["head_dim_qk"],
+            p["page_size"],
+            head_dim_vo=p.get("head_dim_vo"),
+            causal=bool(p.get("causal", False)),
+            window_left=p.get("window_left", -1),
+            q_data_type=p.get("q_data_type", "float16"),
+            kv_data_type=p.get("kv_data_type"),
+            o_data_type=p.get("o_data_type"),
+            non_blocking=bool(p.get("non_blocking", True)),
+            fixed_split_size=p.get("fixed_split_size"),
+            prefix_len_ptr=p.get("prefix_len_ptr"),
+            token_pos_in_items_ptr=p.get("token_pos_in_items_ptr"),
+            token_pos_in_items_len=int(p.get("token_pos_in_items_len") or 0),
+            max_item_len_ptr=p.get("max_item_len_ptr"),
+            qo_indptr_host=qo_indptr_host,
+            kv_indptr_host=kv_indptr_host,
+            kv_lens_host=kv_lens_host,
+            max_q_len=int(
+                (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
+            ),
+            max_kv_len=int(kv_lens_host.max().item()),
+        )
+        return result
 
 
 def plan_pinned_ws_rotate(wrapper) -> None:
@@ -559,6 +629,49 @@ class FlashInferAttnBackend(AttentionBackend):
             # due to TMA descriptor initialization issues on SM100 GPUs.
             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
                 fmha_backend = "cutlass"
+        # Design-FlashInferWidth (TODO-8): green-context CTA reserve for the
+        # fa2 prefill-template cuda-graph plans. Mode 1 arms the draft
+        # worker's extend plans (reserve 2*(device_sms - allocated SMALL));
+        # mode 2 also arms the target worker's verify plans (allocated LARGE).
+        # PrefillPlan consumes the reserve as
+        # available_ctas = 2*num_sm - num_colocated_ctas, so the reserve
+        # yields exactly the partition's 2*width CTA budget. Draft decode has
+        # no plan-level hook and stays width-blind (FLASHINFER-WIDTH.md B5).
+        self.spec_pdmux_colocated_reserve = 0
+        width_mode = envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get()
+        if (
+            width_mode > 0
+            and self.enable_spec_pdmux
+            and self.prefill_backend == "fa2"
+        ):
+            armed = model_runner.is_draft_worker or width_mode >= 2
+            from sglang.srt.multiplex.pdmux_context import (
+                get_spec_sm_allocated_split,
+            )
+
+            allocated = get_spec_sm_allocated_split()
+            if armed and allocated is not None:
+                width = (
+                    allocated[1]
+                    if model_runner.is_draft_worker
+                    else allocated[0]
+                )
+                device_sms = torch.cuda.get_device_properties(
+                    model_runner.gpu_id
+                ).multi_processor_count
+                self.spec_pdmux_colocated_reserve = max(
+                    0, 2 * (device_sms - width)
+                )
+                logger.info(
+                    "FlashInfer width reserve armed: worker=%s allocated "
+                    "width=%d device SMs=%d num_colocated_ctas=%d "
+                    "(fa2 prefill-template cuda-graph plans only)",
+                    "draft" if model_runner.is_draft_worker else "target",
+                    width,
+                    device_sms,
+                    self.spec_pdmux_colocated_reserve,
+                )
+
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
@@ -1044,19 +1157,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 if use_custom_mask
                 else {}
             )
-            wrappers.append(
-                BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    use_cuda_graph=True,
-                    backend=self.prefill_backend,
-                    qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                    paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                    paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                    paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                    **extra,
-                )
+            wrapper_cls = (
+                WidthAwarePrefillWrapper
+                if self.spec_pdmux_colocated_reserve > 0
+                else BatchPrefillWithPagedKVCacheWrapper
             )
+            wrapper = wrapper_cls(
+                self.workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                backend=self.prefill_backend,
+                qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                **extra,
+            )
+            if self.spec_pdmux_colocated_reserve > 0:
+                wrapper._spec_pdmux_colocated_reserve = (
+                    self.spec_pdmux_colocated_reserve
+                )
+            wrappers.append(wrapper)
         return wrappers
 
     def _prepare_cuda_graph_metadata(
