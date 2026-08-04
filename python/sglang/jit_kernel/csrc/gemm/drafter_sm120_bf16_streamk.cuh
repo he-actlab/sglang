@@ -22,9 +22,15 @@ limitations under the License.
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
+// `copy_atom.hpp` enables SM100 TMA traits that recursively include
+// `tensor.hpp`; load the complete tensor/algorithm surface first so the
+// recursive include sees a fully declared Copy_Atom.
+// clang-format off
+#include <cute/tensor.hpp>
 #include <cute/atom/copy_atom.hpp>
 #include <cute/atom/mma_atom.hpp>
-#include <cute/tensor.hpp>
+#include <cute/atom/mma_traits_sm90_gmma.hpp>
+// clang-format on
 #include <cutlass/arch/arch.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/detail/layout.hpp>
@@ -225,7 +231,7 @@ inline void drafter_sm120_bf16_streamk(
   Gemm gemm;
   SGLANG_DRAFTER_STREAMK_CUTLASS_CHECK(gemm.can_implement(arguments));
   SGLANG_DRAFTER_STREAMK_CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr, stream));
-  SGLANG_DRAFTER_STREAMK_CUTLASS_CHECK(gemm.run(arguments, workspace_ptr, stream));
+  SGLANG_DRAFTER_STREAMK_CUTLASS_CHECK(gemm.run(stream));
 }
 
 #undef SGLANG_DRAFTER_STREAMK_CUTLASS_CHECK
