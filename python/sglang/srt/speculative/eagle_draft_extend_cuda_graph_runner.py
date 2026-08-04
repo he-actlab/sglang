@@ -326,6 +326,44 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
 
+    def _get_probe_prefill_plan_metadata(self, bs: int):
+        probe = self._draft_extend_surface_probe
+        if probe is None or not probe.requires_prefill_plan_metadata:
+            return None
+        getter = getattr(
+            self.draft_extend_attn_backend,
+            "get_draft_extend_plan_metadata",
+            None,
+        )
+        if not callable(getter):
+            raise RuntimeError(
+                "armed S2 planner diagnostic requires attention plan metadata"
+            )
+        return getter(bs)
+
+    def _init_forward_metadata_with_probe(
+        self,
+        forward_batch,
+        *,
+        in_capture: bool,
+        num_tokens: int,
+    ) -> None:
+        try:
+            self.draft_extend_attn_backend.init_forward_metadata_out_graph(
+                forward_batch,
+                in_capture=in_capture,
+            )
+        except Exception as error:
+            probe = self._draft_extend_surface_probe
+            if probe is not None and probe.requires_prefill_plan_metadata:
+                probe.record_prefill_plan_rejection(
+                    stage="capture" if in_capture else "replay",
+                    batch_size=int(forward_batch.batch_size),
+                    num_tokens=num_tokens,
+                    error=error,
+                )
+            raise
+
     def _cache_loc_dtype(self):
         return torch.int64
 
@@ -490,8 +528,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend)
         ):
-            self.draft_extend_attn_backend.init_forward_metadata_out_graph(
-                forward_batch, in_capture=True
+            self._init_forward_metadata_with_probe(
+                forward_batch,
+                in_capture=True,
+                num_tokens=num_tokens,
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
             canary_ctx = (
@@ -515,6 +555,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                         None,
                     ),
                 )
+                if (
+                    self._draft_extend_surface_probe is not None
+                    and self._draft_extend_surface_probe.requires_prefill_plan_metadata
+                ):
+                    self._draft_extend_surface_probe.record_capture_prefill_plan_metadata(
+                        batch_size=bs,
+                        num_tokens=num_tokens,
+                        metadata=self._get_probe_prefill_plan_metadata(bs),
+                    )
 
     def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
@@ -633,7 +682,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
         )
-        self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+        self._init_forward_metadata_with_probe(
+            fb_view,
+            in_capture=False,
+            num_tokens=num_tokens,
+        )
+        probe_prefill_plan_metadata = self._get_probe_prefill_plan_metadata(bs)
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on.
@@ -655,6 +709,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             probe_token = (
                 self._draft_extend_surface_probe.before_replay(
                     raw_bs=raw_bs,
+                    prefill_plan_metadata=probe_prefill_plan_metadata,
                     padded_bs=bs,
                 )
                 if self._draft_extend_surface_probe is not None

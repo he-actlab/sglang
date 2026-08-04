@@ -53,6 +53,32 @@ SURFACE_AXES = {
     "down": ("M", "K", "N"),
     "lm_head": ("M", "K", "N"),
 }
+_PREFILL_PLAN_REQUIRED_FIELDS = {
+    "padded_batch_size",
+    "total_num_rows",
+    "total_num_rows_offset",
+    "cta_tile_q",
+    "request_indices_offset",
+    "qo_tile_indices_offset",
+    "kv_tile_indices_offset",
+    "merge_indptr_offset",
+    "o_indptr_offset",
+    "kv_chunk_size_ptr_offset",
+    "v_offset",
+    "s_offset",
+    "block_valid_mask_offset",
+    "enable_cuda_graph",
+    "split_kv",
+    "kv_chunk_size",
+}
+_PREFILL_CONTROL_REQUIRED_FIELDS = {
+    "device_sms",
+    "available_ctas",
+    "planning_width_sms",
+    "num_colocated_ctas",
+    "fixed_split_size",
+    "disable_split_kv",
+}
 
 
 @dataclass(frozen=True)
@@ -69,6 +95,7 @@ class DraftExtendSurfaceProbeConfig:
     ncu_range_name: str
     device_index: int
     config_identity: Dict[str, Any]
+    require_prefill_plan_metadata: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +104,10 @@ class _ReplayToken:
     collect_sample: bool
     sample_index: Optional[int]
     ncu_range_open: bool
+    capture_prefill_plan_metadata: Optional[Any]
+    replay_prefill_plan_metadata: Optional[Any]
+    prefill_plan_exact_match: bool
+    prefill_plan_changed_fields: Tuple[str, ...]
 
 
 _ACTIVE_PROBE: contextvars.ContextVar[Optional["DraftExtendSurfaceProbe"]] = (
@@ -189,6 +220,8 @@ class DraftExtendSurfaceProbe:
         self._cache_scrub = None
         self._cache_scrub_bytes = 0
 
+        self._capture_prefill_plan_metadata = {}
+        self._wrote_replay_prefill_plan_metadata = False
         # All timing events are allocated before graph capture and then primed
         # on the capture stream.  external=True forces explicit event record
         # nodes into the graph instead of graph-internal dependency nodes.
@@ -211,9 +244,11 @@ class DraftExtendSurfaceProbe:
         )
 
         self._output = None
-        if config.mode == "measure":
+        if config.mode == "measure" or config.require_prefill_plan_metadata:
             if config.output_path is None:
-                raise ValueError("measure mode requires an output path")
+                raise ValueError(
+                    "measure mode and planner-metadata capture require an output path"
+                )
             output_path = Path(config.output_path)
             self._output = output_path.open("x", encoding="utf-8", buffering=1)
 
@@ -230,6 +265,232 @@ class DraftExtendSurfaceProbe:
         """Literal filter required for a single NVTX push/pop range."""
 
         return f"{self.config.ncu_range_name}/"
+
+    @property
+    def requires_prefill_plan_metadata(self) -> bool:
+        return self.config.require_prefill_plan_metadata
+
+    def _write_record(self, record: Dict[str, Any]) -> None:
+        if self._output is None:
+            raise RuntimeError("draft-extend probe output is not open")
+        self._output.write(json.dumps(record, sort_keys=True) + "\n")
+        self._output.flush()
+
+    def _normalize_prefill_plan_metadata(self, metadata: Any) -> Any:
+        if not isinstance(metadata, (list, tuple)) or len(metadata) != 1:
+            raise RuntimeError(
+                "draft-extend S2 requires exactly one FlashInfer prefill wrapper; "
+                f"got {metadata!r}"
+            )
+        entry = metadata[0]
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                "draft-extend S2 FlashInfer prefill plan metadata is absent"
+            )
+        plan_info = entry.get("plan_info")
+        controls = entry.get("controls")
+        if not isinstance(plan_info, dict) or not isinstance(controls, dict):
+            raise RuntimeError(
+                "draft-extend S2 FlashInfer metadata lacks plan_info/controls"
+            )
+        missing_plan = sorted(_PREFILL_PLAN_REQUIRED_FIELDS - plan_info.keys())
+        missing_controls = sorted(
+            _PREFILL_CONTROL_REQUIRED_FIELDS - controls.keys()
+        )
+        if missing_plan or missing_controls:
+            raise RuntimeError(
+                "draft-extend S2 FlashInfer metadata schema changed: "
+                f"missing_plan={missing_plan} missing_controls={missing_controls}"
+            )
+
+        identity = self.config.config_identity
+        required_identity = {
+            "allocated_sm_split",
+            "draft_extend_flashinfer_plan_override",
+            "draft_extend_flashinfer_plan_width",
+            "draft_extend_flashinfer_num_colocated_ctas",
+            "draft_extend_flashinfer_fixed_split_size",
+            "draft_extend_flashinfer_disable_split_kv",
+        }
+        missing_identity = sorted(required_identity - identity.keys())
+        if missing_identity:
+            raise RuntimeError(
+                "draft-extend S2 planner identity is incomplete: "
+                f"missing={missing_identity}"
+            )
+        if not identity["draft_extend_flashinfer_plan_override"]:
+            raise RuntimeError(
+                "planner metadata was required without arming the plan override"
+            )
+
+        device_sms = int(controls["device_sms"])
+        if device_sms != 188:
+            raise RuntimeError(
+                f"draft-extend S2 planner expected 188 physical SMs, got {device_sms}"
+            )
+        requested_width = int(identity["draft_extend_flashinfer_plan_width"])
+        requested_reserve = int(
+            identity["draft_extend_flashinfer_num_colocated_ctas"]
+        )
+        if requested_width > 0:
+            expected_width = requested_width
+            expected_reserve = 2 * (device_sms - requested_width)
+        elif requested_reserve >= 0:
+            expected_reserve = requested_reserve
+            available_ctas = 2 * device_sms - expected_reserve
+            expected_width = (
+                available_ctas // 2 if available_ctas % 2 == 0 else None
+            )
+        else:
+            execution_width = int(identity["allocated_sm_split"][1])
+            expected_width = execution_width
+            expected_reserve = 2 * (device_sms - execution_width)
+        expected_available_ctas = 2 * device_sms - expected_reserve
+        expected_fixed = (
+            int(identity["draft_extend_flashinfer_fixed_split_size"]) or None
+        )
+        expected_disable = bool(
+            identity["draft_extend_flashinfer_disable_split_kv"]
+        )
+        expected_controls = {
+            "device_sms": device_sms,
+            "available_ctas": expected_available_ctas,
+            "planning_width_sms": expected_width,
+            "num_colocated_ctas": expected_reserve,
+            "fixed_split_size": expected_fixed,
+            "disable_split_kv": expected_disable,
+        }
+        if controls != expected_controls:
+            raise RuntimeError(
+                "draft-extend S2 effective FlashInfer controls do not match the "
+                f"manifest-bound request: expected={expected_controls} got={controls}"
+            )
+
+        if int(plan_info["total_num_rows"]) != TARGET_M:
+            raise RuntimeError(
+                "draft-extend S2 FlashInfer total_num_rows changed: "
+                f"expected {TARGET_M}, got {plan_info['total_num_rows']}"
+            )
+        if int(plan_info["cta_tile_q"]) != 128:
+            raise RuntimeError(
+                "draft-extend S2 width-candidate law assumes cta_tile_q=128; "
+                f"got {plan_info['cta_tile_q']}"
+            )
+        if int(plan_info["padded_batch_size"]) <= 0:
+            raise RuntimeError("FlashInfer padded_batch_size must be positive")
+        if plan_info["enable_cuda_graph"] is not True:
+            raise RuntimeError("FlashInfer diagnostic plan is not CUDA-graph enabled")
+        if not isinstance(plan_info["split_kv"], bool):
+            raise RuntimeError("FlashInfer split_kv metadata must be boolean")
+        kv_chunk_size = plan_info["kv_chunk_size"]
+        if kv_chunk_size is not None and (
+            int(kv_chunk_size) == 0 or int(kv_chunk_size) < -1
+        ):
+            raise RuntimeError(
+                "FlashInfer kv_chunk_size must be positive or the -1 no-split sentinel"
+            )
+
+        # Deep-copy through JSON and prove that the manifest-facing payload is
+        # serializable before the experiment begins.
+        return json.loads(json.dumps(list(metadata), sort_keys=True))
+
+    @staticmethod
+    def _compare_capture_replay_plan(
+        capture: Any, replay: Any
+    ) -> Tuple[bool, Tuple[str, ...]]:
+        capture_entry = capture[0]
+        replay_entry = replay[0]
+        if capture_entry["controls"] != replay_entry["controls"]:
+            raise RuntimeError(
+                "draft-extend FlashInfer effective controls changed between "
+                "capture and replay"
+            )
+        capture_plan = capture_entry["plan_info"]
+        replay_plan = replay_entry["plan_info"]
+        changed = tuple(
+            sorted(
+                key
+                for key in capture_plan.keys() | replay_plan.keys()
+                if capture_plan.get(key) != replay_plan.get(key)
+            )
+        )
+        # Every value returned in PrefillPlanInfo is part of the captured plan
+        # ABI, including all workspace offsets. Only kv_chunk_size is a
+        # synthetic readback from the pinned workspace and may track live KV
+        # lengths without changing the captured graph template.
+        invariant_changes = tuple(
+            field for field in changed if field != "kv_chunk_size"
+        )
+        if invariant_changes:
+            raise RuntimeError(
+                "draft-extend FlashInfer PrefillPlanInfo ABI changed before replay; "
+                f"invariant fields={invariant_changes}"
+            )
+        return capture == replay, changed
+
+    def record_capture_prefill_plan_metadata(
+        self,
+        *,
+        batch_size: int,
+        num_tokens: int,
+        metadata: Any,
+    ) -> None:
+        if not self.config.require_prefill_plan_metadata or num_tokens != TARGET_M:
+            return
+        if batch_size != TARGET_BS:
+            raise RuntimeError(
+                f"M={TARGET_M} planner capture expected bs={TARGET_BS}, got {batch_size}"
+            )
+        normalized = self._normalize_prefill_plan_metadata(metadata)
+        previous = self._capture_prefill_plan_metadata.get(batch_size)
+        if previous is not None:
+            if previous != normalized:
+                raise RuntimeError(
+                    "draft-extend FlashInfer capture plan changed for the same bucket"
+                )
+            return
+        self._capture_prefill_plan_metadata[batch_size] = normalized
+        self._write_record(
+            {
+                "schema_version": 1,
+                "kind": "draft_extend_prefill_plan_capture",
+                "configuration_id": self._config_id,
+                "configuration": self.config.config_identity,
+                "batch_size": batch_size,
+                "padded_num_tokens": num_tokens,
+                "prefill_plan_metadata": normalized,
+            }
+        )
+
+    def record_prefill_plan_rejection(
+        self,
+        *,
+        stage: str,
+        batch_size: int,
+        num_tokens: int,
+        error: Exception,
+    ) -> None:
+        if not self.config.require_prefill_plan_metadata or num_tokens != TARGET_M:
+            return
+        if batch_size != TARGET_BS:
+            raise RuntimeError(
+                f"M={TARGET_M} planner rejection expected bs={TARGET_BS}, got {batch_size}"
+            ) from error
+        if stage not in ("capture", "replay"):
+            raise ValueError(f"invalid planner rejection stage {stage!r}") from error
+        self._write_record(
+            {
+                "schema_version": 1,
+                "kind": "draft_extend_prefill_plan_rejection",
+                "configuration_id": self._config_id,
+                "configuration": self.config.config_identity,
+                "stage": stage,
+                "batch_size": batch_size,
+                "padded_num_tokens": num_tokens,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+        )
 
     def prime_for_capture(self, stream, num_tokens: int) -> None:
         """Materialize every external event before the inner graph capture."""
@@ -291,12 +552,43 @@ class DraftExtendSurfaceProbe:
                 "green-context stream"
             )
 
-    def before_replay(self, *, raw_bs: int, padded_bs: int) -> Optional[_ReplayToken]:
+    def before_replay(
+        self,
+        *,
+        raw_bs: int,
+        padded_bs: int,
+        prefill_plan_metadata: Any = None,
+    ) -> Optional[_ReplayToken]:
         # A smaller live batch padded to the bs=32 graph is not the workbook's
         # logical M=128 surface and must not consume warmups, samples, or the
         # one-shot NCU replay index.
         if raw_bs != TARGET_BS or padded_bs != TARGET_BS:
             return None
+        capture_plan = None
+        replay_plan = None
+        plan_exact_match = False
+        plan_changed_fields = ()
+        if self.config.require_prefill_plan_metadata:
+            try:
+                capture_plan = self._capture_prefill_plan_metadata.get(padded_bs)
+                if capture_plan is None:
+                    raise RuntimeError(
+                        "draft-extend FlashInfer replay has no archived capture plan"
+                    )
+                replay_plan = self._normalize_prefill_plan_metadata(
+                    prefill_plan_metadata
+                )
+                plan_exact_match, plan_changed_fields = (
+                    self._compare_capture_replay_plan(capture_plan, replay_plan)
+                )
+            except Exception as error:
+                self.record_prefill_plan_rejection(
+                    stage="replay",
+                    batch_size=padded_bs,
+                    num_tokens=TARGET_M,
+                    error=error,
+                )
+                raise
         self._assert_small_stream()
         self._target_replay_count += 1
         replay_index = self._target_replay_count
@@ -328,6 +620,10 @@ class DraftExtendSurfaceProbe:
             collect_sample=collect_sample,
             sample_index=sample_index,
             ncu_range_open=open_ncu_range,
+            capture_prefill_plan_metadata=capture_plan,
+            replay_prefill_plan_metadata=replay_plan,
+            prefill_plan_exact_match=plan_exact_match,
+            prefill_plan_changed_fields=plan_changed_fields,
         )
 
     def after_replay(
@@ -343,7 +639,36 @@ class DraftExtendSurfaceProbe:
         if token.ncu_range_open:
             torch.cuda.synchronize(self.config.device_index)
             torch.cuda.nvtx.range_pop()
-        if not succeeded or not token.collect_sample:
+        if not succeeded:
+            return
+        if (
+            self.config.require_prefill_plan_metadata
+            and not self._wrote_replay_prefill_plan_metadata
+        ):
+            self._write_record(
+                {
+                    "schema_version": 1,
+                    "kind": "draft_extend_prefill_plan_replay",
+                    "configuration_id": self._config_id,
+                    "configuration": self.config.config_identity,
+                    "replay_index": token.replay_index,
+                    "raw_batch_size": raw_bs,
+                    "padded_batch_size": padded_bs,
+                    "padded_num_tokens": TARGET_M,
+                    "capture_prefill_plan_metadata": (
+                        token.capture_prefill_plan_metadata
+                    ),
+                    "replay_prefill_plan_metadata": (
+                        token.replay_prefill_plan_metadata
+                    ),
+                    "capture_replay_exact_match": token.prefill_plan_exact_match,
+                    "capture_replay_changed_fields": list(
+                        token.prefill_plan_changed_fields
+                    ),
+                }
+            )
+            self._wrote_replay_prefill_plan_metadata = True
+        if not token.collect_sample:
             return
 
         self._completion_event.record()
@@ -380,11 +705,20 @@ class DraftExtendSurfaceProbe:
             "sample_index": token.sample_index,
             "raw_batch_size": raw_bs,
             "padded_batch_size": padded_bs,
+            "flashinfer_prefill_plan": (
+                {
+                    "capture": token.capture_prefill_plan_metadata,
+                    "replay": token.replay_prefill_plan_metadata,
+                    "exact_match": token.prefill_plan_exact_match,
+                    "changed_fields": list(token.prefill_plan_changed_fields),
+                }
+                if self.config.require_prefill_plan_metadata
+                else None
+            ),
             "padded_num_tokens": TARGET_M,
             "calls": calls,
         }
-        self._output.write(json.dumps(record, sort_keys=True) + "\n")
-        self._output.flush()
+        self._write_record(record)
 
 
 def _projection_shape(linear, activation) -> Optional[Tuple[int, int, int]]:
@@ -607,6 +941,21 @@ def _validate_fixed52_runtime(
         "flashinfer_decode_width_mode": int(
             envs.SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH.get()
         ),
+        "draft_extend_flashinfer_plan_override": bool(
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE.get()
+        ),
+        "draft_extend_flashinfer_plan_width": int(
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_WIDTH.get()
+        ),
+        "draft_extend_flashinfer_num_colocated_ctas": int(
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_NUM_COLOCATED_CTAS.get()
+        ),
+        "draft_extend_flashinfer_fixed_split_size": int(
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FIXED_SPLIT_SIZE.get()
+        ),
+        "draft_extend_flashinfer_disable_split_kv": bool(
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_DISABLE_SPLIT_KV.get()
+        ),
     }
     return identity, get_spec_streams()[1]
 
@@ -617,7 +966,10 @@ def create_surface_probe(
     mode = envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.get().strip().lower()
     ncu_range = bool(envs.SGLANG_DRAFT_EXTEND_NCU_RANGE.get())
     preallocate = bool(envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_PREALLOCATE.get())
-    if mode == "off" and not ncu_range and not preallocate:
+    require_plan_metadata = bool(
+        envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE.get()
+    )
+    if mode == "off" and not ncu_range and not preallocate and not require_plan_metadata:
         return None
     if mode not in ("off", "capture-only", "measure"):
         raise ValueError(
@@ -695,7 +1047,7 @@ def create_surface_probe(
         preallocate=preallocate,
         output_path=(
             envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_OUT.get()
-            if mode == "measure"
+            if mode == "measure" or require_plan_metadata
             else None
         ),
         warmups=warmups,
@@ -705,6 +1057,7 @@ def create_surface_probe(
         ncu_range_name=ncu_range_name,
         device_index=int(model_runner.gpu_id),
         config_identity=identity,
+        require_prefill_plan_metadata=require_plan_metadata,
     )
     probe = DraftExtendSurfaceProbe(config, small_stream=small_stream)
     logger.warning(

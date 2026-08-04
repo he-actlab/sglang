@@ -174,6 +174,281 @@ class PrefillMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
 
 
+@dataclass(frozen=True)
+class DraftExtendPrefillPlanOverride:
+    """Resolved controls for one draft-extend FA2 CUDA-graph plan family."""
+
+    device_sms: int
+    num_colocated_ctas: int
+    planning_width_sms: Optional[int]
+    fixed_split_size: Optional[int]
+    disable_split_kv: bool
+
+
+def resolve_draft_extend_prefill_plan_override(
+    *,
+    enabled: bool,
+    is_draft_worker: bool,
+    enable_spec_pdmux: bool,
+    prefill_backend: str,
+    device_sms: int,
+    num_kv_heads: int,
+    inherited_num_colocated_ctas: int,
+    planning_width: int,
+    num_colocated_ctas: int,
+    fixed_split_size: int,
+    disable_split_kv: bool,
+) -> Optional[DraftExtendPrefillPlanOverride]:
+    """Validate and resolve the default-off TODO-50 prefill-plan controls.
+
+    The environment is shared by the target and draft workers, so target-side
+    construction intentionally returns ``None`` before arming anything. A zero
+    planning width and ``-1`` colocated-CTA value inherit the current
+    Design-FlashInferWidth reserve; this makes the diagnostic control arm the
+    realized-width plan rather than silently moving the denominator.
+    """
+
+    if not enabled or not is_draft_worker:
+        return None
+    if prefill_backend != "fa2":
+        raise ValueError(
+            f"draft-extend FlashInfer plan override requires fa2, got {prefill_backend!r}"
+        )
+    if not enable_spec_pdmux:
+        raise ValueError(
+            "draft-extend FlashInfer plan override requires --enable-spec-pdmux"
+        )
+    if device_sms <= 0:
+        raise ValueError(f"device_sms must be positive, got {device_sms}")
+    if num_kv_heads <= 0:
+        raise ValueError(f"num_kv_heads must be positive, got {num_kv_heads}")
+    if planning_width < 0:
+        raise ValueError(f"planning width must be >= 0, got {planning_width}")
+    if num_colocated_ctas < -1:
+        raise ValueError(
+            "num_colocated_ctas must be -1 (inherit) or non-negative, "
+            f"got {num_colocated_ctas}"
+        )
+    if planning_width > 0 and num_colocated_ctas >= 0:
+        raise ValueError(
+            "set at most one of planning width and explicit num_colocated_ctas"
+        )
+    if fixed_split_size < 0:
+        raise ValueError(f"fixed split size must be >= 0 pages, got {fixed_split_size}")
+    if fixed_split_size > 0:
+        raise ValueError(
+            "draft-extend FlashInfer fixed split size is reserved but unsupported "
+            "for CUDA graphs in this freeze: capture uses seq_lens=1, so a live "
+            "replay can change the split_kv/merge graph structure; leave "
+            "SGLANG_DRAFT_EXTEND_FLASHINFER_FIXED_SPLIT_SIZE=0"
+        )
+
+    if planning_width > 0:
+        min_width = (num_kv_heads + 1) // 2
+        if planning_width < min_width or planning_width > device_sms:
+            raise ValueError(
+                "planning width must leave at least one CTA per KV head and "
+                f"not exceed the device: expected [{min_width}, {device_sms}], "
+                f"got {planning_width}"
+            )
+        effective_colocated = 2 * (device_sms - planning_width)
+        effective_width = planning_width
+    elif num_colocated_ctas >= 0:
+        effective_colocated = num_colocated_ctas
+        available_ctas = 2 * device_sms - effective_colocated
+        if available_ctas < num_kv_heads:
+            raise ValueError(
+                "num_colocated_ctas leaves fewer than one available CTA per "
+                f"KV head: device_sms={device_sms}, num_kv_heads={num_kv_heads}, "
+                f"num_colocated_ctas={effective_colocated}"
+            )
+        effective_width = available_ctas // 2 if available_ctas % 2 == 0 else None
+    else:
+        effective_colocated = inherited_num_colocated_ctas
+        if effective_colocated < 0:
+            raise ValueError(
+                "inherited num_colocated_ctas must be non-negative, "
+                f"got {effective_colocated}"
+            )
+        if effective_colocated == 0:
+            raise ValueError(
+                "no realized-width FlashInfer reserve is armed; set "
+                "SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH or provide an explicit "
+                "planning width/num_colocated_ctas"
+            )
+        available_ctas = 2 * device_sms - effective_colocated
+        if available_ctas < num_kv_heads:
+            raise ValueError(
+                "inherited num_colocated_ctas leaves fewer than one available "
+                f"CTA per KV head: {effective_colocated}"
+            )
+        effective_width = available_ctas // 2 if available_ctas % 2 == 0 else None
+
+    return DraftExtendPrefillPlanOverride(
+        device_sms=device_sms,
+        num_colocated_ctas=effective_colocated,
+        planning_width_sms=effective_width,
+        fixed_split_size=fixed_split_size or None,
+        disable_split_kv=disable_split_kv,
+    )
+
+
+def draft_extend_prefill_cuda_graph_q_tile_upper_bound(
+    *,
+    total_num_rows: int,
+    batch_size: int,
+    gqa_group_size: int,
+    cta_tile_q: int,
+) -> int:
+    """Mirror FA2 scheduler.cuh's CUDA-graph q-tile upper bound."""
+
+    if (
+        total_num_rows < batch_size
+        or batch_size <= 0
+        or gqa_group_size <= 0
+        or cta_tile_q <= 0
+    ):
+        raise ValueError(
+            "expected total_num_rows >= positive batch_size and positive "
+            "gqa_group_size/cta_tile_q"
+        )
+    return (
+        (total_num_rows * gqa_group_size + cta_tile_q - 1) // cta_tile_q
+        + batch_size
+        - 1
+    )
+
+
+def draft_extend_prefill_planning_width_candidates(
+    *,
+    device_sms: int,
+    execution_width: int,
+    num_kv_heads: int,
+    cuda_graph_q_tile_upper_bound: int,
+) -> tuple[int, ...]:
+    """Return only scheduler-distinct planning-width representatives.
+
+    FA2 uses ``padded=max(C, graph_q_tile_upper_bound)`` with
+    ``C=floor(2*width/num_kv_heads)``. The live execution width represents the
+    control. Above it, retain the first width at ``C == graph_q_tile_upper_bound``
+    as well as every larger C: equality can change the scheduler's split binary
+    search even though the padded grid size is unchanged.
+    """
+
+    if not (0 < execution_width <= device_sms):
+        raise ValueError("execution_width must be in [1, device_sms]")
+    if num_kv_heads <= 0 or cuda_graph_q_tile_upper_bound <= 0:
+        raise ValueError(
+            "num_kv_heads and cuda_graph_q_tile_upper_bound must be positive"
+        )
+    max_split_budget = (2 * device_sms) // num_kv_heads
+    execution_split_budget = (2 * execution_width) // num_kv_heads
+    candidates = {execution_width}
+    first_new_budget = (
+        max(cuda_graph_q_tile_upper_bound - 1, execution_split_budget) + 1
+    )
+    for split_budget in range(first_new_budget, max_split_budget + 1):
+        first_width = (split_budget * num_kv_heads + 1) // 2
+        if first_width <= device_sms:
+            candidates.add(first_width)
+    return tuple(sorted(candidates))
+
+
+_PREFILL_PLAN_INFO_FIELDS = (
+    "padded_batch_size",
+    "total_num_rows",
+    "total_num_rows_offset",
+    "cta_tile_q",
+    "request_indices_offset",
+    "qo_tile_indices_offset",
+    "kv_tile_indices_offset",
+    "merge_indptr_offset",
+    "o_indptr_offset",
+    "kv_chunk_size_ptr_offset",
+    "v_offset",
+    "s_offset",
+    "block_valid_mask_offset",
+    "enable_cuda_graph",
+    "split_kv",
+)
+
+
+def _read_prefill_kv_chunk_size(wrapper, byte_offset: int) -> Optional[int]:
+    buffer = getattr(wrapper, "_pin_memory_int_workspace_buffer", None)
+    if buffer is None or byte_offset < 0 or byte_offset + 4 > buffer.numel():
+        return None
+    raw = buffer.reshape(-1)[byte_offset : byte_offset + 4]
+    if raw.device.type != "cpu":
+        raw = raw.cpu()
+    return int(raw.view(torch.int32)[0].item())
+
+
+def _record_draft_extend_prefill_plan_metadata(
+    wrapper,
+    override: DraftExtendPrefillPlanOverride,
+) -> None:
+    """Expose JSON-shaped planner state only for the armed diagnostic path."""
+
+    raw_plan_info = list(wrapper._plan_info)
+    if len(raw_plan_info) != len(_PREFILL_PLAN_INFO_FIELDS):
+        raise RuntimeError(
+            "FlashInfer PrefillPlanInfo ABI changed: expected "
+            f"{len(_PREFILL_PLAN_INFO_FIELDS)} values, got {len(raw_plan_info)}"
+        )
+    values = [int(value) for value in raw_plan_info]
+    plan_info = dict(zip(_PREFILL_PLAN_INFO_FIELDS, values))
+    plan_info["enable_cuda_graph"] = bool(plan_info["enable_cuda_graph"])
+    plan_info["split_kv"] = bool(plan_info["split_kv"])
+    plan_info["kv_chunk_size"] = _read_prefill_kv_chunk_size(
+        wrapper, plan_info["kv_chunk_size_ptr_offset"]
+    )
+    available_ctas = 2 * override.device_sms - override.num_colocated_ctas
+    wrapper._sglang_draft_extend_prefill_plan_metadata = {
+        "plan_info": plan_info,
+        "controls": {
+            "device_sms": override.device_sms,
+            "available_ctas": available_ctas,
+            "planning_width_sms": override.planning_width_sms,
+            "num_colocated_ctas": override.num_colocated_ctas,
+            "fixed_split_size": override.fixed_split_size,
+            "disable_split_kv": override.disable_split_kv,
+        },
+    }
+
+
+def get_draft_extend_prefill_plan_metadata(wrapper) -> Optional[dict]:
+    """Return the last capture/replay plan metadata for a diagnostic wrapper."""
+
+    metadata = getattr(wrapper, "_sglang_draft_extend_prefill_plan_metadata", None)
+    if metadata is None:
+        return None
+    return {
+        "plan_info": dict(metadata["plan_info"]),
+        "controls": dict(metadata["controls"]),
+    }
+
+
+def _effective_prefill_plan_controls(
+    wrapper,
+    fixed_split_size: Optional[int],
+    disable_split_kv: bool,
+) -> tuple[Optional[int], bool, int, Optional[DraftExtendPrefillPlanOverride]]:
+    override = getattr(wrapper, "_sglang_draft_extend_prefill_plan_override", None)
+    if override is None:
+        return (
+            fixed_split_size,
+            disable_split_kv,
+            getattr(wrapper, "_spec_pdmux_colocated_reserve", 0),
+            None,
+        )
+    return (
+        override.fixed_split_size,
+        override.disable_split_kv,
+        override.num_colocated_ctas,
+        override,
+    )
+
+
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
@@ -211,6 +486,7 @@ def fast_prefill_plan(
     o_data_type: Optional[Union[str, torch.dtype]] = None,
     non_blocking: bool = True,
     fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
     prefix_len_ptr: Optional[torch.Tensor] = None,
     token_pos_in_items_ptr: Optional[torch.Tensor] = None,
     token_pos_in_items_len: int = 0,
@@ -297,6 +573,12 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
+    (
+        effective_fixed_split_size,
+        effective_disable_split_kv,
+        effective_num_colocated_ctas,
+        diagnostic_override,
+    ) = _effective_prefill_plan_controls(self, fixed_split_size, disable_split_kv)
 
     args = [
         self._float_workspace_buffer,
@@ -315,11 +597,13 @@ def fast_prefill_plan(
         head_dim_vo,
         causal,
         window_left,
-        fixed_split_size if fixed_split_size is not None else -1,
-        False,  # disable_split_kv
-        getattr(self, "_spec_pdmux_colocated_reserve", 0),  # num_colocated_ctas
+        (effective_fixed_split_size if effective_fixed_split_size is not None else -1),
+        effective_disable_split_kv,
+        effective_num_colocated_ctas,
     ]
     self._plan_info = self._cached_module.plan(*args)
+    if diagnostic_override is not None:
+        _record_draft_extend_prefill_plan_metadata(self, diagnostic_override)
 
 
 class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
@@ -339,7 +623,12 @@ class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
     def plan(self, *args, **kwargs):
         result = super().plan(*args, **kwargs)
         reserve = self._spec_pdmux_colocated_reserve
-        if reserve <= 0 or getattr(self, "_backend", None) != "fa2":
+        diagnostic_override = getattr(
+            self, "_sglang_draft_extend_prefill_plan_override", None
+        )
+        if (reserve <= 0 and diagnostic_override is None) or getattr(
+            self, "_backend", None
+        ) != "fa2":
             return result
         from flashinfer.page import get_seq_lens
 
@@ -376,6 +665,7 @@ class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
             o_data_type=p.get("o_data_type"),
             non_blocking=bool(p.get("non_blocking", True)),
             fixed_split_size=p.get("fixed_split_size"),
+            disable_split_kv=bool(p.get("disable_split_kv", False)),
             prefix_len_ptr=p.get("prefix_len_ptr"),
             token_pos_in_items_ptr=p.get("token_pos_in_items_ptr"),
             token_pos_in_items_len=int(p.get("token_pos_in_items_len") or 0),
@@ -684,6 +974,42 @@ class FlashInferAttnBackend(AttentionBackend):
                     device_sms,
                     self.spec_pdmux_colocated_reserve,
                 )
+        # TODO-50 Program 2: a strict draft-extend-only FA2 plan diagnostic.
+        # This inherits the current width reserve unless the experiment
+        # explicitly supplies a planning width or raw colocated-CTA reserve.
+        self.draft_extend_prefill_plan_override = None
+        if (
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE.get()
+            and model_runner.is_draft_worker
+        ):
+            diagnostic_device_sms = torch.cuda.get_device_properties(
+                model_runner.gpu_id
+            ).multi_processor_count
+            diagnostic_num_kv_heads = model_runner.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size
+            )
+            self.draft_extend_prefill_plan_override = resolve_draft_extend_prefill_plan_override(
+                enabled=True,
+                is_draft_worker=True,
+                enable_spec_pdmux=self.enable_spec_pdmux,
+                prefill_backend=self.prefill_backend,
+                device_sms=diagnostic_device_sms,
+                num_kv_heads=diagnostic_num_kv_heads,
+                inherited_num_colocated_ctas=self.spec_pdmux_colocated_reserve,
+                planning_width=envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_WIDTH.get(),
+                num_colocated_ctas=envs.SGLANG_DRAFT_EXTEND_FLASHINFER_NUM_COLOCATED_CTAS.get(),
+                fixed_split_size=envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FIXED_SPLIT_SIZE.get(),
+                disable_split_kv=envs.SGLANG_DRAFT_EXTEND_FLASHINFER_DISABLE_SPLIT_KV.get(),
+            )
+            controls = self.draft_extend_prefill_plan_override
+            logger.info(
+                "FlashInfer draft-extend plan diagnostic armed: planning_width=%s "
+                "num_colocated_ctas=%d fixed_split_size=%s disable_split_kv=%s",
+                controls.planning_width_sms,
+                controls.num_colocated_ctas,
+                controls.fixed_split_size,
+                controls.disable_split_kv,
+            )
 
         # Design-FlashInferDecodeWidth (TODO-47): sm_count_override for the
         # fa2 CUDA-cores decode plans of the draft worker, through the
@@ -1216,13 +1542,22 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
         return wrappers
 
-    def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
+    def _create_prefill_wrappers(
+        self,
+        bs: int,
+        use_custom_mask: bool = False,
+        *,
+        draft_extend: bool = False,
+    ) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
         # `custom_mask_buf` is initialized (not whether a custom mask is provided).
         # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
         # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
         # FlashInfer will treat the (zero) buffer as a real mask and block attention.
         wrappers = []
+        diagnostic_override = (
+            self.draft_extend_prefill_plan_override if draft_extend else None
+        )
         for i in range(self.num_wrappers):
             extra = (
                 {
@@ -1234,7 +1569,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             wrapper_cls = (
                 WidthAwarePrefillWrapper
-                if self.spec_pdmux_colocated_reserve > 0
+                if (
+                    self.spec_pdmux_colocated_reserve > 0
+                    or diagnostic_override is not None
+                )
                 else BatchPrefillWithPagedKVCacheWrapper
             )
             wrapper = wrapper_cls(
@@ -1248,10 +1586,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                 **extra,
             )
-            if self.spec_pdmux_colocated_reserve > 0:
+            if isinstance(wrapper, WidthAwarePrefillWrapper):
                 wrapper._spec_pdmux_colocated_reserve = (
-                    self.spec_pdmux_colocated_reserve
+                    diagnostic_override.num_colocated_ctas
+                    if diagnostic_override is not None
+                    else self.spec_pdmux_colocated_reserve
                 )
+                if diagnostic_override is not None:
+                    wrapper._sglang_draft_extend_prefill_plan_override = (
+                        diagnostic_override
+                    )
             wrappers.append(wrapper)
         return wrappers
 
@@ -1279,11 +1623,21 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
+            prefill_wrappers = self._create_prefill_wrappers(
+                bs,
+                use_custom_mask=False,
+                draft_extend=True,
+            )
             self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
+
+    def get_draft_extend_plan_metadata(self, bs: int) -> list[Optional[dict]]:
+        """Return structured FA2 planner state for a captured diagnostic bucket."""
+
+        wrappers = self.draft_extend_cuda_graph_metadata.get(bs, ())
+        return [get_draft_extend_prefill_plan_metadata(wrapper) for wrapper in wrappers]
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1

@@ -81,6 +81,51 @@ class _FakeScrub:
         return self
 
 
+def _plan_identity():
+    return {
+        "arm": "unit",
+        "allocated_sm_split": [136, 52],
+        "draft_extend_flashinfer_plan_override": True,
+        "draft_extend_flashinfer_plan_width": 0,
+        "draft_extend_flashinfer_num_colocated_ctas": -1,
+        "draft_extend_flashinfer_fixed_split_size": 0,
+        "draft_extend_flashinfer_disable_split_kv": False,
+    }
+
+
+def _plan_metadata(*, kv_chunk_size=128, padded_batch_size=33, offset_delta=0):
+    return [
+        {
+            "plan_info": {
+                "padded_batch_size": padded_batch_size,
+                "total_num_rows": 128,
+                "total_num_rows_offset": 400 + offset_delta,
+                "cta_tile_q": 128,
+                "request_indices_offset": 0 + offset_delta,
+                "qo_tile_indices_offset": 144 + offset_delta,
+                "kv_tile_indices_offset": 288 + offset_delta,
+                "merge_indptr_offset": 576 + offset_delta,
+                "o_indptr_offset": 432 + offset_delta,
+                "kv_chunk_size_ptr_offset": 568 + offset_delta,
+                "v_offset": 0 + offset_delta,
+                "s_offset": 2162688 + offset_delta,
+                "block_valid_mask_offset": 1104 + offset_delta,
+                "enable_cuda_graph": True,
+                "split_kv": True,
+                "kv_chunk_size": kv_chunk_size,
+            },
+            "controls": {
+                "device_sms": 188,
+                "available_ctas": 104,
+                "planning_width_sms": 52,
+                "num_colocated_ctas": 272,
+                "fixed_split_size": None,
+                "disable_split_kv": False,
+            },
+        }
+    ]
+
+
 def _config(
     *,
     mode="capture-only",
@@ -91,6 +136,8 @@ def _config(
     samples=1,
     ncu_range=False,
     ncu_replay_index=2,
+    require_plan_metadata=False,
+    config_identity=None,
 ):
     return DraftExtendSurfaceProbeConfig(
         mode=mode,
@@ -104,7 +151,12 @@ def _config(
         ncu_replay_index=ncu_replay_index,
         ncu_range_name="S2_M128",
         device_index=0,
-        config_identity={"arm": "unit", "width": 52},
+        config_identity=(
+            config_identity
+            if config_identity is not None
+            else {"arm": "unit", "width": 52}
+        ),
+        require_prefill_plan_metadata=require_plan_metadata,
     )
 
 
@@ -337,6 +389,122 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             with probe.capture_scope(128):
                 pass
 
+
+    def test_prefill_plan_capture_and_replay_are_archived(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "plan.jsonl"
+            probe = DraftExtendSurfaceProbe(
+                _config(
+                    mode="off",
+                    surfaces=(),
+                    output_path=str(output),
+                    require_plan_metadata=True,
+                    config_identity=_plan_identity(),
+                ),
+                event_factory=_FakeEventFactory(),
+            )
+            capture = _plan_metadata(kv_chunk_size=128)
+            replay = _plan_metadata(kv_chunk_size=512)
+            probe.record_capture_prefill_plan_metadata(
+                batch_size=32,
+                num_tokens=128,
+                metadata=capture,
+            )
+            token = probe.before_replay(
+                raw_bs=32,
+                padded_bs=32,
+                prefill_plan_metadata=replay,
+            )
+            self.assertFalse(token.prefill_plan_exact_match)
+            self.assertEqual(token.prefill_plan_changed_fields, ("kv_chunk_size",))
+            probe.after_replay(
+                token,
+                raw_bs=32,
+                padded_bs=32,
+                succeeded=True,
+            )
+            probe._output.close()
+
+            records = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(
+                [record["kind"] for record in records],
+                [
+                    "draft_extend_prefill_plan_capture",
+                    "draft_extend_prefill_plan_replay",
+                ],
+            )
+            self.assertEqual(records[0]["prefill_plan_metadata"], capture)
+            self.assertEqual(records[1]["replay_prefill_plan_metadata"], replay)
+            self.assertFalse(records[1]["capture_replay_exact_match"])
+            self.assertIn(
+                "kv_chunk_size", records[1]["capture_replay_changed_fields"]
+            )
+
+    def test_prefill_plan_template_mismatch_fails_before_replay(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            probe = DraftExtendSurfaceProbe(
+                _config(
+                    mode="off",
+                    surfaces=(),
+                    output_path=str(Path(tmpdir) / "plan.jsonl"),
+                    require_plan_metadata=True,
+                    config_identity=_plan_identity(),
+                ),
+                event_factory=_FakeEventFactory(),
+            )
+            self.addCleanup(probe._output.close)
+            probe.record_capture_prefill_plan_metadata(
+                batch_size=32,
+                num_tokens=128,
+                metadata=_plan_metadata(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "PrefillPlanInfo ABI changed"):
+                probe.before_replay(
+                    raw_bs=32,
+                    padded_bs=32,
+                    prefill_plan_metadata=_plan_metadata(offset_delta=16),
+                )
+            probe._output.close()
+            records = [
+                json.loads(line)
+                for line in (Path(tmpdir) / "plan.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                [record["kind"] for record in records],
+                [
+                    "draft_extend_prefill_plan_capture",
+                    "draft_extend_prefill_plan_rejection",
+                ],
+            )
+            self.assertEqual(records[1]["stage"], "replay")
+            self.assertIn("request_indices_offset", records[1]["error"])
+
+    def test_prefill_plan_rejection_is_a_structured_artifact(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "rejection.jsonl"
+            probe = DraftExtendSurfaceProbe(
+                _config(
+                    mode="off",
+                    surfaces=(),
+                    output_path=str(output),
+                    require_plan_metadata=True,
+                    config_identity=_plan_identity(),
+                ),
+                event_factory=_FakeEventFactory(),
+            )
+            error = RuntimeError("new batch size should not exceed padded batch size")
+            probe.record_prefill_plan_rejection(
+                stage="replay",
+                batch_size=32,
+                num_tokens=128,
+                error=error,
+            )
+            probe._output.close()
+            [record] = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(record["kind"], "draft_extend_prefill_plan_rejection")
+            self.assertEqual(record["stage"], "replay")
+            self.assertEqual(record["error_type"], "RuntimeError")
+            self.assertIn("new batch size", record["error"])
     def test_factory_default_is_true_noop_and_preallocation_only_is_supported(self):
         with (
             envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("off"),
@@ -376,6 +544,18 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
                 create_surface_probe(object(), [32], 4)
         validate.assert_not_called()
 
+
+    def test_plan_override_requires_equal_memory_artifact_envelope(self):
+        with (
+            envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("off"),
+            envs.SGLANG_DRAFT_EXTEND_NCU_RANGE.override(False),
+            envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_PREALLOCATE.override(False),
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE.override(True),
+            patch.object(probe_module, "_validate_fixed52_runtime") as validate,
+        ):
+            with self.assertRaisesRegex(ValueError, "PREALLOCATE=1"):
+                create_surface_probe(object(), [32], 4)
+        validate.assert_not_called()
     def test_fixed52_validation_binds_exact_model_paths_and_server_seed(self):
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -456,6 +636,17 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(identity["target_model_path"], "Qwen/Qwen3-8B")
             self.assertEqual(identity["draft_model_path"], "Qwen/Qwen3-0.6B")
             self.assertEqual(identity["server_random_seed"], 20260803)
+            self.assertFalse(identity["draft_extend_flashinfer_plan_override"])
+            self.assertEqual(identity["draft_extend_flashinfer_plan_width"], 0)
+            self.assertEqual(
+                identity["draft_extend_flashinfer_num_colocated_ctas"], -1
+            )
+            self.assertEqual(
+                identity["draft_extend_flashinfer_fixed_split_size"], 0
+            )
+            self.assertFalse(
+                identity["draft_extend_flashinfer_disable_split_kv"]
+            )
             self.assertEqual(small_stream, "small-stream")
 
             invalid = (

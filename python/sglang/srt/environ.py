@@ -763,6 +763,20 @@ class Envs:
     # verify plans (allocated LARGE). Draft decode has no plan-level hook and
     # is unaffected. Experimental and default-off.
     SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH = EnvInt(0)
+    # TODO-50 diagnostic: override only the draft worker's FA2 paged-prefill
+    # CUDA-graph plans used by DRAFT_EXTEND_V2. The master switch is required;
+    # subordinate values are inert when it is false. A planning width of 0 and
+    # num_colocated_ctas of -1 inherit Design-FlashInferWidth's current reserve
+    # (52-SM SMALL in the registered experiment). The fixed-split variable is
+    # reserved for a future capture contract; positive values fail before
+    # planning because the current seq_lens=1 capture cannot preserve the live
+    # split/merge graph structure. This is a finite experiment surface, not a
+    # production autotuner; capture and replay bind the same resolved controls.
+    SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE = EnvBool(False)
+    SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_WIDTH = EnvInt(0)
+    SGLANG_DRAFT_EXTEND_FLASHINFER_NUM_COLOCATED_CTAS = EnvInt(-1)
+    SGLANG_DRAFT_EXTEND_FLASHINFER_FIXED_SPLIT_SIZE = EnvInt(0)
+    SGLANG_DRAFT_EXTEND_FLASHINFER_DISABLE_SPLIT_KV = EnvBool(False)
     # Design-FlashInferDecodeWidth (TODO-47): give the fa2 CUDA-cores decode
     # planner the realized green-context SM width via the fork-vendored
     # plan-only module (sm_count_override). The stock decode plan has no
