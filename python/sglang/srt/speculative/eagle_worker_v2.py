@@ -152,12 +152,12 @@ class _PhaseEventLog:
     def __init__(self, path):
         self._path = path
         self._file = None
-        self._pending = []  # (phase, cpu_enqueue_ms, start_evt, end_evt)
+        self._pending = []  # (phase, cpu_enqueue_ms, start_evt, end_evt, identity)
         self._n = 0
         atexit.register(self.flush, final=True)
 
-    def record(self, phase, cpu_ms, start_evt, end_evt):
-        self._pending.append((phase, cpu_ms, start_evt, end_evt))
+    def record(self, phase, cpu_ms, start_evt, end_evt, identity=None):
+        self._pending.append((phase, cpu_ms, start_evt, end_evt, dict(identity or {})))
         self._n += 1
         if self._n % self.FLUSH_EVERY == 0:
             self.flush()
@@ -170,25 +170,70 @@ class _PhaseEventLog:
         if final:
             torch.cuda.synchronize()
         keep = []
-        for phase, cpu_ms, s, e in self._pending:
+        for phase, cpu_ms, s, e, identity in self._pending:
             if e.query():  # end done => start done (same stream, in order)
-                self._file.write(
-                    json.dumps(
-                        {
-                            "phase": phase,
-                            "gpu_ms": round(s.elapsed_time(e), 4),
-                            "cpu_enqueue_ms": round(cpu_ms, 4),
-                        }
-                    )
-                    + "\n"
-                )
+                record = {
+                    "phase": phase,
+                    "gpu_ms": round(s.elapsed_time(e), 4),
+                    "cpu_enqueue_ms": round(cpu_ms, 4),
+                }
+                # Only draft_extend supplies identity. All existing records for
+                # every other phase retain their exact three-field schema.
+                record.update(identity)
+                self._file.write(json.dumps(record) + "\n")
             else:
-                keep.append((phase, cpu_ms, s, e))
+                keep.append((phase, cpu_ms, s, e, identity))
         self._pending = keep
         self._file.flush()
 
 
 _PHASE_LOG = _PhaseEventLog(_PHASE_EVENTS_OUT) if _PHASE_EVENTS else None
+_DRAFT_EXTEND_PHASE_IDENTITY_ATTR = "_draft_extend_phase_event_identity"
+
+
+def _begin_draft_extend_phase_identity(args, kwargs):
+    """Bind the logical input before the decorated method mutates/merges it."""
+
+    owner = args[0]
+    payload = args[1] if len(args) > 1 else kwargs.get("batch")
+    if payload is None:
+        payload = kwargs.get("pendings")
+    if hasattr(payload, "seq_lens"):
+        raw_bs = len(payload.seq_lens)
+    elif isinstance(payload, list):
+        raw_bs = sum(len(item["batch"].seq_lens) for item in payload)
+    else:
+        raise RuntimeError(
+            "draft_extend phase timing cannot identify the logical batch"
+        )
+    tokens_per_request = int(owner.speculative_num_draft_tokens)
+    identity = {
+        "raw_batch_size": int(raw_bs),
+        "padded_batch_size": int(raw_bs),
+        "padded_num_tokens": int(raw_bs) * tokens_per_request,
+    }
+    if getattr(owner, _DRAFT_EXTEND_PHASE_IDENTITY_ATTR, None) is not None:
+        raise RuntimeError("nested draft_extend phase timing is unsupported")
+    setattr(owner, _DRAFT_EXTEND_PHASE_IDENTITY_ATTR, identity)
+    return owner, identity
+
+
+def _update_draft_extend_phase_identity(
+    owner, *, raw_batch_size, padded_batch_size, padded_num_tokens
+):
+    if not _PHASE_EVENTS:
+        return
+    identity = getattr(owner, _DRAFT_EXTEND_PHASE_IDENTITY_ATTR, None)
+    if identity is None:
+        raise RuntimeError("draft_extend execution lacks an active phase record")
+    identity.update(
+        {
+            "raw_batch_size": int(raw_batch_size),
+            "padded_batch_size": int(padded_batch_size),
+            "padded_num_tokens": int(padded_num_tokens),
+        }
+    )
+
 
 # SGLANG_ACCEPT_HIST=1 — per-scheduler-process accept-length histogram + lag-1
 # full-window persistence (the batched draft-ahead decider,
@@ -287,6 +332,11 @@ def _profile_phase(name):
 
             @functools.wraps(fn)
             def event_wrapper(*args, **kwargs):
+                phase_identity = (
+                    _begin_draft_extend_phase_identity(args, kwargs)
+                    if name == "draft_extend"
+                    else None
+                )
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
                 t0 = time.perf_counter()
@@ -295,7 +345,16 @@ def _profile_phase(name):
                     return fn(*args, **kwargs)
                 finally:
                     e.record()
-                    _PHASE_LOG.record(name, (time.perf_counter() - t0) * 1e3, s, e)
+                    identity = phase_identity[1] if phase_identity is not None else None
+                    if phase_identity is not None:
+                        delattr(phase_identity[0], _DRAFT_EXTEND_PHASE_IDENTITY_ATTR)
+                    _PHASE_LOG.record(
+                        name,
+                        (time.perf_counter() - t0) * 1e3,
+                        s,
+                        e,
+                        identity,
+                    )
 
             return event_wrapper
 
@@ -1680,6 +1739,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
+        if _PHASE_EVENTS:
+            _update_draft_extend_phase_identity(
+                self,
+                raw_batch_size=forward_batch.batch_size,
+                padded_batch_size=forward_batch.batch_size,
+                padded_num_tokens=forward_batch.input_ids.shape[0],
+            )
         if (
             self.server_args.enable_spec_pdmux
             and not can_cuda_graph
@@ -1717,6 +1783,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch
                 )
+                if _PHASE_EVENTS:
+                    _update_draft_extend_phase_identity(
+                        self,
+                        raw_batch_size=self.cuda_graph_runner_for_draft_extend.raw_bs,
+                        padded_batch_size=self.cuda_graph_runner_for_draft_extend.bs,
+                        padded_num_tokens=(
+                            self.cuda_graph_runner_for_draft_extend.bs
+                            * self.cuda_graph_runner_for_draft_extend.num_tokens_per_bs
+                        ),
+                    )
             else:
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch

@@ -772,6 +772,34 @@ class Envs:
     # the prefill template and TODO-8's knob). Experimental and default-off.
     SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH = EnvInt(0)
 
+    # Diagnostic-only instrumentation for one exact padded-M=128 draft-extend
+    # CUDA graph. mode is off (default), capture-only (identical event nodes,
+    # no drain/sync), or measure. surface is all, qkv, attention, out, gate_up,
+    # down, or lm_head. Event timings are diagnostics, not clean phase timing.
+    # cache_mode=cold-entry inserts one same-stream L2 scrub before the whole
+    # selected graph replay, never between kernels or surfaces.
+    SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE = EnvStr("off")
+    SGLANG_DRAFT_EXTEND_SURFACE_PROBE_SURFACE = EnvStr("all")
+    SGLANG_DRAFT_EXTEND_SURFACE_PROBE_CACHE_MODE = EnvStr("natural")
+    SGLANG_DRAFT_EXTEND_SURFACE_PROBE_OUT = EnvStr(
+        "/tmp/sglang-draft-extend-surface.jsonl"
+    )
+    SGLANG_DRAFT_EXTEND_SURFACE_PROBE_WARMUPS = EnvInt(20)
+    SGLANG_DRAFT_EXTEND_SURFACE_PROBE_SAMPLES = EnvInt(101)
+    # Hold the same 256-MiB post-capture memory envelope in every Gate-S2 arm,
+    # including the event-free clean control.  Natural-cache legs leave this
+    # buffer untouched; cold-entry legs scrub it once before the whole replay.
+    SGLANG_DRAFT_EXTEND_SURFACE_PROBE_PREALLOCATE = EnvBool(False)
+    # Emit one synchronized NVTX push/pop range around the named one-based exact
+    # M=128 replay. Intended for Nsight Compute kernel
+    # replay with an include expression ending in '/'; range replay cannot
+    # capture a host-launched CUDA graph on the supported toolchain.
+    SGLANG_DRAFT_EXTEND_NCU_RANGE = EnvBool(False)
+    SGLANG_DRAFT_EXTEND_NCU_REPLAY_INDEX = EnvInt(21)
+    SGLANG_DRAFT_EXTEND_NCU_RANGE_NAME = EnvStr(
+        "SGLANG_DRAFT_EXTEND_M128_REPLAY"
+    )
+
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).

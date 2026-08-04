@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.draft_extend_surface_probe import create_surface_probe
 
 _is_hip = is_hip()
 
@@ -299,6 +300,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
         self.buffers.share_buffers(namespace=buffer_namespace)
 
+        # TODO-50 Gate S2: exact fixed-52 diagnostic only.  The factory is an
+        # allocation-free no-op unless one of its default-off modes is armed.
+        # Construct it before capture so every external timing event exists and
+        # can be primed before the inner graph capture begins.
+        self._draft_extend_surface_probe = create_surface_probe(
+            model_runner, self.capture_bs, self.num_tokens_per_bs
+        )
+
         self.backend = resolve_decode_backend(self)
 
         try:
@@ -308,6 +317,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+        if self._draft_extend_surface_probe is not None:
+            # Keep the equal-memory diagnostic buffer outside graph/KV sizing
+            # and graph-pool capture. Natural legs retain it without touching
+            # it; cold-entry legs scrub it immediately before exact replays.
+            self._draft_extend_surface_probe.prepare_after_capture()
 
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
@@ -446,11 +460,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
+            probe_ctx = (
+                self._draft_extend_surface_probe.capture_scope(num_tokens)
+                if self._draft_extend_surface_probe is not None
+                else contextlib.nullcontext()
             )
+            with probe_ctx:
+                ret = self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
             # ROCm's argmax tie-breaks differently from CUDA's softmax+max
             # path on FP8 logits, which corrupts MTP draft selection on AMD.
             # Keep the fastpath CUDA-only.
@@ -481,6 +501,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs)
+                if self._draft_extend_surface_probe is not None:
+                    self._draft_extend_surface_probe.prime_for_capture(
+                        self.stream, num_tokens
+                    )
                 self.backend.capture_one(
                     shape_key,
                     run_once,
@@ -628,7 +652,26 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx:
-            out = self._replay_graph(shape_key, forward_batch)
+            probe_token = (
+                self._draft_extend_surface_probe.before_replay(
+                    raw_bs=raw_bs,
+                    padded_bs=bs,
+                )
+                if self._draft_extend_surface_probe is not None
+                else None
+            )
+            replay_succeeded = False
+            try:
+                out = self._replay_graph(shape_key, forward_batch)
+                replay_succeeded = True
+            finally:
+                if self._draft_extend_surface_probe is not None:
+                    self._draft_extend_surface_probe.after_replay(
+                        probe_token,
+                        raw_bs=raw_bs,
+                        padded_bs=bs,
+                        succeeded=replay_succeeded,
+                    )
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],

@@ -52,6 +52,9 @@ from sglang.srt.utils import (
     next_power_of_2,
     require_gathered_buffer,
 )
+from sglang.srt.utils.draft_extend_surface_probe import (
+    draft_extend_attention_scope,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1324,30 +1327,34 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=causal,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-            )
+            # Exclude the KV write above; this surface is the fused paged-
+            # prefill attention program and any split/merge companions it
+            # launches under the selected FlashInfer plan.
+            with draft_extend_attention_scope(q, layer):
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    # Disable sliding window attention for multi-item scoring:
+                    # - Sliding window could cut across item boundaries, breaking semantic coherence
+                    # - Multi-item sequences need full attention to properly handle delimiter tokens
+                    # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                    #   provide more precise attention control than simple sliding windows
+                    # - Item-aware masking takes precedence over window-based masking
+                    window_left=(
+                        layer.sliding_window_size
+                        if not (
+                            self.forward_metadata.multi_item_params
+                            and self.forward_metadata.multi_item_params.is_enabled()
+                        )
+                        else -1
+                    ),
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over

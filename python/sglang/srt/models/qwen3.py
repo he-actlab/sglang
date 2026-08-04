@@ -36,6 +36,9 @@ from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils.draft_extend_surface_probe import (
+    draft_extend_projection_scope,
+)
 
 Qwen3Config = None
 
@@ -302,11 +305,18 @@ def _qwen3_drafter_projection_or_linear(
     # torch.compile regions (the target's tc_piecewise prefill graphs) always
     # take the production linear, which keeps the portfolio surface confined to
     # the plainly captured decode/verify graphs it was selected on.
-    if dispatch is not None and not torch.compiler.is_compiling():
-        output = dispatch(linear, activation)
-        if output is not None:
-            return output, None
-    return linear(activation, **linear_kwargs)
+    if torch.compiler.is_compiling():
+        return linear(activation, **linear_kwargs)
+
+    # The diagnostic boundary encloses the dispatch and its production
+    # fallback.  It therefore times whichever exact tactic the captured graph
+    # actually selected, including any split-K reduction companion.
+    with draft_extend_projection_scope(linear, activation):
+        if dispatch is not None:
+            output = dispatch(linear, activation)
+            if output is not None:
+                return output, None
+        return linear(activation, **linear_kwargs)
 
 
 # Compatibility alias for the earlier private TMA-only seam.

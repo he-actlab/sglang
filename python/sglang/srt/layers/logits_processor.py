@@ -55,6 +55,9 @@ from sglang.srt.utils.common import (
     is_pin_memory_available,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.draft_extend_surface_probe import (
+    draft_extend_lm_head_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -850,7 +853,10 @@ class LogitsProcessor(nn.Module):
             hidden_states, logits_metadata
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        # Keep the event boundary below hidden-state gathering and above logits
+        # gathering so it measures only the exact LM-head program.
+        with draft_extend_lm_head_scope(hidden_states, lm_head):
+            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
