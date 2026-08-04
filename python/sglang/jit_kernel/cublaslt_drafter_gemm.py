@@ -10,10 +10,11 @@ no heuristic lookup and is CUDA-graph capturable.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
-from dataclasses import dataclass, field
-from typing import Any, Mapping
+from dataclasses import dataclass, field, replace
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -61,6 +62,47 @@ DEFAULT_WORKSPACE_BYTES = 32 * 1024 * 1024
 MAX_ALGORITHMS = 100
 _ALGORITHM_BYTES = 64
 _METADATA_FIELDS = 12
+_CUSTOM_FIND_METADATA_FIELDS = 16
+_CUSTOM_FIND_CENSUS_FIELDS = (
+    "algorithm_ids",
+    "algorithm_id_query_capacity",
+    "algorithm_init_success",
+    "algorithm_init_not_supported",
+    "capability_accepted_ids",
+    "capability_rejected_ids",
+    "alignment_rejected_ids",
+    "configurations_attempted",
+    "config_set_rejected",
+    "algo_check_rejected",
+    "state_rejected",
+    "workspace_rejected",
+    "metadata_rejected",
+    "duplicate_rejected",
+    "legal_unique",
+    "copied",
+    "cluster_launch_supported",
+    "cluster_shape_end",
+)
+_BY_ID_CENSUS_FIELDS = (
+    "algorithm_ids",
+    "algorithm_id_query_capacity",
+    "algorithm_init_success",
+    "algorithm_init_not_supported",
+    "limited_query_success",
+    "limited_query_not_supported",
+    "results_returned",
+    "heuristic_state_success",
+    "heuristic_state_rejected",
+    "algo_check_success",
+    "algo_check_rejected",
+    "workspace_rejected",
+    "copied",
+    "candidates",
+)
+_MAX_ALGORITHM_IDS = 4096
+CUSTOM_FIND_V1_SPLIT_K_VALUES = (2, 3, 4, 5, 6, 8, 12, 16, 32)
+CUSTOM_FIND_V1_INITIAL_CAPACITY = 4096
+CUSTOM_FIND_V1_MAX_CANDIDATES = 262144
 _PROCESS_CACHE_PID = os.getpid()
 _PROCESS_CACHE_TOKEN = secrets.token_hex(16)
 
@@ -96,6 +138,14 @@ def _jit_cublaslt_drafter_gemm_module():
         cuda_files=["gemm/cublaslt_drafter_gemm.cuh"],
         cuda_wrappers=[
             ("query_algorithms", "cublaslt_drafter_gemm::query_algorithms"),
+            (
+                "query_algorithms_by_id",
+                "cublaslt_drafter_gemm::query_algorithms_by_id",
+            ),
+            (
+                "enumerate_custom_find_v1",
+                "cublaslt_drafter_gemm::enumerate_custom_find_v1",
+            ),
             ("run", "cublaslt_drafter_gemm::run"),
         ],
         extra_ldflags=["-lcublasLt", "-lcublas"],
@@ -142,10 +192,43 @@ class CublasLtDrafterAlgorithm:
     waves_count: float
     serialized_algo: bytes = field(repr=False)
     _buffer: torch.Tensor = field(repr=False, compare=False)
+    discovery_source: str = "heuristic"
+    rediscovery_ordinal_within_canonical_config: int = 0
+
+    def __post_init__(self) -> None:
+        if len(self.serialized_algo) != _ALGORITHM_BYTES:
+            raise ValueError(
+                f"serialized cuBLASLt algorithm must contain {_ALGORITHM_BYTES} bytes"
+            )
+        if self.rediscovery_ordinal_within_canonical_config != 0:
+            raise ValueError(
+                "rediscovery ordinal must be 0 because public-config collisions "
+                "fail closed"
+            )
+        self._validate_opaque_buffer_binding()
+
+    def _validate_opaque_buffer_binding(self) -> None:
+        if (
+            self._buffer.device.type != "cpu"
+            or self._buffer.dtype is not torch.uint8
+            or self._buffer.shape != (_ALGORITHM_BYTES,)
+            or not self._buffer.is_contiguous()
+        ):
+            raise ValueError(
+                f"algorithm buffer must be a contiguous {_ALGORITHM_BYTES}-byte CPU tensor"
+            )
+        if bytes(self._buffer.tolist()) != self.serialized_algo:
+            raise ValueError(
+                "algorithm buffer bytes do not match immutable serialized_algo"
+            )
 
     @property
     def shape_mkn(self) -> tuple[int, int, int]:
         return self.m, self.k, self.n
+
+    @property
+    def opaque_algo_sha256(self) -> str:
+        return hashlib.sha256(self.serialized_algo).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
         """Return JSON-compatible metadata including the opaque descriptor."""
@@ -183,6 +266,11 @@ class CublasLtDrafterAlgorithm:
             "workspace_size": self.workspace_size,
             "state": self.state,
             "waves_count": self.waves_count,
+            "discovery_source": self.discovery_source,
+            "opaque_algo_sha256": self.opaque_algo_sha256,
+            "rediscovery_ordinal_within_canonical_config": (
+                self.rediscovery_ordinal_within_canonical_config
+            ),
             "serialized_algo_hex": self.serialized_algo.hex(),
         }
 
@@ -207,6 +295,19 @@ class CublasLtDrafterAlgorithm:
             )
 
         serialized = bytes.fromhex(str(value["serialized_algo_hex"]))
+        if len(serialized) != _ALGORITHM_BYTES:
+            raise ValueError(
+                f"serialized cuBLASLt algorithm must contain {_ALGORITHM_BYTES} bytes"
+            )
+        expected_opaque_sha256 = value.get("opaque_algo_sha256")
+        actual_opaque_sha256 = hashlib.sha256(serialized).hexdigest()
+        if (
+            expected_opaque_sha256 is not None
+            and str(expected_opaque_sha256) != actual_opaque_sha256
+        ):
+            raise ValueError(
+                "opaque cuBLASLt algorithm SHA-256 does not match its bytes"
+            )
         capability = tuple(int(part) for part in value["compute_capability"])
         if len(capability) != 2:
             raise ValueError("compute_capability must contain major and minor")
@@ -238,7 +339,49 @@ class CublasLtDrafterAlgorithm:
             waves_count=float(value["waves_count"]),
             serialized_algo=serialized,
             _buffer=_algorithm_tensor(serialized),
+            discovery_source=str(value.get("discovery_source", "heuristic")),
+            rediscovery_ordinal_within_canonical_config=int(
+                value.get("rediscovery_ordinal_within_canonical_config", 0)
+            ),
         )
+
+
+@dataclass(frozen=True)
+class CublasLtDrafterAlgorithmSearchResult:
+    """One exact-shape discovery census and its runnable candidates."""
+
+    candidates: tuple[CublasLtDrafterAlgorithm, ...]
+    algorithm_ids: tuple[int, ...]
+    census: Mapping[str, int]
+    search_space: Mapping[str, Any]
+
+    def to_dict(self, *, include_candidates: bool = True) -> dict[str, Any]:
+        _require_originating_process()
+        value: dict[str, Any] = {
+            "candidate_count": len(self.candidates),
+            "algorithm_ids": list(self.algorithm_ids),
+            "census": dict(self.census),
+            "search_space": dict(self.search_space),
+        }
+        if include_candidates:
+            value["candidates"] = [candidate.to_dict() for candidate in self.candidates]
+        return value
+
+
+@dataclass(frozen=True)
+class CublasLtCustomFindCensusResult:
+    """Pure CustomFind feasibility census with no runnable candidates."""
+
+    algorithm_ids: tuple[int, ...]
+    census: Mapping[str, int]
+    search_space: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "algorithm_ids": list(self.algorithm_ids),
+            "census": dict(self.census),
+            "search_space": dict(self.search_space),
+        }
 
 
 @dataclass(frozen=True)
@@ -289,9 +432,7 @@ VERIFIER_CUBLASLT_PORTFOLIO_MKNS = (
 
 VERIFIER_CUBLASLT_PORTFOLIO_TACTICS = {
     (128, 4096, 6144): CublasLtDrafterTactic(21, 18, 1, 0, 0, 0, 12, 0, 0, 0, 0),
-    (128, 12288, 4096): CublasLtDrafterTactic(
-        21, 20, 3, 4, 0, 0, 11, 0, 0, 3145728, 0
-    ),
+    (128, 12288, 4096): CublasLtDrafterTactic(21, 20, 3, 4, 0, 0, 11, 0, 0, 3145728, 0),
 }
 
 VERIFIER_CUBLASLT_SM_COUNT_TARGET = 0
@@ -396,6 +537,55 @@ def _validate_problem(
     return shape_mkn
 
 
+def _heuristic_candidate(
+    *,
+    m: int,
+    k: int,
+    n: int,
+    sm_count_target: int,
+    device_index: int,
+    compute_capability: tuple[int, int],
+    activation_alignment: int,
+    weight_alignment: int,
+    workspace_alignment: int,
+    metadata: list[int],
+    waves_count: float,
+    buffer: torch.Tensor,
+    discovery_source: str,
+) -> CublasLtDrafterAlgorithm:
+    serialized = bytes(buffer.tolist())
+    return CublasLtDrafterAlgorithm(
+        m=m,
+        k=k,
+        n=n,
+        sm_count_target=sm_count_target,
+        process_id=_PROCESS_CACHE_PID,
+        process_cache_token=_PROCESS_CACHE_TOKEN,
+        device_index=device_index,
+        compute_capability=compute_capability,
+        activation_alignment=activation_alignment,
+        weight_alignment=weight_alignment,
+        workspace_alignment=workspace_alignment,
+        output_alignment=256,
+        heuristic_rank=int(metadata[0]),
+        algorithm_id=int(metadata[1]),
+        tile_id=int(metadata[2]),
+        split_k=int(metadata[3]),
+        reduction_scheme=int(metadata[4]),
+        cta_swizzle=int(metadata[5]),
+        custom_option=int(metadata[6]),
+        stages_id=int(metadata[7]),
+        inner_shape_id=int(metadata[8]),
+        cluster_shape_id=int(metadata[9]),
+        workspace_size=int(metadata[10]),
+        state=int(metadata[11]),
+        waves_count=waves_count,
+        serialized_algo=serialized,
+        _buffer=buffer,
+        discovery_source=discovery_source,
+    )
+
+
 def discover_algorithms(
     activation: torch.Tensor,
     weight: torch.Tensor,
@@ -462,39 +652,844 @@ def discover_algorithms(
     for index in range(min(count, top_n)):
         metadata = metadata_buffer[index].tolist()
         buffer = algorithm_buffer[index].clone()
-        serialized = bytes(buffer.tolist())
         candidates.append(
-            CublasLtDrafterAlgorithm(
+            _heuristic_candidate(
                 m=m,
                 k=k,
                 n=n,
                 sm_count_target=sm_count_target,
-                process_id=_PROCESS_CACHE_PID,
-                process_cache_token=_PROCESS_CACHE_TOKEN,
                 device_index=device_index,
                 compute_capability=compute_capability,
                 activation_alignment=_alignment_class(activation),
                 weight_alignment=_alignment_class(weight),
                 workspace_alignment=_alignment_class(workspace),
-                output_alignment=256,
-                heuristic_rank=int(metadata[0]),
-                algorithm_id=int(metadata[1]),
-                tile_id=int(metadata[2]),
-                split_k=int(metadata[3]),
-                reduction_scheme=int(metadata[4]),
-                cta_swizzle=int(metadata[5]),
-                custom_option=int(metadata[6]),
-                stages_id=int(metadata[7]),
-                inner_shape_id=int(metadata[8]),
-                cluster_shape_id=int(metadata[9]),
-                workspace_size=int(metadata[10]),
-                state=int(metadata[11]),
+                metadata=metadata,
                 waves_count=float(waves_buffer[index].item()),
-                serialized_algo=serialized,
-                _buffer=buffer,
+                buffer=buffer,
+                discovery_source="heuristic",
             )
         )
     return candidates
+
+
+def discover_algorithms_by_id(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    sm_count_target: int,
+    workspace: torch.Tensor,
+) -> CublasLtDrafterAlgorithmSearchResult:
+    """Ask cuBLASLt for one width-aware configuration for every algorithm ID.
+
+    Coverage is complete over the IDs returned by ``cublasLtMatmulAlgoGetIds``.
+    For each ID, ``CUBLASLT_SEARCH_LIMITED_BY_ALGO_ID`` lets cuBLASLt select
+    one best configuration under the exact descriptor, alignments, and workspace
+    cap. This is intentionally not a claim of complete configuration coverage.
+    """
+
+    _require_originating_process()
+    m, k, n = _validate_problem(activation, weight, workspace)
+    if isinstance(sm_count_target, bool) or not isinstance(sm_count_target, int):
+        raise TypeError("sm_count_target must be an int")
+    if not 0 <= sm_count_target <= 2**31 - 1:
+        raise ValueError("sm_count_target must be in [0,INT32_MAX]")
+
+    algorithm_buffer = torch.empty(
+        (_MAX_ALGORITHM_IDS, _ALGORITHM_BYTES), dtype=torch.uint8, device="cpu"
+    )
+    metadata_buffer = torch.empty(
+        (_MAX_ALGORITHM_IDS, _METADATA_FIELDS), dtype=torch.int64, device="cpu"
+    )
+    waves_buffer = torch.empty(_MAX_ALGORITHM_IDS, dtype=torch.float32, device="cpu")
+    algorithm_ids_buffer = torch.empty(_MAX_ALGORITHM_IDS, dtype=torch.int32)
+    census_buffer = torch.empty(
+        len(_BY_ID_CENSUS_FIELDS), dtype=torch.int64, device="cpu"
+    )
+    with torch.cuda.device(activation.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "cuBLASLt algorithm-by-id discovery is forbidden during CUDA graph capture"
+            )
+        count = int(
+            _jit_cublaslt_drafter_gemm_module().query_algorithms_by_id(
+                activation,
+                weight,
+                workspace,
+                algorithm_buffer,
+                metadata_buffer,
+                waves_buffer,
+                algorithm_ids_buffer,
+                census_buffer,
+                sm_count_target,
+            )
+        )
+
+    census = dict(
+        zip(
+            _BY_ID_CENSUS_FIELDS,
+            (int(value) for value in census_buffer.tolist()),
+        )
+    )
+    if count != census["candidates"] or count != census["copied"]:
+        raise RuntimeError(
+            "limited-by-algorithm-ID native count disagrees with its census: "
+            f"return={count}, candidates={census['candidates']}, "
+            f"copied={census['copied']}"
+        )
+    if count != census["algo_check_success"] - census["workspace_rejected"]:
+        raise RuntimeError(
+            "limited-by-algorithm-ID checked/workspace count was not serialized: "
+            f"algo_check_success={census['algo_check_success']}, "
+            f"workspace_rejected={census['workspace_rejected']}, candidates={count}"
+        )
+    algorithm_id_count = census["algorithm_ids"]
+    if not 0 < algorithm_id_count <= _MAX_ALGORITHM_IDS:
+        raise RuntimeError(
+            f"invalid limited-by-algorithm-ID count {algorithm_id_count}"
+        )
+    algorithm_ids = tuple(
+        int(value) for value in algorithm_ids_buffer[:algorithm_id_count].tolist()
+    )
+    if tuple(sorted(set(algorithm_ids))) != algorithm_ids:
+        raise RuntimeError(
+            "limited-by-algorithm-ID query did not report sorted unique IDs"
+        )
+    accounting = {
+        "algorithm_init": census["algorithm_init_success"]
+        + census["algorithm_init_not_supported"],
+        "limited_query": census["limited_query_success"]
+        + census["limited_query_not_supported"],
+        "heuristic_state": census["heuristic_state_success"]
+        + census["heuristic_state_rejected"],
+    }
+    expected = {
+        "algorithm_init": census["algorithm_ids"],
+        "limited_query": census["algorithm_init_success"],
+        "heuristic_state": census["results_returned"],
+    }
+    if accounting != expected:
+        raise RuntimeError(
+            "limited-by-algorithm-ID census accounting is inconsistent: "
+            f"observed={accounting}, expected={expected}, census={census}"
+        )
+    if census["results_returned"] > census["limited_query_success"]:
+        raise RuntimeError(
+            "limited-by-algorithm-ID returned more results than successful queries"
+        )
+    if (
+        census["algo_check_success"] + census["algo_check_rejected"]
+        != census["heuristic_state_success"]
+    ):
+        raise RuntimeError(
+            "limited-by-algorithm-ID AlgoCheck accounting is inconsistent: "
+            f"census={census}"
+        )
+
+    device_index = _device_index(activation)
+    compute_capability = torch.cuda.get_device_capability(activation.device)
+    candidates = tuple(
+        _heuristic_candidate(
+            m=m,
+            k=k,
+            n=n,
+            sm_count_target=sm_count_target,
+            device_index=device_index,
+            compute_capability=compute_capability,
+            activation_alignment=_alignment_class(activation),
+            weight_alignment=_alignment_class(weight),
+            workspace_alignment=_alignment_class(workspace),
+            metadata=metadata_buffer[index].tolist(),
+            waves_count=float(waves_buffer[index].item()),
+            buffer=algorithm_buffer[index].clone(),
+            discovery_source="heuristic-limited-by-algo-id",
+        )
+        for index in range(count)
+    )
+    candidate_ids = [candidate.algorithm_id for candidate in candidates]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise RuntimeError(
+            "limited-by-algorithm-ID search returned multiple candidates for one ID"
+        )
+    if not set(candidate_ids) <= set(algorithm_ids):
+        raise RuntimeError(
+            "limited-by-algorithm-ID search returned an unreported algorithm ID"
+        )
+
+    search_space = {
+        "name": "heuristic-limited-by-algo-id-v1",
+        "absolute_all_configs_claim": False,
+        "algorithm_id_coverage": (
+            "complete over sorted unique IDs returned by cublasLtMatmulAlgoGetIds"
+        ),
+        "configurations_per_algorithm_id": (
+            "at most one best configuration selected by "
+            "CUBLASLT_SEARCH_LIMITED_BY_ALGO_ID"
+        ),
+        "workspace_cap_bytes": workspace.numel(),
+        "matrix_output_alignment_contract_bytes": 256,
+        "cuda_runtime": torch.version.cuda,
+        "compute_capability": list(compute_capability),
+        "shape_mkn": [m, k, n],
+        "sm_count_target": sm_count_target,
+        "limitation": (
+            "complete algorithm-ID coverage does not enumerate each ID's tile, "
+            "stage, split-K, swizzle, cluster, or custom-option configurations"
+        ),
+    }
+    return CublasLtDrafterAlgorithmSearchResult(
+        candidates=candidates,
+        algorithm_ids=algorithm_ids,
+        census=census,
+        search_space=search_space,
+    )
+
+
+def _public_canonical_config(
+    candidate: CublasLtDrafterAlgorithm,
+) -> tuple[int, ...]:
+    return (
+        candidate.algorithm_id,
+        candidate.tile_id,
+        candidate.split_k,
+        candidate.reduction_scheme,
+        candidate.cta_swizzle,
+        candidate.custom_option,
+        candidate.stages_id,
+        candidate.inner_shape_id,
+        candidate.cluster_shape_id,
+        candidate.workspace_size,
+        candidate.state,
+    )
+
+
+def _require_unique_public_canonical_configs(
+    candidates: Sequence[CublasLtDrafterAlgorithm],
+) -> None:
+    seen: dict[tuple[int, ...], CublasLtDrafterAlgorithm] = {}
+    for candidate in candidates:
+        key = _public_canonical_config(candidate)
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = candidate
+            continue
+        raise RuntimeError(
+            "distinct opaque cuBLASLt descriptors share one public canonical "
+            "configuration; refusing an ambiguous fresh-process rediscovery: "
+            f"first_sha256={existing.opaque_algo_sha256}, "
+            f"second_sha256={candidate.opaque_algo_sha256}, config={key}"
+        )
+
+
+def discover_heuristic_by_id_portfolio(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    sm_count_target: int,
+    workspace: torch.Tensor,
+) -> CublasLtDrafterAlgorithmSearchResult:
+    """Union global heuristic top-100 with one limited search per algorithm ID."""
+
+    heuristic = discover_algorithms(
+        activation,
+        weight,
+        sm_count_target=sm_count_target,
+        top_n=MAX_ALGORITHMS,
+        workspace=workspace,
+    )
+    by_id = discover_algorithms_by_id(
+        activation,
+        weight,
+        sm_count_target=sm_count_target,
+        workspace=workspace,
+    )
+
+    candidates = list(heuristic)
+    opaque_indexes: dict[bytes, int] = {}
+    for index, candidate in enumerate(candidates):
+        if candidate.serialized_algo in opaque_indexes:
+            raise RuntimeError(
+                "global cuBLASLt heuristic returned duplicate opaque descriptors"
+            )
+        opaque_indexes[candidate.serialized_algo] = index
+    by_id_opaque = [candidate.serialized_algo for candidate in by_id.candidates]
+    if len(by_id_opaque) != len(set(by_id_opaque)):
+        raise RuntimeError(
+            "limited-by-algorithm-ID search returned duplicate opaque descriptors"
+        )
+
+    exact_overlaps = 0
+    for candidate in by_id.candidates:
+        existing_index = opaque_indexes.get(candidate.serialized_algo)
+        if existing_index is None:
+            opaque_indexes[candidate.serialized_algo] = len(candidates)
+            candidates.append(candidate)
+            continue
+        exact_overlaps += 1
+        candidates[existing_index] = replace(
+            candidates[existing_index],
+            discovery_source="heuristic+limited-by-algo-id",
+        )
+
+    census = dict(by_id.census)
+    census.update(
+        {
+            "global_heuristic_returned": len(heuristic),
+            "global_by_id_exact_overlaps": exact_overlaps,
+            "portfolio_candidates": len(candidates),
+        }
+    )
+    if len(candidates) != len(heuristic) + len(by_id.candidates) - exact_overlaps:
+        raise RuntimeError("global/by-ID union accounting is inconsistent")
+    _require_unique_public_canonical_configs(candidates)
+
+    search_space = dict(by_id.search_space)
+    search_space.update(
+        {
+            "name": "heuristic-global-top100-plus-all-id-v1",
+            "portfolio_union": (
+                "global cublasLt heuristic top-100 plus one "
+                "CUBLASLT_SEARCH_LIMITED_BY_ALGO_ID query for every successfully "
+                "initialized returned ID; every returned ID is init-accounted"
+            ),
+            "portfolio_deduplication": (
+                "exact 64-byte opaque descriptor within this process/toolkit; "
+                "a same-public-config/different-opaque collision fails closed"
+            ),
+            "rediscovery_identity": (
+                "public canonical config plus ordinal 0; opaque SHA-256 is reported "
+                "for auditing but opaque descriptors remain process-local"
+            ),
+            "timing_coverage": False,
+        }
+    )
+    return CublasLtDrafterAlgorithmSearchResult(
+        candidates=tuple(candidates),
+        algorithm_ids=by_id.algorithm_ids,
+        census=census,
+        search_space=search_space,
+    )
+
+
+def _normalize_custom_find_split_k_values(values: Sequence[int]) -> tuple[int, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError("split_k_values must be a sequence of ints")
+    normalized = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("split_k_values must contain only ints")
+        if not 2 <= value <= 2**31 - 1:
+            raise ValueError("split_k_values must be in [2,INT32_MAX]")
+        normalized.append(value)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("split_k_values must not contain duplicates")
+    return tuple(normalized)
+
+
+def _validate_custom_find_algorithm_id_accounting(
+    census: Mapping[str, int],
+) -> None:
+    accounted = (
+        census["algorithm_init_success"] + census["algorithm_init_not_supported"]
+    )
+    if accounted != census["algorithm_ids"]:
+        raise RuntimeError(
+            "custom-find algorithm-ID initialization accounting is inconsistent: "
+            f"success={census['algorithm_init_success']}, "
+            f"not_supported={census['algorithm_init_not_supported']}, "
+            f"algorithm_ids={census['algorithm_ids']}"
+        )
+
+
+def _custom_find_candidate(
+    *,
+    m: int,
+    k: int,
+    n: int,
+    sm_count_target: int,
+    device_index: int,
+    compute_capability: tuple[int, int],
+    workspace_alignment: int,
+    metadata: list[int],
+    waves_count: float,
+    buffer: torch.Tensor,
+) -> CublasLtDrafterAlgorithm:
+    serialized = bytes(buffer.tolist())
+    required_alignment_a = int(metadata[12])
+    required_alignment_b = int(metadata[13])
+    required_alignment_c = int(metadata[14])
+    required_alignment_d = int(metadata[15])
+    if (
+        min(
+            required_alignment_a,
+            required_alignment_b,
+            required_alignment_c,
+            required_alignment_d,
+        )
+        <= 0
+    ):
+        raise RuntimeError(
+            "custom-find returned a non-positive matrix-alignment requirement"
+        )
+    return CublasLtDrafterAlgorithm(
+        m=m,
+        k=k,
+        n=n,
+        sm_count_target=sm_count_target,
+        process_id=_PROCESS_CACHE_PID,
+        process_cache_token=_PROCESS_CACHE_TOKEN,
+        device_index=device_index,
+        compute_capability=compute_capability,
+        activation_alignment=required_alignment_b,
+        weight_alignment=required_alignment_a,
+        workspace_alignment=workspace_alignment,
+        output_alignment=max(required_alignment_c, required_alignment_d),
+        heuristic_rank=int(metadata[0]),
+        algorithm_id=int(metadata[1]),
+        tile_id=int(metadata[2]),
+        split_k=int(metadata[3]),
+        reduction_scheme=int(metadata[4]),
+        cta_swizzle=int(metadata[5]),
+        custom_option=int(metadata[6]),
+        stages_id=int(metadata[7]),
+        inner_shape_id=int(metadata[8]),
+        cluster_shape_id=int(metadata[9]),
+        workspace_size=int(metadata[10]),
+        state=int(metadata[11]),
+        waves_count=waves_count,
+        serialized_algo=serialized,
+        _buffer=buffer,
+        discovery_source="custom-find-v1",
+    )
+
+
+def _custom_find_search_space(
+    *,
+    m: int,
+    k: int,
+    n: int,
+    sm_count_target: int,
+    workspace: torch.Tensor,
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    normalized_split_ks: tuple[int, ...],
+    compute_capability: tuple[int, int],
+    census: Mapping[str, int],
+) -> dict[str, Any]:
+    return {
+        "name": "custom-find-v1",
+        "absolute_all_configs_claim": False,
+        "algorithm_ids": "all values returned by cublasLtMatmulAlgoGetIds",
+        "tile_ids": "CUBLASLT_ALGO_CAP_TILE_IDS (UNDEFINED when empty)",
+        "stages_ids": "CUBLASLT_ALGO_CAP_STAGES_IDS (UNDEFINED when empty)",
+        "custom_options": "0..CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX",
+        "cta_swizzles": "0..CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT",
+        "cluster_shapes": (
+            "0..<CUBLASLT_CLUSTER_SHAPE_END"
+            if census["cluster_launch_supported"]
+            else "CUBLASLT_CLUSTER_SHAPE_AUTO only"
+        ),
+        "inner_shape_ids": "AlgoInit default only; readback metadata, not swept",
+        "no_split_k_value": 0,
+        "split_k_values": list(normalized_split_ks),
+        "reduction_schemes": [1, 2, 4],
+        "workspace_cap_bytes": workspace.numel(),
+        "activation_pointer_alignment_bytes": _alignment_class(activation),
+        "weight_pointer_alignment_bytes": _alignment_class(weight),
+        "matrix_output_alignment_contract_bytes": 256,
+        "cuda_runtime": torch.version.cuda,
+        "compute_capability": list(compute_capability),
+        "shape_mkn": [m, k, n],
+        "sm_count_target": sm_count_target,
+        "limitation": (
+            "CUDA exposes no supported-value/max query for SPLITK_NUM and no "
+            "inner-shape capability list; completeness is only over this declared domain"
+        ),
+    }
+
+
+def collect_custom_find_v1_census(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    sm_count_target: int,
+    workspace: torch.Tensor,
+    split_k_values: Sequence[int] = CUSTOM_FIND_V1_SPLIT_K_VALUES,
+) -> CublasLtCustomFindCensusResult:
+    """Count the complete declared CustomFind-v1 domain in one native pass.
+
+    This feasibility diagnostic uses zero candidate capacity. It returns only
+    exact census and search-domain metadata: no opaque descriptors, runnable
+    candidates, candidate timings, or performance-coverage claim.
+    """
+
+    _require_originating_process()
+    m, k, n = _validate_problem(activation, weight, workspace)
+    if isinstance(sm_count_target, bool) or not isinstance(sm_count_target, int):
+        raise TypeError("sm_count_target must be an int")
+    if not 0 <= sm_count_target <= 2**31 - 1:
+        raise ValueError("sm_count_target must be in [0,INT32_MAX]")
+    normalized_split_ks = _normalize_custom_find_split_k_values(split_k_values)
+
+    split_k_buffer = torch.tensor(normalized_split_ks, dtype=torch.int32)
+    algorithm_buffer = torch.empty(
+        (0, _ALGORITHM_BYTES), dtype=torch.uint8, device="cpu"
+    )
+    metadata_buffer = torch.empty(
+        (0, _CUSTOM_FIND_METADATA_FIELDS), dtype=torch.int64, device="cpu"
+    )
+    waves_buffer = torch.empty(0, dtype=torch.float32, device="cpu")
+    algorithm_ids_buffer = torch.empty(_MAX_ALGORITHM_IDS, dtype=torch.int32)
+    census_buffer = torch.empty(
+        len(_CUSTOM_FIND_CENSUS_FIELDS), dtype=torch.int64, device="cpu"
+    )
+    with torch.cuda.device(activation.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "cuBLASLt custom-find census is forbidden during CUDA graph capture"
+            )
+        total = int(
+            _jit_cublaslt_drafter_gemm_module().enumerate_custom_find_v1(
+                activation,
+                weight,
+                workspace,
+                split_k_buffer,
+                algorithm_buffer,
+                metadata_buffer,
+                waves_buffer,
+                algorithm_ids_buffer,
+                census_buffer,
+                sm_count_target,
+            )
+        )
+
+    census = dict(
+        zip(
+            _CUSTOM_FIND_CENSUS_FIELDS,
+            (int(value) for value in census_buffer.tolist()),
+        )
+    )
+    _validate_custom_find_algorithm_id_accounting(census)
+    if total < 0 or total != census["legal_unique"]:
+        raise RuntimeError(
+            "custom-find census native total disagrees with its census: "
+            f"return={total}, legal_unique={census['legal_unique']}"
+        )
+    if census["copied"] != 0:
+        raise RuntimeError(
+            "census-only CustomFind unexpectedly serialized runnable candidates: "
+            f"copied={census['copied']}"
+        )
+    algorithm_id_count = census["algorithm_ids"]
+    if not 0 < algorithm_id_count <= _MAX_ALGORITHM_IDS:
+        raise RuntimeError(
+            f"invalid custom-find algorithm-id count {algorithm_id_count}"
+        )
+    algorithm_ids = tuple(
+        int(value) for value in algorithm_ids_buffer[:algorithm_id_count].tolist()
+    )
+    if tuple(sorted(set(algorithm_ids))) != algorithm_ids:
+        raise RuntimeError("custom-find algorithm IDs are not sorted and unique")
+
+    compute_capability = torch.cuda.get_device_capability(activation.device)
+    search_space = _custom_find_search_space(
+        m=m,
+        k=k,
+        n=n,
+        sm_count_target=sm_count_target,
+        workspace=workspace,
+        activation=activation,
+        weight=weight,
+        normalized_split_ks=normalized_split_ks,
+        compute_capability=compute_capability,
+        census=census,
+    )
+    search_space.update(
+        {
+            "result_kind": "feasibility-census-only",
+            "native_passes": 1,
+            "candidate_serialization_capacity": 0,
+            "runnable_candidates_returned": False,
+            "timing_coverage": False,
+        }
+    )
+    return CublasLtCustomFindCensusResult(
+        algorithm_ids=algorithm_ids,
+        census=census,
+        search_space=search_space,
+    )
+
+
+def enumerate_custom_find_v1(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    sm_count_target: int,
+    workspace: torch.Tensor,
+    split_k_values: Sequence[int] = CUSTOM_FIND_V1_SPLIT_K_VALUES,
+    initial_capacity: int = CUSTOM_FIND_V1_INITIAL_CAPACITY,
+    max_candidates: int = CUSTOM_FIND_V1_MAX_CANDIDATES,
+) -> CublasLtDrafterAlgorithmSearchResult:
+    """Enumerate NVIDIA CustomFind's finite declared configuration domain.
+
+    This is deliberately named ``custom-find-v1``, not "all algorithms". CUDA
+    exposes no supported-value query for ``SPLITK_NUM`` and no capability list
+    for inner-shape IDs. The domain mirrors NVIDIA's CustomFind sample: all
+    returned algorithm IDs, capability-listed tile/stage IDs, every custom
+    option and supported CTA swizzle, every cluster enum on cluster-capable
+    devices, no-split plus the explicitly supplied split-K sequence, and every
+    supported reduction scheme. Inner shape remains at ``AlgoInit``'s default
+    and is read back into candidate metadata.
+
+    The native routine always returns the total legal unique count even when the
+    output buffer is smaller. This wrapper grows and reruns until every candidate
+    fits, or fails rather than silently truncating at ``max_candidates``.
+    ``AlgoCheck`` and workspace/alignment gates run here; callers must still run
+    candidates once and synchronize because cuBLASLt documents that AlgoCheck
+    cannot validate actual buffer pointers.
+    """
+
+    _require_originating_process()
+    m, k, n = _validate_problem(activation, weight, workspace)
+    if isinstance(sm_count_target, bool) or not isinstance(sm_count_target, int):
+        raise TypeError("sm_count_target must be an int")
+    if not 0 <= sm_count_target <= 2**31 - 1:
+        raise ValueError("sm_count_target must be in [0,INT32_MAX]")
+    normalized_split_ks = _normalize_custom_find_split_k_values(split_k_values)
+    for name, value in (
+        ("initial_capacity", initial_capacity),
+        ("max_candidates", max_candidates),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an int")
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+    if initial_capacity > max_candidates:
+        raise ValueError("initial_capacity must not exceed max_candidates")
+
+    split_k_buffer = torch.tensor(normalized_split_ks, dtype=torch.int32)
+    algorithm_ids_buffer = torch.empty(_MAX_ALGORITHM_IDS, dtype=torch.int32)
+    module = _jit_cublaslt_drafter_gemm_module()
+    capacity = initial_capacity
+    first_total: int | None = None
+    reruns = 0
+    with torch.cuda.device(activation.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "cuBLASLt custom-find enumeration is forbidden during CUDA graph capture"
+            )
+        while True:
+            algorithm_buffer = torch.empty(
+                (capacity, _ALGORITHM_BYTES), dtype=torch.uint8, device="cpu"
+            )
+            metadata_buffer = torch.empty(
+                (capacity, _CUSTOM_FIND_METADATA_FIELDS),
+                dtype=torch.int64,
+                device="cpu",
+            )
+            waves_buffer = torch.empty(capacity, dtype=torch.float32, device="cpu")
+            census_buffer = torch.empty(
+                len(_CUSTOM_FIND_CENSUS_FIELDS), dtype=torch.int64, device="cpu"
+            )
+            total = int(
+                module.enumerate_custom_find_v1(
+                    activation,
+                    weight,
+                    workspace,
+                    split_k_buffer,
+                    algorithm_buffer,
+                    metadata_buffer,
+                    waves_buffer,
+                    algorithm_ids_buffer,
+                    census_buffer,
+                    sm_count_target,
+                )
+            )
+            census_values = [int(value) for value in census_buffer.tolist()]
+            census = dict(zip(_CUSTOM_FIND_CENSUS_FIELDS, census_values))
+            _validate_custom_find_algorithm_id_accounting(census)
+            if total < 0 or census["legal_unique"] != total:
+                raise RuntimeError(
+                    "custom-find native total disagrees with its census: "
+                    f"return={total}, census={census['legal_unique']}"
+                )
+            if census["copied"] != min(total, capacity):
+                raise RuntimeError(
+                    "custom-find native copied count is inconsistent: "
+                    f"copied={census['copied']}, total={total}, capacity={capacity}"
+                )
+            if first_total is not None and total != first_total:
+                raise RuntimeError(
+                    "custom-find candidate count changed while growing buffers: "
+                    f"first={first_total}, rerun={total}"
+                )
+            first_total = total
+            if total <= capacity:
+                break
+            if total > max_candidates:
+                raise RuntimeError(
+                    "custom-find legal candidate count exceeds the declared safety "
+                    f"cap: total={total}, max_candidates={max_candidates}; census={census}"
+                )
+            capacity = min(max_candidates, max(total, capacity * 2))
+            reruns += 1
+
+    algorithm_id_count = census["algorithm_ids"]
+    if not 0 < algorithm_id_count <= _MAX_ALGORITHM_IDS:
+        raise RuntimeError(
+            f"invalid custom-find algorithm-id count {algorithm_id_count}"
+        )
+    algorithm_ids = tuple(
+        int(value) for value in algorithm_ids_buffer[:algorithm_id_count].tolist()
+    )
+    if tuple(sorted(set(algorithm_ids))) != algorithm_ids:
+        raise RuntimeError("custom-find algorithm IDs are not sorted and unique")
+
+    device_index = _device_index(activation)
+    compute_capability = torch.cuda.get_device_capability(activation.device)
+    workspace_alignment = _alignment_class(workspace)
+    candidates = []
+    for index in range(total):
+        buffer = algorithm_buffer[index].clone()
+        candidates.append(
+            _custom_find_candidate(
+                m=m,
+                k=k,
+                n=n,
+                sm_count_target=sm_count_target,
+                device_index=device_index,
+                compute_capability=compute_capability,
+                workspace_alignment=workspace_alignment,
+                metadata=metadata_buffer[index].tolist(),
+                waves_count=float(waves_buffer[index].item()),
+                buffer=buffer,
+            )
+        )
+    public_keys = {
+        (
+            candidate.algorithm_id,
+            candidate.tile_id,
+            candidate.split_k,
+            candidate.reduction_scheme,
+            candidate.cta_swizzle,
+            candidate.custom_option,
+            candidate.stages_id,
+            candidate.inner_shape_id,
+            candidate.cluster_shape_id,
+        )
+        for candidate in candidates
+    }
+    if len(public_keys) != len(candidates):
+        raise RuntimeError(
+            "custom-find returned duplicate public configuration metadata"
+        )
+
+    search_space = _custom_find_search_space(
+        m=m,
+        k=k,
+        n=n,
+        sm_count_target=sm_count_target,
+        workspace=workspace,
+        activation=activation,
+        weight=weight,
+        normalized_split_ks=normalized_split_ks,
+        compute_capability=compute_capability,
+        census=census,
+    )
+    search_space.update(
+        {
+            "result_kind": "runnable-candidate-enumeration",
+            "runnable_candidates_returned": True,
+            "timing_coverage": False,
+            "candidate_buffer_initial_capacity": initial_capacity,
+            "candidate_buffer_final_capacity": capacity,
+            "candidate_buffer_max_candidates": max_candidates,
+            "candidate_buffer_reruns": reruns,
+        }
+    )
+    return CublasLtDrafterAlgorithmSearchResult(
+        candidates=tuple(candidates),
+        algorithm_ids=algorithm_ids,
+        census=census,
+        search_space=search_space,
+    )
+
+
+def discover_custom_find_v1_portfolio(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    sm_count_target: int,
+    workspace: torch.Tensor,
+    split_k_values: Sequence[int] = CUSTOM_FIND_V1_SPLIT_K_VALUES,
+    initial_capacity: int = CUSTOM_FIND_V1_INITIAL_CAPACITY,
+    max_candidates: int = CUSTOM_FIND_V1_MAX_CANDIDATES,
+) -> CublasLtDrafterAlgorithmSearchResult:
+    """Union heuristic top-100 with the declared custom-find-v1 candidates."""
+
+    heuristic = discover_algorithms(
+        activation,
+        weight,
+        sm_count_target=sm_count_target,
+        top_n=MAX_ALGORITHMS,
+        workspace=workspace,
+    )
+    custom_find = enumerate_custom_find_v1(
+        activation,
+        weight,
+        sm_count_target=sm_count_target,
+        workspace=workspace,
+        split_k_values=split_k_values,
+        initial_capacity=initial_capacity,
+        max_candidates=max_candidates,
+    )
+
+    candidates = list(heuristic)
+    opaque_indexes = {
+        candidate.serialized_algo: index for index, candidate in enumerate(candidates)
+    }
+    exact_overlaps = 0
+    for candidate in custom_find.candidates:
+        existing_index = opaque_indexes.get(candidate.serialized_algo)
+        if existing_index is None:
+            opaque_indexes[candidate.serialized_algo] = len(candidates)
+            candidates.append(candidate)
+            continue
+        exact_overlaps += 1
+        candidates[existing_index] = replace(
+            candidates[existing_index],
+            discovery_source="heuristic+custom-find-v1",
+        )
+
+    _require_unique_public_canonical_configs(candidates)
+
+    census = dict(custom_find.census)
+    census.update(
+        {
+            "heuristic_returned": len(heuristic),
+            "heuristic_custom_find_exact_overlaps": exact_overlaps,
+            "portfolio_candidates": len(candidates),
+        }
+    )
+    search_space = dict(custom_find.search_space)
+    search_space.update(
+        {
+            "portfolio_union": "cublasLt heuristic top-100 plus custom-find-v1",
+            "portfolio_deduplication": (
+                "exact 64-byte opaque descriptor within this process/toolkit; "
+                "a same-public-config/different-opaque collision fails closed"
+            ),
+            "rediscovery_identity": (
+                "public canonical config plus ordinal 0; opaque SHA-256 is reported "
+                "for auditing but opaque descriptors remain process-local"
+            ),
+        }
+    )
+    return CublasLtDrafterAlgorithmSearchResult(
+        candidates=tuple(candidates),
+        algorithm_ids=custom_find.algorithm_ids,
+        census=census,
+        search_space=search_space,
+    )
 
 
 def matmul(
@@ -561,15 +1556,7 @@ def matmul(
             f"workspace has {workspace.numel()} bytes but algorithm requires "
             f"{algorithm.workspace_size}"
         )
-    if (
-        algorithm._buffer.device.type != "cpu"
-        or algorithm._buffer.dtype is not torch.uint8
-        or algorithm._buffer.shape != (_ALGORITHM_BYTES,)
-        or not algorithm._buffer.is_contiguous()
-    ):
-        raise ValueError(
-            f"algorithm buffer must be a contiguous {_ALGORITHM_BYTES}-byte CPU tensor"
-        )
+    algorithm._validate_opaque_buffer_binding()
     m, _, n = shape_mkn
     if out is None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=activation.device)
@@ -598,8 +1585,13 @@ def matmul(
 
 
 __all__ = [
+    "CublasLtCustomFindCensusResult",
     "CublasLtDrafterAlgorithm",
+    "CublasLtDrafterAlgorithmSearchResult",
     "CublasLtDrafterTactic",
+    "CUSTOM_FIND_V1_INITIAL_CAPACITY",
+    "CUSTOM_FIND_V1_MAX_CANDIDATES",
+    "CUSTOM_FIND_V1_SPLIT_K_VALUES",
     "DEFAULT_WORKSPACE_BYTES",
     "DRAFTER_CUBLASLT_MKNS",
     "DRAFTER_CUBLASLT_PORTFOLIO_MKNS",
@@ -611,7 +1603,12 @@ __all__ = [
     "VERIFIER_CUBLASLT_PORTFOLIO_TACTICS",
     "VERIFIER_CUBLASLT_SM_COUNT_TARGET",
     "allocate_workspace",
+    "collect_custom_find_v1_census",
     "discover_algorithms",
+    "discover_algorithms_by_id",
+    "discover_custom_find_v1_portfolio",
+    "discover_heuristic_by_id_portfolio",
+    "enumerate_custom_find_v1",
     "matmul",
     "select_drafter_portfolio_algorithm",
     "select_verifier_portfolio_algorithm",

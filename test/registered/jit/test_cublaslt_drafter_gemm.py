@@ -8,7 +8,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import sglang.jit_kernel.cublaslt_drafter_gemm as cublaslt_drafter_gemm
 from sglang.jit_kernel.cublaslt_drafter_gemm import (
+    CUSTOM_FIND_V1_SPLIT_K_VALUES,
     DRAFTER_CUBLASLT_MKNS,
     DRAFTER_CUBLASLT_PORTFOLIO_MKNS,
     DRAFTER_CUBLASLT_PORTFOLIO_TACTICS,
@@ -19,7 +21,10 @@ from sglang.jit_kernel.cublaslt_drafter_gemm import (
     VERIFIER_CUBLASLT_PORTFOLIO_TACTICS,
     CublasLtDrafterAlgorithm,
     allocate_workspace,
+    collect_custom_find_v1_census,
     discover_algorithms,
+    discover_algorithms_by_id,
+    discover_heuristic_by_id_portfolio,
     matmul,
     select_drafter_portfolio_algorithm,
     select_verifier_portfolio_algorithm,
@@ -85,6 +90,55 @@ def test_drafter_portfolio_selector_uses_stable_tactic_metadata(shape_mkn):
         select_drafter_portfolio_algorithm(shape_mkn, [wrong_tactic])
     with pytest.raises(RuntimeError, match="matches=2"):
         select_drafter_portfolio_algorithm(shape_mkn, [candidate, candidate])
+
+
+def test_runnable_union_fails_closed_on_public_config_collision():
+    candidate = _fake_portfolio_algorithm(DRAFTER_CUBLASLT_PORTFOLIO_MKNS[0])
+    hidden_variant = replace(
+        candidate,
+        serialized_algo=bytes([1]) * 64,
+        _buffer=torch.ones(64, dtype=torch.uint8),
+    )
+    assert candidate.opaque_algo_sha256 != hidden_variant.opaque_algo_sha256
+    assert candidate.rediscovery_ordinal_within_canonical_config == 0
+    with pytest.raises(RuntimeError, match="ambiguous fresh-process rediscovery"):
+        cublaslt_drafter_gemm._require_unique_public_canonical_configs(
+            [candidate, hidden_variant]
+        )
+
+
+def test_custom_find_union_applies_fresh_process_identity_gate(monkeypatch):
+    candidate = _fake_portfolio_algorithm(DRAFTER_CUBLASLT_PORTFOLIO_MKNS[0])
+    hidden_variant = replace(
+        candidate,
+        serialized_algo=bytes([1]) * 64,
+        _buffer=torch.ones(64, dtype=torch.uint8),
+        discovery_source="custom-find-v1",
+    )
+    custom_find = cublaslt_drafter_gemm.CublasLtDrafterAlgorithmSearchResult(
+        candidates=(hidden_variant,),
+        algorithm_ids=(candidate.algorithm_id,),
+        census={},
+        search_space={},
+    )
+    monkeypatch.setattr(
+        cublaslt_drafter_gemm,
+        "discover_algorithms",
+        lambda *args, **kwargs: [candidate],
+    )
+    monkeypatch.setattr(
+        cublaslt_drafter_gemm,
+        "enumerate_custom_find_v1",
+        lambda *args, **kwargs: custom_find,
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous fresh-process rediscovery"):
+        cublaslt_drafter_gemm.discover_custom_find_v1_portfolio(
+            object(),
+            object(),
+            sm_count_target=52,
+            workspace=object(),
+        )
 
 
 @pytest.mark.parametrize("shape_mkn", [(32, 3072, 1024), (128, 1024, 4096)])
@@ -201,6 +255,166 @@ def test_cublaslt_drafter_candidate_matches_linear_and_is_deterministic(
     _assert_candidate_matches_linear_and_is_deterministic(shape_mkn, sm_count_target)
 
 
+def test_custom_find_v1_declares_the_nvidia_split_k_domain():
+    assert CUSTOM_FIND_V1_SPLIT_K_VALUES == (2, 3, 4, 5, 6, 8, 12, 16, 32)
+
+
+def test_extended_discovery_apis_are_exported():
+    assert {
+        "CublasLtCustomFindCensusResult",
+        "collect_custom_find_v1_census",
+        "discover_algorithms_by_id",
+        "discover_heuristic_by_id_portfolio",
+    } <= set(cublaslt_drafter_gemm.__all__)
+
+
+def test_custom_find_v1_no_split_census_is_one_pass_and_candidate_free():
+    _require_sm120()
+    from sglang.srt.multiplex.pdmux_context import initialize_spec_stream_pair
+
+    device_index = torch.cuda.current_device()
+    _, small_stream = initialize_spec_stream_pair(device_index, 132, 56)
+    m, k, n = 128, 2048, 1024
+    torch.manual_seed(20260804)
+    activation = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    workspace = allocate_workspace(device_index)
+
+    with torch.cuda.stream(small_stream):
+        result = collect_custom_find_v1_census(
+            activation,
+            weight,
+            sm_count_target=52,
+            workspace=workspace,
+            split_k_values=(),
+        )
+    small_stream.synchronize()
+
+    assert result.census["algorithm_ids"] == len(result.algorithm_ids)
+    assert (
+        result.census["algorithm_init_success"]
+        + result.census["algorithm_init_not_supported"]
+        == result.census["algorithm_ids"]
+    )
+    assert result.census["legal_unique"] > 0
+    assert result.census["copied"] == 0
+    assert result.search_space["name"] == "custom-find-v1"
+    assert result.search_space["absolute_all_configs_claim"] is False
+    assert result.search_space["split_k_values"] == []
+    assert "default only" in result.search_space["inner_shape_ids"]
+    assert result.search_space["native_passes"] == 1
+    assert result.search_space["candidate_serialization_capacity"] == 0
+    assert result.search_space["runnable_candidates_returned"] is False
+    assert result.search_space["timing_coverage"] is False
+    machine_readable = json.loads(json.dumps(result.to_dict()))
+    assert "candidates" not in machine_readable
+    print(json.dumps(machine_readable, sort_keys=True))
+
+
+def test_target52_global_plus_all_id_portfolio_executes_every_candidate():
+    _require_sm120()
+    from sglang.srt.multiplex.pdmux_context import initialize_spec_stream_pair
+
+    device_index = torch.cuda.current_device()
+    _, small_stream = initialize_spec_stream_pair(device_index, 132, 56)
+    m, k, n = 128, 2048, 1024
+    torch.manual_seed(20260804)
+    activation = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    workspace = allocate_workspace(device_index)
+    reference = F.linear(activation, weight)
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(small_stream):
+        result = discover_heuristic_by_id_portfolio(
+            activation,
+            weight,
+            sm_count_target=52,
+            workspace=workspace,
+        )
+    small_stream.synchronize()
+
+    assert result.candidates
+    assert result.census["algorithm_ids"] == len(result.algorithm_ids)
+    assert tuple(sorted(set(result.algorithm_ids))) == result.algorithm_ids
+    assert (
+        result.census["algorithm_init_success"]
+        + result.census["algorithm_init_not_supported"]
+        == result.census["algorithm_ids"]
+    )
+    assert (
+        result.census["algo_check_success"] + result.census["algo_check_rejected"]
+        == result.census["heuristic_state_success"]
+    )
+    assert (
+        result.census["portfolio_candidates"]
+        == result.census["global_heuristic_returned"]
+        + result.census["candidates"]
+        - result.census["global_by_id_exact_overlaps"]
+    )
+    assert result.search_space["absolute_all_configs_claim"] is False
+    assert result.search_space["name"] == "heuristic-global-top100-plus-all-id-v1"
+    assert "every returned ID" in result.search_space["portfolio_union"]
+    assert result.search_space["timing_coverage"] is False
+    assert len({candidate.serialized_algo for candidate in result.candidates}) == len(
+        result.candidates
+    )
+    assert {candidate.discovery_source for candidate in result.candidates} <= {
+        "heuristic",
+        "heuristic-limited-by-algo-id",
+        "heuristic+limited-by-algo-id",
+    }
+    assert all(
+        candidate.algorithm_id in result.algorithm_ids
+        for candidate in result.candidates
+        if "limited-by-algo-id" in candidate.discovery_source
+    )
+    assert all(
+        len(candidate.opaque_algo_sha256) == 64
+        and candidate.rediscovery_ordinal_within_canonical_config == 0
+        for candidate in result.candidates
+    )
+    candidate_metadata = result.candidates[0].to_dict()
+    assert (
+        candidate_metadata["opaque_algo_sha256"]
+        == result.candidates[0].opaque_algo_sha256
+    )
+    assert candidate_metadata["rediscovery_ordinal_within_canonical_config"] == 0
+
+    output = torch.empty_like(reference)
+    for candidate in result.candidates:
+        with torch.cuda.stream(small_stream):
+            output.fill_(float("nan"))
+            matmul(
+                activation,
+                weight,
+                algorithm=candidate,
+                sm_count_target=52,
+                workspace=workspace,
+                out=output,
+            )
+        small_stream.synchronize()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, reference, rtol=2e-2, atol=2.5)
+        first_bits = output.view(torch.int16).clone()
+        torch.cuda.synchronize()
+
+        with torch.cuda.stream(small_stream):
+            output.fill_(float("nan"))
+            matmul(
+                activation,
+                weight,
+                algorithm=candidate,
+                sm_count_target=52,
+                workspace=workspace,
+                out=output,
+            )
+        small_stream.synchronize()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, reference, rtol=2e-2, atol=2.5)
+        assert torch.equal(output.view(torch.int16), first_bits)
+
+
 _VERIFIER_SHAPE_IDS = [
     "verify-qkv",
     "verify-output",
@@ -302,14 +516,28 @@ def test_cublaslt_drafter_rejects_workspace_output_and_algorithm_mismatches():
             workspace=workspace,
         )
 
-    bad_algorithm_buffer = replace(
-        algorithm, _buffer=torch.empty(63, dtype=torch.uint8)
-    )
     with pytest.raises(ValueError, match="contiguous 64-byte CPU tensor"):
+        replace(algorithm, _buffer=torch.empty(63, dtype=torch.uint8))
+
+    mismatched_buffer = algorithm._buffer.clone()
+    mismatched_buffer[0] = int(mismatched_buffer[0].item()) ^ 1
+    with pytest.raises(ValueError, match="do not match immutable serialized_algo"):
+        replace(algorithm, _buffer=mismatched_buffer)
+    with pytest.raises(ValueError, match="do not match immutable serialized_algo"):
+        replace(
+            algorithm,
+            serialized_algo=bytes([algorithm.serialized_algo[0] ^ 1])
+            + algorithm.serialized_algo[1:],
+        )
+
+    mutable_buffer = algorithm._buffer.clone()
+    mutated_algorithm = replace(algorithm, _buffer=mutable_buffer)
+    mutable_buffer[0] = int(mutable_buffer[0].item()) ^ 1
+    with pytest.raises(ValueError, match="do not match immutable serialized_algo"):
         matmul(
             activation,
             weight,
-            algorithm=bad_algorithm_buffer,
+            algorithm=mutated_algorithm,
             sm_count_target=52,
             workspace=workspace,
         )
@@ -356,6 +584,100 @@ def test_cublaslt_drafter_discovery_is_forbidden_during_capture():
                 top_n=1,
                 workspace=workspace,
             )
+
+
+def test_cublaslt_by_id_discovery_is_forbidden_during_capture():
+    _require_sm120()
+    m, k, n = DRAFTER_CUBLASLT_MKNS[0]
+    activation = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+    workspace = allocate_workspace(activation.device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        with pytest.raises(RuntimeError, match="forbidden during CUDA graph capture"):
+            discover_algorithms_by_id(
+                activation,
+                weight,
+                sm_count_target=52,
+                workspace=workspace,
+            )
+
+
+def test_cublaslt_by_id_only_candidate_captures_and_replays_on_small_stream():
+    _require_sm120()
+    from sglang.srt.multiplex.pdmux_context import initialize_spec_stream_pair
+
+    device_index = torch.cuda.current_device()
+    _, small_stream = initialize_spec_stream_pair(device_index, 132, 56)
+    m, k, n = 128, 2048, 1024
+    torch.manual_seed(20260804)
+    activation = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    workspace = allocate_workspace(device_index)
+    reference = F.linear(activation, weight)
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(small_stream):
+        result = discover_heuristic_by_id_portfolio(
+            activation,
+            weight,
+            sm_count_target=52,
+            workspace=workspace,
+        )
+    small_stream.synchronize()
+    by_id_only = [
+        candidate
+        for candidate in result.candidates
+        if candidate.discovery_source == "heuristic-limited-by-algo-id"
+    ]
+    if not by_id_only:
+        pytest.skip(
+            "no by-ID-only target-52 out128 candidate: "
+            f"by_id_candidates={result.census['candidates']}, "
+            f"global_candidates={result.census['global_heuristic_returned']}, "
+            f"exact_overlaps={result.census['global_by_id_exact_overlaps']}"
+        )
+    candidate = by_id_only[0]
+    output = torch.empty_like(reference)
+
+    with torch.cuda.stream(small_stream):
+        matmul(
+            activation,
+            weight,
+            algorithm=candidate,
+            sm_count_target=52,
+            workspace=workspace,
+            out=output,
+        )
+    small_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=small_stream):
+        matmul(
+            activation,
+            weight,
+            algorithm=candidate,
+            sm_count_target=52,
+            workspace=workspace,
+            out=output,
+        )
+
+    with torch.cuda.stream(small_stream):
+        output.fill_(float("nan"))
+        graph.replay()
+    small_stream.synchronize()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=2e-2, atol=2.5)
+    first_bits = output.view(torch.int16).clone()
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(small_stream):
+        output.fill_(float("nan"))
+        graph.replay()
+    small_stream.synchronize()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=2e-2, atol=2.5)
+    assert torch.equal(output.view(torch.int16), first_bits)
 
 
 def test_cublaslt_drafter_full_device_and_targeted_queries_are_distinct_plans():
