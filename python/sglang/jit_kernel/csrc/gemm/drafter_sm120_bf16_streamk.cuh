@@ -201,8 +201,7 @@ inline void drafter_sm120_bf16_streamk(
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView activation,
     tvm::ffi::TensorView weight,
-    tvm::ffi::TensorView workspace,
-    cudaStream_t stream) {
+    tvm::ffi::TensorView workspace) {
   using namespace host;
   using namespace sglang::drafter_sm120_bf16_streamk_detail;
 
@@ -212,6 +211,7 @@ inline void drafter_sm120_bf16_streamk(
   TensorMatcher({kN, kK}).with_dtype<bf16_t>().with_device(device).verify(weight);
   TensorMatcher({kM, kN}).with_dtype<bf16_t>().with_device(device).verify(output);
   TensorMatcher({workspace_bytes}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
 
   auto arguments = make_arguments(
       static_cast<ElementD*>(output.data_ptr()),
