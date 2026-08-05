@@ -170,6 +170,12 @@ static constexpr int kM = 128;
 static constexpr int kN = 1024;
 static constexpr int kK = 2048;
 static constexpr int kSmCount = 52;
+static constexpr size_t kTensorAlignmentBytes = 16;
+static constexpr size_t kWorkspaceAlignmentBytes = 16;
+
+static_assert(Stage2Family::GemmKernel::SharedStorageSize == 51200);
+static_assert(Stage3Family::GemmKernel::SharedStorageSize == 71680);
+static_assert(Stage4Family::GemmKernel::SharedStorageSize == 92160);
 
 template <int Stages>
 inline typename KernelFamily<Stages>::Gemm::Arguments make_arguments(
@@ -232,6 +238,18 @@ inline void drafter_sm120_bf16_schedule(
   TensorMatcher({kN, kK}).with_dtype<bf16_t>().with_device(device).verify(weight);
   TensorMatcher({kM, kN}).with_dtype<bf16_t>().with_device(device).verify(output);
   TensorMatcher({workspace_bytes}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  const auto is_aligned = [](const void* pointer, size_t alignment) {
+    return reinterpret_cast<uintptr_t>(pointer) % alignment == 0;
+  };
+  RuntimeCheck(
+      is_aligned(activation.data_ptr(), kTensorAlignmentBytes),
+      "drafter SM120 BF16 activation pointer must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(weight.data_ptr(), kTensorAlignmentBytes),
+      "drafter SM120 BF16 weight pointer must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(output.data_ptr(), kTensorAlignmentBytes),
+      "drafter SM120 BF16 output pointer must be 16-byte aligned");
   const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
 
   auto arguments = make_arguments<Stages>(
@@ -248,6 +266,10 @@ inline void drafter_sm120_bf16_schedule(
       required_workspace_bytes,
       " bytes, got ",
       workspace_bytes.unwrap());
+  RuntimeCheck(
+      required_workspace_bytes == 0 ||
+          is_aligned(workspace.data_ptr(), kWorkspaceAlignmentBytes),
+      "drafter SM120 BF16 workspace pointer must be 16-byte aligned");
   void* workspace_ptr = required_workspace_bytes == 0 ? nullptr : workspace.data_ptr();
 
   Gemm gemm;

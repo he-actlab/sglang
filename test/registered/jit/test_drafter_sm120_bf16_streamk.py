@@ -19,15 +19,27 @@ _OUT128_M = 128
 _OUT128_K = 2048
 _OUT128_N = 1024
 _CORRECTNESS_SEEDS = (20260805, 20260806)
-_WORKSPACE_BYTES = 32 * 1024 * 1024
+_STREAMK_WORKSPACE_BYTES = 524_544
 _REQUIRED_ALIGNMENT = 256
 _CONFIGS = (
-    ("s2-dp", "drafter_sm120_bf16_streamk_s2_dp"),
-    ("s2-streamk", "drafter_sm120_bf16_streamk_s2_streamk"),
-    ("s3-dp", "drafter_sm120_bf16_streamk_s3_dp"),
-    ("s3-streamk", "drafter_sm120_bf16_streamk_s3_streamk"),
-    ("s4-dp", "drafter_sm120_bf16_streamk_s4_dp"),
-    ("s4-streamk", "drafter_sm120_bf16_streamk_s4_streamk"),
+    ("s2-dp", "drafter_sm120_bf16_streamk_s2_dp", 0),
+    (
+        "s2-streamk",
+        "drafter_sm120_bf16_streamk_s2_streamk",
+        _STREAMK_WORKSPACE_BYTES,
+    ),
+    ("s3-dp", "drafter_sm120_bf16_streamk_s3_dp", 0),
+    (
+        "s3-streamk",
+        "drafter_sm120_bf16_streamk_s3_streamk",
+        _STREAMK_WORKSPACE_BYTES,
+    ),
+    ("s4-dp", "drafter_sm120_bf16_streamk_s4_dp", 0),
+    (
+        "s4-streamk",
+        "drafter_sm120_bf16_streamk_s4_streamk",
+        _STREAMK_WORKSPACE_BYTES,
+    ),
 )
 
 
@@ -40,15 +52,19 @@ def test_drafter_sm120_bf16_streamk_compiles_and_loads_without_launch() -> None:
     module = _jit_drafter_sm120_bf16_streamk_module()
     assert module is not None
     assert callable(module.drafter_sm120_bf16_streamk)
-    for _, symbol in _CONFIGS:
+    for _, symbol, _ in _CONFIGS:
         assert callable(getattr(module, symbol))
 
 
 @pytest.mark.skipif(not _sm120_available(), reason="SM120 is required")
-@pytest.mark.parametrize(("config_id", "symbol"), _CONFIGS, ids=[item[0] for item in _CONFIGS])
+@pytest.mark.parametrize(
+    ("config_id", "symbol", "workspace_bytes"),
+    _CONFIGS,
+    ids=[item[0] for item in _CONFIGS],
+)
 @pytest.mark.parametrize("seed", _CORRECTNESS_SEEDS)
 def test_drafter_sm120_bf16_streamk_out128_correctness(
-    seed: int, config_id: str, symbol: str
+    seed: int, config_id: str, symbol: str, workspace_bytes: int
 ) -> None:
     from sglang.srt.multiplex.pdmux_context import (
         get_spec_sm_allocated_split,
@@ -72,7 +88,7 @@ def test_drafter_sm120_bf16_streamk_out128_correctness(
     output = torch.empty(
         (_OUT128_M, _OUT128_N), dtype=torch.bfloat16, device=device
     )
-    workspace = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
 
     assert activation.shape == (_OUT128_M, _OUT128_K)
     assert weight.shape == (_OUT128_N, _OUT128_K)
@@ -81,7 +97,7 @@ def test_drafter_sm120_bf16_streamk_out128_correctness(
     assert weight.is_contiguous()
     assert output.is_contiguous()
     assert workspace.is_contiguous()
-    assert workspace.numel() == _WORKSPACE_BYTES
+    assert workspace.numel() == workspace_bytes
 
     stable_pointers = tuple(
         tensor.data_ptr() for tensor in (activation, weight, output, workspace)
@@ -96,7 +112,41 @@ def test_drafter_sm120_bf16_streamk_out128_correctness(
 
     module = _jit_drafter_sm120_bf16_streamk_module()
     kernel = getattr(module, symbol)
-    assert config_id in {item[0] for item in _CONFIGS}
+
+    if workspace_bytes:
+        insufficient_workspace = torch.empty(0, dtype=torch.uint8, device=device)
+        with pytest.raises(RuntimeError, match="requires 524544 bytes, got 0"):
+            kernel(output, activation, weight, insufficient_workspace)
+
+    if config_id == "s2-dp" and seed == _CORRECTNESS_SEEDS[0]:
+        tensors = [activation, weight, output]
+        labels = ("activation", "weight", "output")
+        for index, (label, tensor) in enumerate(zip(labels, tensors)):
+            backing = torch.empty(
+                tensor.numel() + 1, dtype=tensor.dtype, device=device
+            )
+            misaligned = backing[1:].view(tensor.shape)
+            assert misaligned.is_contiguous()
+            assert misaligned.data_ptr() % 16 != 0
+            arguments = [activation, weight, output]
+            arguments[index] = misaligned
+            with pytest.raises(
+                RuntimeError, match=f"{label} pointer must be 16-byte aligned"
+            ):
+                kernel(arguments[2], arguments[0], arguments[1], workspace)
+
+    if config_id == "s2-streamk" and seed == _CORRECTNESS_SEEDS[0]:
+        workspace_backing = torch.empty(
+            workspace_bytes + 1, dtype=torch.uint8, device=device
+        )
+        misaligned_workspace = workspace_backing[1:]
+        assert misaligned_workspace.is_contiguous()
+        assert misaligned_workspace.data_ptr() % 16 != 0
+        with pytest.raises(
+            RuntimeError, match="workspace pointer must be 16-byte aligned"
+        ):
+            kernel(output, activation, weight, misaligned_workspace)
+
     expected_bits = None
 
     def check_output() -> None:
