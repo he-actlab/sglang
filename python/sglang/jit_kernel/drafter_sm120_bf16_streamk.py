@@ -1,4 +1,4 @@
-"""Compile-only loader for the SM120 BF16 Stream-K feasibility kernel."""
+"""Loader for the finite SM120 BF16 out128 schedule microgate."""
 
 from __future__ import annotations
 
@@ -34,14 +34,38 @@ def _arch_env():
 
 @cache_once
 def _jit_drafter_sm120_bf16_streamk_module():
-    """Compile and load the candidate without invoking its exported GEMM."""
+    """Compile the six frozen stage/scheduler candidates in one module."""
 
     with _arch_env():
         return load_jit(
             "drafter_sm120_bf16_streamk",
             cuda_files=["gemm/drafter_sm120_bf16_streamk.cuh"],
             cuda_wrappers=[
-                ("drafter_sm120_bf16_streamk", "drafter_sm120_bf16_streamk")
+                ("drafter_sm120_bf16_streamk", "drafter_sm120_bf16_streamk"),
+                (
+                    "drafter_sm120_bf16_streamk_s2_dp",
+                    "drafter_sm120_bf16_streamk_s2_dp",
+                ),
+                (
+                    "drafter_sm120_bf16_streamk_s2_streamk",
+                    "drafter_sm120_bf16_streamk_s2_streamk",
+                ),
+                (
+                    "drafter_sm120_bf16_streamk_s3_dp",
+                    "drafter_sm120_bf16_streamk_s3_dp",
+                ),
+                (
+                    "drafter_sm120_bf16_streamk_s3_streamk",
+                    "drafter_sm120_bf16_streamk_s3_streamk",
+                ),
+                (
+                    "drafter_sm120_bf16_streamk_s4_dp",
+                    "drafter_sm120_bf16_streamk_s4_dp",
+                ),
+                (
+                    "drafter_sm120_bf16_streamk_s4_streamk",
+                    "drafter_sm120_bf16_streamk_s4_streamk",
+                ),
             ],
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=_cuda_flags(),

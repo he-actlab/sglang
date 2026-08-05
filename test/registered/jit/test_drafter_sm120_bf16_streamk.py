@@ -12,7 +12,7 @@ from sglang.jit_kernel.drafter_sm120_bf16_streamk import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 
-register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=600, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 _OUT128_M = 128
@@ -21,6 +21,14 @@ _OUT128_N = 1024
 _CORRECTNESS_SEEDS = (20260805, 20260806)
 _WORKSPACE_BYTES = 32 * 1024 * 1024
 _REQUIRED_ALIGNMENT = 256
+_CONFIGS = (
+    ("s2-dp", "drafter_sm120_bf16_streamk_s2_dp"),
+    ("s2-streamk", "drafter_sm120_bf16_streamk_s2_streamk"),
+    ("s3-dp", "drafter_sm120_bf16_streamk_s3_dp"),
+    ("s3-streamk", "drafter_sm120_bf16_streamk_s3_streamk"),
+    ("s4-dp", "drafter_sm120_bf16_streamk_s4_dp"),
+    ("s4-streamk", "drafter_sm120_bf16_streamk_s4_streamk"),
+)
 
 
 def _sm120_available() -> bool:
@@ -32,11 +40,16 @@ def test_drafter_sm120_bf16_streamk_compiles_and_loads_without_launch() -> None:
     module = _jit_drafter_sm120_bf16_streamk_module()
     assert module is not None
     assert callable(module.drafter_sm120_bf16_streamk)
+    for _, symbol in _CONFIGS:
+        assert callable(getattr(module, symbol))
 
 
 @pytest.mark.skipif(not _sm120_available(), reason="SM120 is required")
+@pytest.mark.parametrize(("config_id", "symbol"), _CONFIGS, ids=[item[0] for item in _CONFIGS])
 @pytest.mark.parametrize("seed", _CORRECTNESS_SEEDS)
-def test_drafter_sm120_bf16_streamk_out128_correctness(seed: int) -> None:
+def test_drafter_sm120_bf16_streamk_out128_correctness(
+    seed: int, config_id: str, symbol: str
+) -> None:
     from sglang.srt.multiplex.pdmux_context import (
         get_spec_sm_allocated_split,
         get_spec_streams,
@@ -82,6 +95,8 @@ def test_drafter_sm120_bf16_streamk_out128_correctness(seed: int) -> None:
     torch.cuda.synchronize(device)
 
     module = _jit_drafter_sm120_bf16_streamk_module()
+    kernel = getattr(module, symbol)
+    assert config_id in {item[0] for item in _CONFIGS}
     expected_bits = None
 
     def check_output() -> None:
@@ -102,15 +117,13 @@ def test_drafter_sm120_bf16_streamk_out128_correctness(seed: int) -> None:
     for _ in range(2):
         with torch.cuda.stream(small_stream):
             output.fill_(float("nan"))
-            module.drafter_sm120_bf16_streamk(
-                output, activation, weight, workspace
-            )
+            kernel(output, activation, weight, workspace)
         small_stream.synchronize()
         check_output()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=small_stream):
-        module.drafter_sm120_bf16_streamk(output, activation, weight, workspace)
+        kernel(output, activation, weight, workspace)
     assert output.data_ptr() == stable_output_pointer
 
     for _ in range(2):
@@ -119,6 +132,16 @@ def test_drafter_sm120_bf16_streamk_out128_correctness(seed: int) -> None:
             graph.replay()
         small_stream.synchronize()
         check_output()
+
+    if config_id == "s2-streamk":
+        with torch.cuda.stream(small_stream):
+            output.fill_(float("nan"))
+            module.drafter_sm120_bf16_streamk(
+                output, activation, weight, workspace
+            )
+        small_stream.synchronize()
+        assert expected_bits is not None
+        assert torch.equal(output.view(torch.int16), expected_bits)
 
 
 if __name__ == "__main__":

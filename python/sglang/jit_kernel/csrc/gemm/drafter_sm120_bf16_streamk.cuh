@@ -93,74 +93,94 @@ using SmemCopyAtomB = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, ElementB>;
 using GmemTiledCopyA = cute::SM90_TMA_LOAD;
 using GmemTiledCopyB = cute::SM90_TMA_LOAD;
 
-static constexpr int kMainloopStages = 2;
-static constexpr int kSchedulerStages = 2;
-
-using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeSm120<kSchedulerStages>;
-using DispatchPolicy =
-    cutlass::gemm::MainloopSm120TmaWarpSpecialized<kMainloopStages, kSchedulerStages, ClusterShape, KernelSchedule>;
-
-using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-    DispatchPolicy,
-    TileShape,
-    ElementA,
-    StrideA,
-    ElementB,
-    StrideB,
-    TiledMma,
-    GmemTiledCopyA,
-    SmemLayoutAtomA,
-    SmemCopyAtomA,
-    cute::identity,
-    GmemTiledCopyB,
-    SmemLayoutAtomB,
-    SmemCopyAtomB,
-    cute::identity>;
-
-using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm120,
-    cutlass::arch::OpClassTensorOp,
-    TileShape,
-    ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator,
-    ElementCompute,
-    void,
-    LayoutC,
-    kAlignmentC,
-    ElementD,
-    LayoutD,
-    kAlignmentD,
-    cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
-
 using ProblemShape = cute::Shape<int, int, int, int>;
-using GemmKernel = cutlass::gemm::kernel::
-    GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::StreamKScheduler>;
-using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-static_assert(std::is_same_v<typename GemmKernel::ArchTag, cutlass::arch::Sm120>);
-static_assert(std::is_same_v<typename GemmKernel::TileSchedulerTag, cutlass::gemm::StreamKScheduler>);
-static_assert(std::is_same_v<typename CollectiveMainloop::GmemTiledCopyA, cute::SM90_TMA_LOAD>);
-static_assert(std::is_same_v<typename CollectiveMainloop::GmemTiledCopyB, cute::SM90_TMA_LOAD>);
-static_assert(
-    std::is_same_v<
-        typename GemmKernel::TileScheduler,
-        cutlass::gemm::kernel::detail::PersistentTileSchedulerSm100StreamK<TileShape, ClusterShape, kSchedulerStages>>);
-static_assert(DispatchPolicy::Stages == kMainloopStages);
-static_assert(DispatchPolicy::Schedule::SchedulerPipelineStageCount == kSchedulerStages);
-static_assert(GemmKernel::NumMMAThreads == 256);
+// The performance gate is deliberately finite: one production-quality CUTLASS
+// kernel family, three equal mainloop/scheduler pipeline depths, and the two
+// public decomposition modes that answer the K-parallelism question.  Holding
+// every other type fixed makes scheduler and depth the only changing axes.
+template <int Stages>
+struct KernelFamily {
+  static_assert(Stages >= 2 && Stages <= 4);
+
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeSm120<Stages>;
+  using DispatchPolicy =
+      cutlass::gemm::MainloopSm120TmaWarpSpecialized<Stages, Stages, ClusterShape, KernelSchedule>;
+  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+      DispatchPolicy,
+      TileShape,
+      ElementA,
+      StrideA,
+      ElementB,
+      StrideB,
+      TiledMma,
+      GmemTiledCopyA,
+      SmemLayoutAtomA,
+      SmemCopyAtomA,
+      cute::identity,
+      GmemTiledCopyB,
+      SmemLayoutAtomB,
+      SmemCopyAtomB,
+      cute::identity>;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm120,
+      cutlass::arch::OpClassTensorOp,
+      TileShape,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementCompute,
+      void,
+      LayoutC,
+      kAlignmentC,
+      ElementD,
+      LayoutD,
+      kAlignmentD,
+      cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      cutlass::gemm::StreamKScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  static_assert(std::is_same_v<typename GemmKernel::ArchTag, cutlass::arch::Sm120>);
+  static_assert(std::is_same_v<typename GemmKernel::TileSchedulerTag, cutlass::gemm::StreamKScheduler>);
+  static_assert(std::is_same_v<typename CollectiveMainloop::GmemTiledCopyA, cute::SM90_TMA_LOAD>);
+  static_assert(std::is_same_v<typename CollectiveMainloop::GmemTiledCopyB, cute::SM90_TMA_LOAD>);
+  static_assert(
+      std::is_same_v<
+          typename GemmKernel::TileScheduler,
+          cutlass::gemm::kernel::detail::PersistentTileSchedulerSm100StreamK<TileShape, ClusterShape, Stages>>);
+  static_assert(DispatchPolicy::Stages == Stages);
+  static_assert(DispatchPolicy::Schedule::SchedulerPipelineStageCount == Stages);
+  static_assert(GemmKernel::NumMMAThreads == 256);
+  static_assert(GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
+};
+
+using Stage2Family = KernelFamily<2>;
+using Stage3Family = KernelFamily<3>;
+using Stage4Family = KernelFamily<4>;
+
 static_assert(cute::size<0>(TileShape{}) == 128);
 static_assert(cute::size<1>(TileShape{}) == 32);
 static_assert(cute::size<2>(TileShape{}) == 64);
-static_assert(GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
 
 static constexpr int kM = 128;
 static constexpr int kN = 1024;
 static constexpr int kK = 2048;
 static constexpr int kSmCount = 52;
 
-inline typename Gemm::Arguments
-make_arguments(ElementD* output, const ElementA* activation, const ElementB* weight, int device_id) {
+template <int Stages>
+inline typename KernelFamily<Stages>::Gemm::Arguments make_arguments(
+    ElementD* output,
+    const ElementA* activation,
+    const ElementB* weight,
+    int device_id,
+    cutlass::gemm::kernel::detail::DecompositionMode decomposition_mode) {
+  using Family = KernelFamily<Stages>;
+  using Gemm = typename Family::Gemm;
+  using GemmKernel = typename Family::GemmKernel;
   using StrideD = typename GemmKernel::StrideD;
 
   auto stride_a = cutlass::make_cute_packed_stride(StrideA{}, {kM, kK, 1});
@@ -169,7 +189,7 @@ make_arguments(ElementD* output, const ElementA* activation, const ElementB* wei
 
   typename GemmKernel::TileSchedulerArguments scheduler_args{};
   scheduler_args.splits = 1;
-  scheduler_args.decomposition_mode = cutlass::gemm::kernel::detail::DecompositionMode::StreamK;
+  scheduler_args.decomposition_mode = decomposition_mode;
   scheduler_args.reduction_mode = cutlass::gemm::kernel::detail::ReductionMode::Deterministic;
 
   cutlass::KernelHardwareInfo hardware_info{};
@@ -194,16 +214,17 @@ make_arguments(ElementD* output, const ElementA* activation, const ElementB* wei
     RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   } while (false)
 
-// Feasibility wrapper for one exact out-projection shape. Loading the JIT
-// module instantiates this complete adapter path; the compile-only gate never
-// calls this function and therefore does not launch a device kernel.
-inline void drafter_sm120_bf16_streamk(
+template <int Stages>
+inline void drafter_sm120_bf16_schedule(
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView activation,
     tvm::ffi::TensorView weight,
-    tvm::ffi::TensorView workspace) {
+    tvm::ffi::TensorView workspace,
+    cutlass::gemm::kernel::detail::DecompositionMode decomposition_mode) {
   using namespace host;
   using namespace sglang::drafter_sm120_bf16_streamk_detail;
+  using Family = KernelFamily<Stages>;
+  using Gemm = typename Family::Gemm;
 
   SymbolicDevice device;
   SymbolicSize workspace_bytes{"workspace bytes"};
@@ -213,11 +234,12 @@ inline void drafter_sm120_bf16_streamk(
   TensorMatcher({workspace_bytes}).with_dtype<uint8_t>().with_device(device).verify(workspace);
   const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
 
-  auto arguments = make_arguments(
+  auto arguments = make_arguments<Stages>(
       static_cast<ElementD*>(output.data_ptr()),
       static_cast<const ElementA*>(activation.data_ptr()),
       static_cast<const ElementB*>(weight.data_ptr()),
-      device.unwrap().device_id);
+      device.unwrap().device_id,
+      decomposition_mode);
 
   const size_t required_workspace_bytes = Gemm::get_workspace_size(arguments);
   RuntimeCheck(
@@ -233,5 +255,37 @@ inline void drafter_sm120_bf16_streamk(
   SGLANG_DRAFTER_STREAMK_CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr, stream));
   SGLANG_DRAFTER_STREAMK_CUTLASS_CHECK(gemm.run(stream));
 }
+
+#define SGLANG_DRAFTER_DEFINE_SCHEDULE_WRAPPER(name, stages, mode) \
+  inline void name(                                                   \
+      tvm::ffi::TensorView output,                                    \
+      tvm::ffi::TensorView activation,                                \
+      tvm::ffi::TensorView weight,                                    \
+      tvm::ffi::TensorView workspace) {                               \
+    drafter_sm120_bf16_schedule<stages>(                              \
+        output,                                                       \
+        activation,                                                   \
+        weight,                                                       \
+        workspace,                                                    \
+        cutlass::gemm::kernel::detail::DecompositionMode::mode);      \
+  }
+
+SGLANG_DRAFTER_DEFINE_SCHEDULE_WRAPPER(drafter_sm120_bf16_streamk_s2_dp, 2, DataParallel)
+SGLANG_DRAFTER_DEFINE_SCHEDULE_WRAPPER(drafter_sm120_bf16_streamk_s2_streamk, 2, StreamK)
+SGLANG_DRAFTER_DEFINE_SCHEDULE_WRAPPER(drafter_sm120_bf16_streamk_s3_dp, 3, DataParallel)
+SGLANG_DRAFTER_DEFINE_SCHEDULE_WRAPPER(drafter_sm120_bf16_streamk_s3_streamk, 3, StreamK)
+SGLANG_DRAFTER_DEFINE_SCHEDULE_WRAPPER(drafter_sm120_bf16_streamk_s4_dp, 4, DataParallel)
+SGLANG_DRAFTER_DEFINE_SCHEDULE_WRAPPER(drafter_sm120_bf16_streamk_s4_streamk, 4, StreamK)
+
+// Preserve the feasibility ABI as an alias for the exact stage-2 Stream-K arm.
+inline void drafter_sm120_bf16_streamk(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  drafter_sm120_bf16_streamk_s2_streamk(output, activation, weight, workspace);
+}
+
+#undef SGLANG_DRAFTER_DEFINE_SCHEDULE_WRAPPER
 
 #undef SGLANG_DRAFTER_STREAMK_CUTLASS_CHECK
