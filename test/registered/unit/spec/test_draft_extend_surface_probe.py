@@ -1,6 +1,7 @@
 """CPU-side contracts for the fixed-52 draft-extend surface probe."""
 
 import contextlib
+import hashlib
 import json
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from sglang.srt.utils.draft_extend_surface_probe import (
     EXPECTED_CALLS,
     EXPECTED_SHAPES,
     SURFACE_ORDER,
+    build_selected_replay_workload_identity,
     create_surface_probe,
     draft_extend_attention_scope,
     draft_extend_lm_head_scope,
@@ -137,6 +139,8 @@ def _config(
     ncu_range=False,
     ncu_replay_index=2,
     require_plan_metadata=False,
+    workload_calibration=False,
+    ncu_workload_sha256="",
     config_identity=None,
 ):
     return DraftExtendSurfaceProbeConfig(
@@ -157,6 +161,8 @@ def _config(
             else {"arm": "unit", "width": 52}
         ),
         require_prefill_plan_metadata=require_plan_metadata,
+        workload_calibration=workload_calibration,
+        ncu_workload_sha256=ncu_workload_sha256,
     )
 
 
@@ -194,6 +200,16 @@ def _emit_all_surface_calls(probe):
                 pass
         with draft_extend_lm_head_scope(lm_input, lm_head):
             pass
+
+
+def _workload_identity():
+    return build_selected_replay_workload_identity(
+        rids=[f"todo50-p2-measure-{index:04d}-0123456789abcdef" for index in range(32)],
+        seq_lens=[129 + index for index in range(32)],
+        extend_seq_lens=[4] * 32,
+        num_tokens_per_req=4,
+        page_size=16,
+    )
 
 
 class DraftExtendSurfaceProbeTests(CustomTestCase):
@@ -360,25 +376,167 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
         self.assertEqual(synchronize.call_count, 2)
 
     def test_one_shot_ncu_range_uses_only_exact_second_replay(self):
-        probe = DraftExtendSurfaceProbe(
-            _config(mode="off", surfaces=(), ncu_range=True, ncu_replay_index=2),
-            event_factory=_FakeEventFactory(),
-        )
-        with (
-            patch.object(torch.cuda, "synchronize") as synchronize,
-            patch.object(torch.cuda.nvtx, "range_push") as push,
-            patch.object(torch.cuda.nvtx, "range_pop") as pop,
-        ):
-            self.assertIsNone(probe.before_replay(raw_bs=4, padded_bs=32))
-            first = probe.before_replay(raw_bs=32, padded_bs=32)
-            probe.after_replay(first, raw_bs=32, padded_bs=32, succeeded=True)
-            second = probe.before_replay(raw_bs=32, padded_bs=32)
-            probe.after_replay(second, raw_bs=32, padded_bs=32, succeeded=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "selected.jsonl"
+            probe = DraftExtendSurfaceProbe(
+                _config(
+                    mode="off",
+                    surfaces=(),
+                    ncu_range=True,
+                    ncu_replay_index=2,
+                    output_path=str(output),
+                ),
+                event_factory=_FakeEventFactory(),
+            )
+            with (
+                patch.object(torch.cuda, "synchronize") as synchronize,
+                patch.object(torch.cuda.nvtx, "range_push") as push,
+                patch.object(torch.cuda.nvtx, "range_pop") as pop,
+            ):
+                self.assertIsNone(probe.before_replay(raw_bs=4, padded_bs=32))
+                first = probe.before_replay(
+                    raw_bs=32,
+                    padded_bs=32,
+                    workload_identity=_workload_identity(),
+                )
+                probe.after_replay(first, raw_bs=32, padded_bs=32, succeeded=True)
+                second = probe.before_replay(
+                    raw_bs=32,
+                    padded_bs=32,
+                    workload_identity=_workload_identity(),
+                )
+                probe.after_replay(second, raw_bs=32, padded_bs=32, succeeded=True)
+            probe._output.close()
 
-        push.assert_called_once_with("S2_M128")
-        pop.assert_called_once_with()
-        self.assertEqual(synchronize.call_count, 2)
-        self.assertEqual(probe.ncu_include_expression, "S2_M128/")
+            [record] = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(record["kind"], "draft_extend_selected_replay_workload")
+            self.assertEqual(record["logical_workload"], _workload_identity())
+            self.assertEqual(len(record["logical_workload_sha256"]), 64)
+            self.assertEqual(record["selection_mode"], "legacy-exact-replay-index")
+            push.assert_called_once_with("S2_M128")
+            pop.assert_called_once_with()
+            self.assertEqual(synchronize.call_count, 2)
+            self.assertEqual(probe.ncu_include_expression, "S2_M128/")
+
+    def test_selected_ncu_replay_fails_without_exact_host_workload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            probe = DraftExtendSurfaceProbe(
+                _config(
+                    mode="off",
+                    surfaces=(),
+                    ncu_range=True,
+                    ncu_replay_index=1,
+                    output_path=str(Path(tmpdir) / "selected.jsonl"),
+                ),
+                event_factory=_FakeEventFactory(),
+            )
+            self.addCleanup(probe._output.close)
+            with self.assertRaisesRegex(RuntimeError, "logical workload identity"):
+                probe.before_replay(raw_bs=32, padded_bs=32)
+
+    def test_calibration_archives_every_exact_workload_without_nvtx(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "calibration.jsonl"
+            probe = DraftExtendSurfaceProbe(
+                _config(
+                    mode="off",
+                    surfaces=(),
+                    workload_calibration=True,
+                    output_path=str(output),
+                ),
+                event_factory=_FakeEventFactory(),
+            )
+            with (
+                patch.object(torch.cuda, "synchronize") as synchronize,
+                patch.object(torch.cuda.nvtx, "range_push") as push,
+            ):
+                for _ in range(3):
+                    token = probe.before_replay(
+                        raw_bs=32,
+                        padded_bs=32,
+                        workload_identity=_workload_identity(),
+                    )
+                    probe.after_replay(token, raw_bs=32, padded_bs=32, succeeded=True)
+            probe._output.close()
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(
+                [row["replay_index"] for row in rows],
+                [1, 2, 3],
+            )
+            self.assertTrue(
+                all(row["kind"] == "draft_extend_replay_workload" for row in rows)
+            )
+            synchronize.assert_not_called()
+            push.assert_not_called()
+
+    def test_digest_bound_range_selects_first_match_after_minimum(self):
+        workload = _workload_identity()
+        expected = hashlib.sha256(
+            json.dumps(workload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        other = json.loads(json.dumps(workload))
+        other["ordered_requests"][0]["seq_len"] += 1
+        other["ordered_requests"][0]["prefix_len"] += 1
+        other["planner_inputs"]["kv_lens_host"][0] += 1
+        for index in range(1, len(other["planner_inputs"]["kv_indptr_host"])):
+            other["planner_inputs"]["kv_indptr_host"][index] += 1
+        other["planner_inputs"]["max_kv_len"] = max(
+            other["planner_inputs"]["kv_lens_host"]
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "selected.jsonl"
+            probe = DraftExtendSurfaceProbe(
+                _config(
+                    mode="off",
+                    surfaces=(),
+                    ncu_range=True,
+                    ncu_replay_index=2,
+                    ncu_workload_sha256=expected,
+                    output_path=str(output),
+                ),
+                event_factory=_FakeEventFactory(),
+            )
+            with (
+                patch.object(torch.cuda, "synchronize") as synchronize,
+                patch.object(torch.cuda.nvtx, "range_push") as push,
+                patch.object(torch.cuda.nvtx, "range_pop") as pop,
+            ):
+                for identity in (workload, other, workload, workload):
+                    token = probe.before_replay(
+                        raw_bs=32,
+                        padded_bs=32,
+                        workload_identity=identity,
+                    )
+                    probe.after_replay(token, raw_bs=32, padded_bs=32, succeeded=True)
+            probe._output.close()
+            [record] = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(record["replay_index"], 3)
+            self.assertEqual(record["logical_workload_sha256"], expected)
+            self.assertEqual(
+                record["selection_mode"], "digest-at-or-after-minimum-replay"
+            )
+            push.assert_called_once_with("S2_M128")
+            pop.assert_called_once_with()
+            self.assertEqual(synchronize.call_count, 2)
+
+    def test_workload_identity_rejects_duplicate_or_incomplete_requests(self):
+        kwargs = {
+            "rids": [f"rid-{index}" for index in range(32)],
+            "seq_lens": [128] * 32,
+            "extend_seq_lens": [4] * 32,
+            "num_tokens_per_req": 4,
+            "page_size": 16,
+        }
+        kwargs["rids"][-1] = kwargs["rids"][0]
+        with self.assertRaisesRegex(RuntimeError, "not unique"):
+            build_selected_replay_workload_identity(**kwargs)
+        kwargs["rids"] = kwargs["rids"][:-1]
+        with self.assertRaisesRegex(RuntimeError, "exactly 32"):
+            build_selected_replay_workload_identity(**kwargs)
+        kwargs["rids"] = [f"rid-{index}" for index in range(32)]
+        kwargs["extend_seq_lens"][0] = 3
+        with self.assertRaisesRegex(RuntimeError, "exactly match"):
+            build_selected_replay_workload_identity(**kwargs)
 
     def test_call_census_fails_closed(self):
         probe = DraftExtendSurfaceProbe(
@@ -388,7 +546,6 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "call census changed"):
             with probe.capture_scope(128):
                 pass
-
 
     def test_prefill_plan_capture_and_replay_are_archived(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -436,9 +593,7 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(records[0]["prefill_plan_metadata"], capture)
             self.assertEqual(records[1]["replay_prefill_plan_metadata"], replay)
             self.assertFalse(records[1]["capture_replay_exact_match"])
-            self.assertIn(
-                "kv_chunk_size", records[1]["capture_replay_changed_fields"]
-            )
+            self.assertIn("kv_chunk_size", records[1]["capture_replay_changed_fields"])
 
     def test_prefill_plan_template_mismatch_fails_before_replay(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -505,6 +660,7 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(record["stage"], "replay")
             self.assertEqual(record["error_type"], "RuntimeError")
             self.assertIn("new batch size", record["error"])
+
     def test_factory_default_is_true_noop_and_preallocation_only_is_supported(self):
         with (
             envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("off"),
@@ -544,7 +700,6 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
                 create_surface_probe(object(), [32], 4)
         validate.assert_not_called()
 
-
     def test_plan_override_requires_equal_memory_artifact_envelope(self):
         with (
             envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("off"),
@@ -556,6 +711,7 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "PREALLOCATE=1"):
                 create_surface_probe(object(), [32], 4)
         validate.assert_not_called()
+
     def test_fixed52_validation_binds_exact_model_paths_and_server_seed(self):
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -638,15 +794,9 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(identity["server_random_seed"], 20260803)
             self.assertFalse(identity["draft_extend_flashinfer_plan_override"])
             self.assertEqual(identity["draft_extend_flashinfer_plan_width"], 0)
-            self.assertEqual(
-                identity["draft_extend_flashinfer_num_colocated_ctas"], -1
-            )
-            self.assertEqual(
-                identity["draft_extend_flashinfer_fixed_split_size"], 0
-            )
-            self.assertFalse(
-                identity["draft_extend_flashinfer_disable_split_kv"]
-            )
+            self.assertEqual(identity["draft_extend_flashinfer_num_colocated_ctas"], -1)
+            self.assertEqual(identity["draft_extend_flashinfer_fixed_split_size"], 0)
+            self.assertFalse(identity["draft_extend_flashinfer_disable_split_kv"])
             self.assertEqual(small_stream, "small-stream")
 
             invalid = (

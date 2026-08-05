@@ -813,6 +813,11 @@ class Envs:
     SGLANG_DRAFT_EXTEND_NCU_RANGE_NAME = EnvStr(
         "SGLANG_DRAFT_EXTEND_M128_REPLAY"
     )
+    # Program-2 workload admission. Calibration archives every exact-M128
+    # logical attention input without opening an NVTX range. Counter runs bind
+    # the one-shot range to the first matching digest at/after replay_index.
+    SGLANG_DRAFT_EXTEND_WORKLOAD_CALIBRATION = EnvBool(False)
+    SGLANG_DRAFT_EXTEND_NCU_WORKLOAD_SHA256 = EnvStr("")
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

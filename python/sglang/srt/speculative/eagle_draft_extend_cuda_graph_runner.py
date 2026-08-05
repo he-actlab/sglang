@@ -44,7 +44,10 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
-from sglang.srt.utils.draft_extend_surface_probe import create_surface_probe
+from sglang.srt.utils.draft_extend_surface_probe import (
+    build_selected_replay_workload_identity,
+    create_surface_probe,
+)
 
 _is_hip = is_hip()
 
@@ -294,8 +297,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             buffer_namespace = "spec-pdmux-draft"
             logger.info(
-                "[spec-pdmux] %s: graph statics in DEDICATED input-buffer "
-                "namespace",
+                "[spec-pdmux] %s: graph statics in DEDICATED input-buffer " "namespace",
                 type(self).__name__,
             )
         self.buffers.share_buffers(namespace=buffer_namespace)
@@ -340,6 +342,33 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 "armed S2 planner diagnostic requires attention plan metadata"
             )
         return getter(bs)
+
+    def _get_probe_workload_identity(
+        self, forward_batch: ForwardBatch, raw_bs: int, padded_bs: int
+    ):
+        probe = self._draft_extend_surface_probe
+        if (
+            probe is None
+            or not probe.requires_workload_identity
+            or raw_bs != 32
+            or padded_bs != 32
+        ):
+            return None
+        spec_info = forward_batch.spec_info
+        rids = forward_batch.rids
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if rids is None or seq_lens_cpu is None or extend_seq_lens_cpu is None:
+            raise RuntimeError(
+                "selected draft-extend replay lacks host request/sequence inputs"
+            )
+        return build_selected_replay_workload_identity(
+            rids=rids[:raw_bs],
+            seq_lens=seq_lens_cpu[:raw_bs].tolist(),
+            extend_seq_lens=extend_seq_lens_cpu[:raw_bs],
+            num_tokens_per_req=int(spec_info.num_tokens_per_req),
+            page_size=int(self.model_runner.page_size),
+        )
 
     def _init_forward_metadata_with_probe(
         self,
@@ -688,6 +717,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_tokens=num_tokens,
         )
         probe_prefill_plan_metadata = self._get_probe_prefill_plan_metadata(bs)
+        probe_workload_identity = self._get_probe_workload_identity(
+            forward_batch, raw_bs, bs
+        )
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on.
@@ -711,6 +743,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     raw_bs=raw_bs,
                     prefill_plan_metadata=probe_prefill_plan_metadata,
                     padded_bs=bs,
+                    workload_identity=probe_workload_identity,
                 )
                 if self._draft_extend_surface_probe is not None
                 else None

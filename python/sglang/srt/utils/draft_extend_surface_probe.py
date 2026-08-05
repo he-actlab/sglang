@@ -96,6 +96,8 @@ class DraftExtendSurfaceProbeConfig:
     device_index: int
     config_identity: Dict[str, Any]
     require_prefill_plan_metadata: bool = False
+    workload_calibration: bool = False
+    ncu_workload_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,93 @@ class _ReplayToken:
     replay_prefill_plan_metadata: Optional[Any]
     prefill_plan_exact_match: bool
     prefill_plan_changed_fields: Tuple[str, ...]
+
+
+def build_selected_replay_workload_identity(
+    *,
+    rids: Sequence[str],
+    seq_lens: Sequence[int],
+    extend_seq_lens: Sequence[int],
+    num_tokens_per_req: int,
+    page_size: int,
+) -> Dict[str, Any]:
+    """Build a JSON-stable identity for the host-known attention-plan inputs.
+
+    This deliberately excludes physical request/KV-pool slots: those addresses
+    change across fresh server processes but do not change the logical paged
+    attention workload. Every included value is already host resident before
+    replay, so evidence collection adds no device readback or cache traffic.
+    """
+
+    values = {
+        "rids": list(rids),
+        "seq_lens": [int(value) for value in seq_lens],
+        "extend_seq_lens": [int(value) for value in extend_seq_lens],
+    }
+    lengths = {key: len(value) for key, value in values.items()}
+    if set(lengths.values()) != {TARGET_BS}:
+        raise RuntimeError(
+            "selected draft-extend workload must contain exactly "
+            f"{TARGET_BS} ordered requests in every field; got {lengths}"
+        )
+    if any(not isinstance(rid, str) or not rid for rid in values["rids"]):
+        raise RuntimeError("selected draft-extend workload has an invalid request ID")
+    if len(set(values["rids"])) != TARGET_BS:
+        raise RuntimeError("selected draft-extend workload request IDs are not unique")
+    if isinstance(num_tokens_per_req, bool) or int(num_tokens_per_req) <= 0:
+        raise RuntimeError("selected draft-extend num_tokens_per_req is invalid")
+    if isinstance(page_size, bool) or int(page_size) <= 0:
+        raise RuntimeError("selected draft-extend page_size is invalid")
+    num_tokens_per_req = int(num_tokens_per_req)
+    page_size = int(page_size)
+    if any(value <= 0 for value in values["seq_lens"]):
+        raise RuntimeError("selected draft-extend sequence lengths are invalid")
+    if any(value != num_tokens_per_req for value in values["extend_seq_lens"]):
+        raise RuntimeError(
+            "selected draft-extend extend lengths must exactly match "
+            "num_tokens_per_req"
+        )
+    qo_indptr = [index * num_tokens_per_req for index in range(TARGET_BS + 1)]
+    kv_indptr = [0]
+    requests = []
+    for rid, seq_len, extend_len in zip(
+        values["rids"],
+        values["seq_lens"],
+        values["extend_seq_lens"],
+        strict=True,
+    ):
+        prefix_len = seq_len - extend_len
+        if prefix_len < 0:
+            raise RuntimeError("selected draft-extend prefix length is negative")
+        kv_indptr.append(kv_indptr[-1] + seq_len)
+        requests.append(
+            {
+                "rid": rid,
+                "seq_len": seq_len,
+                "extend_seq_len": extend_len,
+                "prefix_len": prefix_len,
+                "model_kv_storage_page_count": (seq_len + page_size - 1) // page_size,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "ordered_requests": requests,
+        "planner_inputs": {
+            "batch_size": TARGET_BS,
+            "padded_num_tokens": TARGET_M,
+            "num_tokens_per_req": num_tokens_per_req,
+            # Fast-prefill constructs kv_indptr in token units and calls the
+            # FlashInfer planner with page_size=1.  Keep the model KV-storage
+            # page size separate so the two units cannot be conflated.
+            "attention_plan_page_size": 1,
+            "kv_indptr_unit": "tokens",
+            "model_kv_storage_page_size": page_size,
+            "qo_indptr_host": qo_indptr,
+            "kv_indptr_host": kv_indptr,
+            "kv_lens_host": values["seq_lens"],
+            "max_kv_len": max(values["seq_lens"]),
+        },
+    }
 
 
 _ACTIVE_PROBE: contextvars.ContextVar[Optional["DraftExtendSurfaceProbe"]] = (
@@ -222,6 +311,7 @@ class DraftExtendSurfaceProbe:
 
         self._capture_prefill_plan_metadata = {}
         self._wrote_replay_prefill_plan_metadata = False
+        self._ncu_range_selected = False
         # All timing events are allocated before graph capture and then primed
         # on the capture stream.  external=True forces explicit event record
         # nodes into the graph instead of graph-internal dependency nodes.
@@ -244,7 +334,12 @@ class DraftExtendSurfaceProbe:
         )
 
         self._output = None
-        if config.mode == "measure" or config.require_prefill_plan_metadata:
+        if (
+            config.mode == "measure"
+            or config.require_prefill_plan_metadata
+            or config.ncu_range
+            or config.workload_calibration
+        ):
             if config.output_path is None:
                 raise ValueError(
                     "measure mode and planner-metadata capture require an output path"
@@ -270,6 +365,10 @@ class DraftExtendSurfaceProbe:
     def requires_prefill_plan_metadata(self) -> bool:
         return self.config.require_prefill_plan_metadata
 
+    @property
+    def requires_workload_identity(self) -> bool:
+        return self.config.workload_calibration or self.config.ncu_range
+
     def _write_record(self, record: Dict[str, Any]) -> None:
         if self._output is None:
             raise RuntimeError("draft-extend probe output is not open")
@@ -294,9 +393,7 @@ class DraftExtendSurfaceProbe:
                 "draft-extend S2 FlashInfer metadata lacks plan_info/controls"
             )
         missing_plan = sorted(_PREFILL_PLAN_REQUIRED_FIELDS - plan_info.keys())
-        missing_controls = sorted(
-            _PREFILL_CONTROL_REQUIRED_FIELDS - controls.keys()
-        )
+        missing_controls = sorted(_PREFILL_CONTROL_REQUIRED_FIELDS - controls.keys())
         if missing_plan or missing_controls:
             raise RuntimeError(
                 "draft-extend S2 FlashInfer metadata schema changed: "
@@ -329,18 +426,14 @@ class DraftExtendSurfaceProbe:
                 f"draft-extend S2 planner expected 188 physical SMs, got {device_sms}"
             )
         requested_width = int(identity["draft_extend_flashinfer_plan_width"])
-        requested_reserve = int(
-            identity["draft_extend_flashinfer_num_colocated_ctas"]
-        )
+        requested_reserve = int(identity["draft_extend_flashinfer_num_colocated_ctas"])
         if requested_width > 0:
             expected_width = requested_width
             expected_reserve = 2 * (device_sms - requested_width)
         elif requested_reserve >= 0:
             expected_reserve = requested_reserve
             available_ctas = 2 * device_sms - expected_reserve
-            expected_width = (
-                available_ctas // 2 if available_ctas % 2 == 0 else None
-            )
+            expected_width = available_ctas // 2 if available_ctas % 2 == 0 else None
         else:
             execution_width = int(identity["allocated_sm_split"][1])
             expected_width = execution_width
@@ -349,9 +442,7 @@ class DraftExtendSurfaceProbe:
         expected_fixed = (
             int(identity["draft_extend_flashinfer_fixed_split_size"]) or None
         )
-        expected_disable = bool(
-            identity["draft_extend_flashinfer_disable_split_kv"]
-        )
+        expected_disable = bool(identity["draft_extend_flashinfer_disable_split_kv"])
         expected_controls = {
             "device_sms": device_sms,
             "available_ctas": expected_available_ctas,
@@ -558,6 +649,7 @@ class DraftExtendSurfaceProbe:
         raw_bs: int,
         padded_bs: int,
         prefill_plan_metadata: Any = None,
+        workload_identity: Any = None,
     ) -> Optional[_ReplayToken]:
         # A smaller live batch padded to the bs=32 graph is not the workbook's
         # logical M=128 surface and must not consume warmups, samples, or the
@@ -593,6 +685,67 @@ class DraftExtendSurfaceProbe:
         self._target_replay_count += 1
         replay_index = self._target_replay_count
 
+        workload_digest = None
+        if self.requires_workload_identity:
+            if not isinstance(workload_identity, dict):
+                raise RuntimeError(
+                    "exact-M128 replay lacks host-known logical workload identity"
+                )
+            canonical = json.dumps(
+                workload_identity, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            workload_digest = hashlib.sha256(canonical).hexdigest()
+        if self.config.workload_calibration:
+            self._write_record(
+                {
+                    "schema_version": 1,
+                    "kind": "draft_extend_replay_workload",
+                    "configuration_id": self._config_id,
+                    "configuration": self.config.config_identity,
+                    "replay_index": replay_index,
+                    "raw_batch_size": raw_bs,
+                    "padded_batch_size": padded_bs,
+                    "padded_num_tokens": TARGET_M,
+                    "logical_workload": workload_identity,
+                    "logical_workload_sha256": workload_digest,
+                }
+            )
+
+        expected_digest = self.config.ncu_workload_sha256
+        selected_workload = False
+        if self.config.ncu_range and not self._ncu_range_selected:
+            if expected_digest:
+                selected_workload = (
+                    replay_index >= self.config.ncu_replay_index
+                    and workload_digest == expected_digest
+                )
+            else:
+                # Legacy Gate-S2 behavior. Program-2 always supplies a digest.
+                selected_workload = replay_index == self.config.ncu_replay_index
+        if selected_workload:
+            self._ncu_range_selected = True
+            self._write_record(
+                {
+                    "schema_version": 1,
+                    "kind": "draft_extend_selected_replay_workload",
+                    "configuration_id": self._config_id,
+                    "configuration": self.config.config_identity,
+                    "replay_index": replay_index,
+                    "minimum_replay_index": self.config.ncu_replay_index,
+                    "raw_batch_size": raw_bs,
+                    "padded_batch_size": padded_bs,
+                    "padded_num_tokens": TARGET_M,
+                    "logical_workload": workload_identity,
+                    "logical_workload_sha256": workload_digest,
+                    "expected_logical_workload_sha256": expected_digest or None,
+                    "selection_mode": (
+                        "digest-at-or-after-minimum-replay"
+                        if expected_digest
+                        else "legacy-exact-replay-index"
+                    ),
+                }
+            )
+
         # One scrub precedes the entire graph on its own SMALL stream.  Never
         # scrub between kernels/surfaces; NCU must use --cache-control none.
         if self.config.cache_mode == "cold-entry":
@@ -606,9 +759,7 @@ class DraftExtendSurfaceProbe:
             and replay_index <= self.config.warmups + self.config.samples
         )
         sample_index = replay_index - self.config.warmups if collect_sample else None
-        open_ncu_range = (
-            self.config.ncu_range and replay_index == self.config.ncu_replay_index
-        )
+        open_ncu_range = selected_workload
         if open_ncu_range:
             # Isolate the selected graph replay from earlier async work.  Range
             # replay is unsupported for this CUDA graph; this range is consumed
@@ -965,11 +1116,19 @@ def create_surface_probe(
 ) -> Optional[DraftExtendSurfaceProbe]:
     mode = envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.get().strip().lower()
     ncu_range = bool(envs.SGLANG_DRAFT_EXTEND_NCU_RANGE.get())
+    workload_calibration = bool(envs.SGLANG_DRAFT_EXTEND_WORKLOAD_CALIBRATION.get())
+    ncu_workload_sha256 = envs.SGLANG_DRAFT_EXTEND_NCU_WORKLOAD_SHA256.get().strip()
     preallocate = bool(envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_PREALLOCATE.get())
     require_plan_metadata = bool(
         envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE.get()
     )
-    if mode == "off" and not ncu_range and not preallocate and not require_plan_metadata:
+    if (
+        mode == "off"
+        and not ncu_range
+        and not workload_calibration
+        and not preallocate
+        and not require_plan_metadata
+    ):
         return None
     if mode not in ("off", "capture-only", "measure"):
         raise ValueError(
@@ -981,6 +1140,17 @@ def create_surface_probe(
             "NCU collection requires surface probe mode=off so the profiled "
             "graph has no diagnostic event nodes"
         )
+    if workload_calibration and (ncu_range or mode != "off"):
+        raise ValueError(
+            "workload calibration requires mode=off and NCU range disabled"
+        )
+    if ncu_workload_sha256 and (
+        len(ncu_workload_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in ncu_workload_sha256)
+    ):
+        raise ValueError("NCU workload SHA256 must be empty or 64 lowercase hex digits")
+    if ncu_workload_sha256 and not ncu_range:
+        raise ValueError("NCU workload SHA256 requires NCU range mode")
 
     selected = envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_SURFACE.get().strip().lower()
     if selected == "all":
@@ -1038,6 +1208,8 @@ def create_surface_probe(
             "ncu_replay_index": ncu_replay_index,
             "ncu_range_name": ncu_range_name,
             "ncu_include_expression": f"{ncu_range_name}/",
+            "workload_calibration": workload_calibration,
+            "ncu_workload_sha256": ncu_workload_sha256,
         }
     )
     config = DraftExtendSurfaceProbeConfig(
@@ -1047,7 +1219,12 @@ def create_surface_probe(
         preallocate=preallocate,
         output_path=(
             envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_OUT.get()
-            if mode == "measure" or require_plan_metadata
+            if (
+                mode == "measure"
+                or require_plan_metadata
+                or ncu_range
+                or workload_calibration
+            )
             else None
         ),
         warmups=warmups,
@@ -1058,11 +1235,14 @@ def create_surface_probe(
         device_index=int(model_runner.gpu_id),
         config_identity=identity,
         require_prefill_plan_metadata=require_plan_metadata,
+        workload_calibration=workload_calibration,
+        ncu_workload_sha256=ncu_workload_sha256,
     )
     probe = DraftExtendSurfaceProbe(config, small_stream=small_stream)
     logger.warning(
         "draft-extend S2 probe armed: mode=%s surfaces=%s cache=%s output=%s; "
-        "preallocate=%d bytes; NCU range=%s replay=%d include=%s "
+        "preallocate=%d bytes; workload_calibration=%s; NCU range=%s "
+        "minimum_replay=%d workload_sha256=%s include=%s "
         "(use kernel replay, "
         "graph-profiling=node, cache-control=none)",
         mode,
@@ -1070,8 +1250,10 @@ def create_surface_probe(
         cache_mode,
         config.output_path,
         CACHE_PREALLOCATE_BYTES,
+        workload_calibration,
         ncu_range,
         ncu_replay_index,
+        ncu_workload_sha256 or "legacy-ordinal",
         probe.ncu_include_expression,
     )
     return probe
@@ -1083,6 +1265,7 @@ __all__ = [
     "CACHE_PREALLOCATE_BYTES",
     "EXPECTED_CALLS",
     "EXPECTED_SHAPES",
+    "build_selected_replay_workload_identity",
     "SURFACE_ORDER",
     "TARGET_M",
     "TARGET_BS",
