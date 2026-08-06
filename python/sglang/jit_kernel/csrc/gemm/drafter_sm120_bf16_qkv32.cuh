@@ -101,12 +101,16 @@ using ProblemShape = cute::Shape<int, int, int, int>;
 // kernel family, three equal mainloop/scheduler pipeline depths, and the two
 // public decomposition modes that answer the K-parallelism question.  Holding
 // every other type fixed makes scheduler and depth the only changing axes.
-template <int TileN, int Stages, int TileK = 64>
+template <int TileN, int Stages, int TileK = 64, int ClusterN = 1>
 struct KernelFamily {
   static_assert(TileN == 16 || TileN == 32 || TileN == 64);
   static_assert(TileK == 64 || TileK == 128);
   static_assert(Stages >= 3 && Stages <= 8);
+  static_assert(ClusterN == 1 || ClusterN == 2);
   using TileShape = cute::Shape<cute::_32, cute::Int<TileN>, cute::Int<TileK>>;
+  using FamilyClusterShape = cute::Shape<cute::_1, cute::Int<ClusterN>, cute::_1>;
+  using GmemTiledCopyASel = std::conditional_t<
+      ClusterN == 2, cute::SM90_TMA_LOAD_MULTICAST, cute::SM90_TMA_LOAD>;
   using TiledMma = TiledMmaFor<TileN>;
   // Narrow B tiles feed fewer values per thread than the x4 ldmatrix atom
   // provides; drop to the x2 atom at TileN == 16.
@@ -117,7 +121,7 @@ struct KernelFamily {
 
   using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpongSm120<Stages>;
   using DispatchPolicy =
-      cutlass::gemm::MainloopSm120TmaWarpSpecialized<Stages, Stages, ClusterShape, KernelSchedule>;
+      cutlass::gemm::MainloopSm120TmaWarpSpecialized<Stages, Stages, FamilyClusterShape, KernelSchedule>;
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
       DispatchPolicy,
       TileShape,
@@ -126,7 +130,7 @@ struct KernelFamily {
       ElementB,
       StrideB,
       TiledMma,
-      GmemTiledCopyA,
+      GmemTiledCopyASel,
       SmemLayoutAtomA,
       SmemCopyAtomA,
       cute::identity,
@@ -138,7 +142,7 @@ struct KernelFamily {
       cutlass::arch::Sm120,
       cutlass::arch::OpClassTensorOp,
       TileShape,
-      ClusterShape,
+      FamilyClusterShape,
       cute::Shape<cute::_32, cute::Int<TileN < 32 ? TileN : 32>>,
       ElementAccumulator,
       ElementCompute,
@@ -157,7 +161,6 @@ struct KernelFamily {
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   static_assert(std::is_same_v<typename GemmKernel::ArchTag, cutlass::arch::Sm120>);
-  static_assert(std::is_same_v<typename CollectiveMainloop::GmemTiledCopyA, cute::SM90_TMA_LOAD>);
   static_assert(std::is_same_v<typename CollectiveMainloop::GmemTiledCopyB, cute::SM90_TMA_LOAD>);
   static_assert(DispatchPolicy::Stages == Stages);
   static_assert(GemmKernel::NumMMAThreads == 128);
@@ -190,13 +193,14 @@ static_assert(N16S8Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120
 static_assert(N32K128S4Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
 static_assert(N32K128S5Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
 
-template <int TileN, int Stages, int TileK>
-inline typename KernelFamily<TileN, Stages, TileK>::Gemm::Arguments make_arguments(
+template <int TileN, int Stages, int TileK, int ClusterN = 1>
+inline typename KernelFamily<TileN, Stages, TileK, ClusterN>::Gemm::Arguments make_arguments(
     ElementD* output,
     const ElementA* activation,
     const ElementB* weight,
-    int device_id) {
-  using Family = KernelFamily<TileN, Stages, TileK>;
+    int device_id,
+    int sm_count) {
+  using Family = KernelFamily<TileN, Stages, TileK, ClusterN>;
   using Gemm = typename Family::Gemm;
   using GemmKernel = typename Family::GemmKernel;
   using StrideD = typename GemmKernel::StrideD;
@@ -209,8 +213,8 @@ inline typename KernelFamily<TileN, Stages, TileK>::Gemm::Arguments make_argumen
 
   cutlass::KernelHardwareInfo hardware_info{};
   hardware_info.device_id = device_id;
-  hardware_info.sm_count = kSmCount;
-  hardware_info.cluster_shape = dim3(1, 1, 1);
+  hardware_info.sm_count = sm_count;
+  hardware_info.cluster_shape = dim3(1, ClusterN, 1);
 
   return typename Gemm::Arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
@@ -229,7 +233,7 @@ inline typename KernelFamily<TileN, Stages, TileK>::Gemm::Arguments make_argumen
     RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   } while (false)
 
-template <int TileN, int Stages, int TileK = 64>
+template <int TileN, int Stages, int TileK = 64, int ClusterN = 1, int SmCount = 52>
 inline void drafter_sm120_bf16_qkv32_schedule(
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView activation,
@@ -237,7 +241,7 @@ inline void drafter_sm120_bf16_qkv32_schedule(
     tvm::ffi::TensorView workspace) {
   using namespace host;
   using namespace sglang::drafter_sm120_bf16_qkv32_detail;
-  using Family = KernelFamily<TileN, Stages, TileK>;
+  using Family = KernelFamily<TileN, Stages, TileK, ClusterN>;
   using Gemm = typename Family::Gemm;
 
   SymbolicDevice device;
@@ -260,11 +264,12 @@ inline void drafter_sm120_bf16_qkv32_schedule(
       "drafter SM120 BF16 output pointer must be 16-byte aligned");
   const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
 
-  auto arguments = make_arguments<TileN, Stages, TileK>(
+  auto arguments = make_arguments<TileN, Stages, TileK, ClusterN>(
       static_cast<ElementD*>(output.data_ptr()),
       static_cast<const ElementA*>(activation.data_ptr()),
       static_cast<const ElementB*>(weight.data_ptr()),
-      device.unwrap().device_id);
+      device.unwrap().device_id,
+      SmCount);
 
   const size_t required_workspace_bytes = Gemm::get_workspace_size(arguments);
   RuntimeCheck(
@@ -305,6 +310,21 @@ SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n32_s6, 32, 6)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s6, 16, 6)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s8, 16, 8)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n32_s3, 32, 3)
+
+// Knob 1 proper: force the persistent grid to two CTAs per SM.
+inline void drafter_sm120_bf16_qkv32_n32_s3_g104(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  drafter_sm120_bf16_qkv32_schedule<32, 3, 64, 1, 104>(
+      output, activation, weight, workspace);
+}
+
+// ClusterN == 2 compiles but fails at launch on this device
+// (cudaErrorLaunchFailure, 2026-08-06): consumer SM120 rejects thread-block
+// clusters, so TMA-multicast activation sharing is unreachable here. The
+// template axis is retained for documentation; no cluster symbol is exported.
 
 #define SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER_K(name, tile_n, stages, tile_k) \
   inline void name(                                                   \
