@@ -1050,8 +1050,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         allocated_split = get_spec_sm_allocated_split()
-        if allocated_split is None or allocated_split[1] != 52:
-            return fallback(f"allocated SM split={allocated_split}")
+        required_small = envs.SGLANG_QWEN3_DRAFTER_PORTFOLIO_SMALL_WIDTH.get()
+        if allocated_split is None or allocated_split[1] != required_small:
+            return fallback(
+                f"allocated SM split={allocated_split} "
+                f"(required SMALL={required_small})"
+            )
 
         enable = getattr(self.model, "enable_qwen3_drafter_cublaslt_portfolio", None)
         if not callable(enable):
