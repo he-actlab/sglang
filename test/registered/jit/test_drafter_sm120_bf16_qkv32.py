@@ -24,6 +24,10 @@ _GENEROUS_WORKSPACE_BYTES = 1_048_576
 _CONFIGS = (
     ("s4-dp", "drafter_sm120_bf16_qkv32_s4_dp", _GENEROUS_WORKSPACE_BYTES),
     ("s6-dp", "drafter_sm120_bf16_qkv32_s6_dp", _GENEROUS_WORKSPACE_BYTES),
+    ("n32-s4", "drafter_sm120_bf16_qkv32_n32_s4", _GENEROUS_WORKSPACE_BYTES),
+    ("n32-s6", "drafter_sm120_bf16_qkv32_n32_s6", _GENEROUS_WORKSPACE_BYTES),
+    ("n16-s6", "drafter_sm120_bf16_qkv32_n16_s6", _GENEROUS_WORKSPACE_BYTES),
+    ("n16-s8", "drafter_sm120_bf16_qkv32_n16_s8", _GENEROUS_WORKSPACE_BYTES),
 )
 
 

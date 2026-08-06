@@ -50,6 +50,22 @@ def _jit_drafter_sm120_bf16_qkv32_module():
                     "drafter_sm120_bf16_qkv32_s6_dp",
                     "drafter_sm120_bf16_qkv32_s6_dp",
                 ),
+                (
+                    "drafter_sm120_bf16_qkv32_n32_s4",
+                    "drafter_sm120_bf16_qkv32_n32_s4",
+                ),
+                (
+                    "drafter_sm120_bf16_qkv32_n32_s6",
+                    "drafter_sm120_bf16_qkv32_n32_s6",
+                ),
+                (
+                    "drafter_sm120_bf16_qkv32_n16_s6",
+                    "drafter_sm120_bf16_qkv32_n16_s6",
+                ),
+                (
+                    "drafter_sm120_bf16_qkv32_n16_s8",
+                    "drafter_sm120_bf16_qkv32_n16_s8",
+                ),
             ],
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=_cuda_flags(),
