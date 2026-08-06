@@ -101,11 +101,12 @@ using ProblemShape = cute::Shape<int, int, int, int>;
 // kernel family, three equal mainloop/scheduler pipeline depths, and the two
 // public decomposition modes that answer the K-parallelism question.  Holding
 // every other type fixed makes scheduler and depth the only changing axes.
-template <int TileN, int Stages>
+template <int TileN, int Stages, int TileK = 64>
 struct KernelFamily {
   static_assert(TileN == 16 || TileN == 32 || TileN == 64);
+  static_assert(TileK == 64 || TileK == 128);
   static_assert(Stages >= 3 && Stages <= 8);
-  using TileShape = cute::Shape<cute::_32, cute::Int<TileN>, cute::_64>;
+  using TileShape = cute::Shape<cute::_32, cute::Int<TileN>, cute::Int<TileK>>;
   using TiledMma = TiledMmaFor<TileN>;
   // Narrow B tiles feed fewer values per thread than the x4 ldmatrix atom
   // provides; drop to the x2 atom at TileN == 16.
@@ -169,6 +170,8 @@ using N32S4Family = KernelFamily<32, 4>;
 using N32S6Family = KernelFamily<32, 6>;
 using N16S6Family = KernelFamily<16, 6>;
 using N16S8Family = KernelFamily<16, 8>;
+using N32K128S4Family = KernelFamily<32, 4, 128>;
+using N32K128S5Family = KernelFamily<32, 5, 128>;
 
 
 
@@ -183,14 +186,16 @@ static_assert(N64S4Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120
 static_assert(N64S6Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
 static_assert(N32S6Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
 static_assert(N16S8Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
+static_assert(N32K128S4Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
+static_assert(N32K128S5Family::GemmKernel::SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes);
 
-template <int TileN, int Stages>
-inline typename KernelFamily<TileN, Stages>::Gemm::Arguments make_arguments(
+template <int TileN, int Stages, int TileK>
+inline typename KernelFamily<TileN, Stages, TileK>::Gemm::Arguments make_arguments(
     ElementD* output,
     const ElementA* activation,
     const ElementB* weight,
     int device_id) {
-  using Family = KernelFamily<TileN, Stages>;
+  using Family = KernelFamily<TileN, Stages, TileK>;
   using Gemm = typename Family::Gemm;
   using GemmKernel = typename Family::GemmKernel;
   using StrideD = typename GemmKernel::StrideD;
@@ -223,7 +228,7 @@ inline typename KernelFamily<TileN, Stages>::Gemm::Arguments make_arguments(
     RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   } while (false)
 
-template <int TileN, int Stages>
+template <int TileN, int Stages, int TileK = 64>
 inline void drafter_sm120_bf16_qkv32_schedule(
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView activation,
@@ -231,7 +236,7 @@ inline void drafter_sm120_bf16_qkv32_schedule(
     tvm::ffi::TensorView workspace) {
   using namespace host;
   using namespace sglang::drafter_sm120_bf16_qkv32_detail;
-  using Family = KernelFamily<TileN, Stages>;
+  using Family = KernelFamily<TileN, Stages, TileK>;
   using Gemm = typename Family::Gemm;
 
   SymbolicDevice device;
@@ -254,7 +259,7 @@ inline void drafter_sm120_bf16_qkv32_schedule(
       "drafter SM120 BF16 output pointer must be 16-byte aligned");
   const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
 
-  auto arguments = make_arguments<TileN, Stages>(
+  auto arguments = make_arguments<TileN, Stages, TileK>(
       static_cast<ElementD*>(output.data_ptr()),
       static_cast<const ElementA*>(activation.data_ptr()),
       static_cast<const ElementB*>(weight.data_ptr()),
@@ -299,6 +304,22 @@ SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n32_s6, 32, 6)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s6, 16, 6)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s8, 16, 8)
 
+#define SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER_K(name, tile_n, stages, tile_k) \
+  inline void name(                                                   \
+      tvm::ffi::TensorView output,                                    \
+      tvm::ffi::TensorView activation,                                \
+      tvm::ffi::TensorView weight,                                    \
+      tvm::ffi::TensorView workspace) {                               \
+    drafter_sm120_bf16_qkv32_schedule<tile_n, stages, tile_k>(        \
+        output,                                                       \
+        activation,                                                   \
+        weight,                                                       \
+        workspace);                                                   \
+  }
+
+SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER_K(drafter_sm120_bf16_qkv32_n32_k128_s4, 32, 4, 128)
+SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER_K(drafter_sm120_bf16_qkv32_n32_k128_s5, 32, 5, 128)
+
 // Default entry: the screen-selected v1 configuration.
 inline void drafter_sm120_bf16_qkv32(
     tvm::ffi::TensorView output,
@@ -309,5 +330,6 @@ inline void drafter_sm120_bf16_qkv32(
 }
 
 #undef SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER
+#undef SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER_K
 
 #undef SGLANG_DRAFTER_QKV32_CUTLASS_CHECK
