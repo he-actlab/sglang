@@ -29,6 +29,7 @@ def _jit_sm120_stream_ceiling_module():
                 ("sm120_stream_ceiling_tma", "sm120_stream_ceiling_tma"),
                 ("sm120_stream_ceiling_ld", "sm120_stream_ceiling_ld"),
                 ("sm120_stream_fill", "sm120_stream_fill"),
+                ("sm120_tma_decoupled", "sm120_tma_decoupled"),
                 ("sm120_prefetch_tick", "sm120_prefetch_tick"),
                 ("sm120_prefetch_persistent", "sm120_prefetch_persistent"),
             ],

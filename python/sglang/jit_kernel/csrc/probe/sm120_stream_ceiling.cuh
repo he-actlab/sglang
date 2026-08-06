@@ -129,9 +129,55 @@ extern "C" __global__ void __launch_bounds__(32) sm120_stream_tma_kernel(
   }
 }
 
+// Decoupled TMA reader: ONE barrier tracks a whole batch of transfers, so a
+// single producer thread fires `batch` bulk copies back-to-back without
+// waiting. In-flight requests are limited by landing space, not by CTA count
+// or by consumer granularity.
+extern "C" __global__ void sm120_tma_decoupled_kernel(
+    const uint8_t* __restrict__ source, uint64_t total_bytes,
+    int box_bytes, int batch, uint64_t* __restrict__ checksum_out) {
+  extern __shared__ __align__(128) unsigned char smem[];
+  uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
+  unsigned char* ring = smem + 128;
+
+  const uint64_t boxes_total = total_bytes / (uint64_t)box_bytes;
+  const uint64_t cta = blockIdx.x;
+  const uint64_t ctas = gridDim.x;
+  if (threadIdx.x == 0) {
+    mbar_init(bar, 1);
+    asm volatile("fence.proxy.async.shared::cta;");
+  }
+  __syncthreads();
+
+  uint64_t local = 0;
+  uint32_t phase = 0;
+  if (threadIdx.x == 0) {
+    // this CTA's contiguous stripe
+    const uint64_t first = (cta * boxes_total) / ctas;
+    const uint64_t last = ((cta + 1) * boxes_total) / ctas;
+    for (uint64_t base = first; base < last; base += batch) {
+      const int n = (int)min((uint64_t)batch, last - base);
+      mbar_expect_tx(bar, (uint32_t)(n * box_bytes));
+      for (int i = 0; i < n; ++i) {
+        tma_bulk_1d(ring + (size_t)i * box_bytes,
+                    source + (base + i) * (uint64_t)box_bytes,
+                    (uint32_t)box_bytes, bar);
+      }
+      mbar_wait(bar, phase & 1u);
+      ++phase;
+      const uint64_t* words = reinterpret_cast<const uint64_t*>(ring);
+      for (int w = 0; w < n * box_bytes / 4096; ++w) local ^= words[w * 512];
+    }
+    atomicAdd(reinterpret_cast<unsigned long long*>(checksum_out),
+              (unsigned long long)local);
+  }
+}
+
 #else
 extern "C" __global__ void sm120_stream_tma_kernel(const uint8_t*, uint64_t,
                                                    uint64_t*) {}
+extern "C" __global__ void sm120_tma_decoupled_kernel(const uint8_t*, uint64_t,
+                                                       int, int, uint64_t*) {}
 #endif
 
 extern "C" __global__ void __launch_bounds__(kLdThreads) sm120_stream_ld_kernel(
@@ -222,6 +268,35 @@ inline void sm120_stream_ceiling_tma(tvm::ffi::TensorView checksum,
       static_cast<uint64_t>(source_bytes.unwrap()),
       static_cast<uint64_t*>(checksum.data_ptr()));
   RuntimeCheck(cudaGetLastError() == cudaSuccess, "tma probe launch failed");
+}
+
+inline void sm120_tma_decoupled(tvm::ffi::TensorView checksum,
+                                tvm::ffi::TensorView source,
+                                int64_t num_ctas, int64_t box_bytes,
+                                int64_t batch) {
+  using namespace host;
+  using namespace sglang::sm120_stream_ceiling_detail;
+  SymbolicDevice device;
+  SymbolicSize source_bytes{"source bytes"};
+  TensorMatcher({source_bytes}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(source);
+  TensorMatcher({1}).with_dtype<uint64_t>().with_device(device).verify(checksum);
+  RuntimeCheck(num_ctas >= 1 && num_ctas <= 1024, "num_ctas out of range");
+  RuntimeCheck(box_bytes >= 1024 && box_bytes % 128 == 0, "box_bytes invalid");
+  RuntimeCheck(batch >= 1 && batch <= 64, "batch out of range");
+  const size_t smem = 128 + (size_t)box_bytes * batch;
+  RuntimeCheck(smem <= 101376, "landing space exceeds the sm120 per-CTA smem budget");
+  RuntimeCheck(source_bytes.unwrap() % box_bytes == 0,
+               "source bytes must be a multiple of box_bytes");
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  RuntimeCheck(cudaFuncSetAttribute(sm120_tma_decoupled_kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int)smem) == cudaSuccess,
+               "decoupled smem attribute failed");
+  sm120_tma_decoupled_kernel<<<(uint32_t)num_ctas, 32, smem, stream>>>(
+      static_cast<const uint8_t*>(source.data_ptr()),
+      (uint64_t)source_bytes.unwrap(), (int)box_bytes, (int)batch,
+      static_cast<uint64_t*>(checksum.data_ptr()));
+  RuntimeCheck(cudaGetLastError() == cudaSuccess, "decoupled launch failed");
 }
 
 inline void sm120_prefetch_tick(tvm::ffi::TensorView progress, int64_t value) {
