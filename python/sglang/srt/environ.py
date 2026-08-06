@@ -748,6 +748,11 @@ class Envs:
     # Requires SGLANG_SPEC_PDMUX_SM_HINT=2 so production fallbacks use the same
     # target-52 baseline. Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO = EnvBool(False)
+    # Experiment-only escape hatch: the drafter portfolio's tactics are pinned
+    # to target 52 internally, so they can be dispatched on a different SMALL
+    # width to isolate partition width from kernel identity. Default 52 keeps
+    # production behaviour byte-identical.
+    SGLANG_QWEN3_DRAFTER_PORTFOLIO_SMALL_WIDTH = EnvInt(52)
     # Selected per-shape cuBLASLt tactics for the exact Qwen3-8B TP1 BF16
     # target/verifier worker on an allocated 136-SM LARGE context (TODO-45).
     # Two exact verify M=128 shapes (fused QKV and down) use cached target-0
