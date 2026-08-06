@@ -36,6 +36,7 @@ _CONFIGS = (
     ("amp-s6", "drafter_sm120_bf16_qkv32_amp_s6", _GENEROUS_WORKSPACE_BYTES),
     ("amp-k64-s4", "drafter_sm120_bf16_qkv32_amp_k64_s4", _GENEROUS_WORKSPACE_BYTES),
     ("amp-k64-s5", "drafter_sm120_bf16_qkv32_amp_k64_s5", _GENEROUS_WORKSPACE_BYTES),
+    ("tmafed", "drafter_qkv32_tmafed", _GENEROUS_WORKSPACE_BYTES),
 )
 
 

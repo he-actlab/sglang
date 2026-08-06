@@ -39,7 +39,10 @@ def _jit_drafter_sm120_bf16_qkv32_module():
     with _arch_env():
         return load_jit(
             "drafter_sm120_bf16_qkv32",
-            cuda_files=["gemm/drafter_sm120_bf16_qkv32.cuh"],
+            cuda_files=[
+                "gemm/drafter_sm120_bf16_qkv32.cuh",
+                "gemm/drafter_qkv32_tmafed.cuh",
+            ],
             cuda_wrappers=[
                 ("drafter_sm120_bf16_qkv32", "drafter_sm120_bf16_qkv32"),
                 (
@@ -93,6 +96,10 @@ def _jit_drafter_sm120_bf16_qkv32_module():
                 (
                     "drafter_sm120_bf16_qkv32_amp_k64_s5",
                     "drafter_sm120_bf16_qkv32_amp_k64_s5",
+                ),
+                (
+                    "drafter_qkv32_tmafed",
+                    "drafter_qkv32_tmafed",
                 ),
                 (
                     "drafter_sm120_bf16_qkv32_n32_s3_g104",
