@@ -168,6 +168,40 @@ extern "C" __global__ void __launch_bounds__(kLdThreads) sm120_stream_fill_kerne
             static_cast<unsigned long long>(local_sum));
 }
 
+extern "C" __global__ void sm120_prefetch_tick_kernel(int* progress, int value) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    __threadfence();
+    atomicExch(progress, value);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(kLdThreads)
+sm120_prefetch_persistent_kernel(const uint64_t* __restrict__ slab_pointers,
+                                 uint64_t slab_bytes, int num_slabs,
+                                 int* __restrict__ progress,
+                                 uint64_t* __restrict__ checksum_out) {
+  // Persistent cache-filling prefetcher: resident for the whole layer loop,
+  // streams slab S with .cg loads once the compute stream's tick raises
+  // progress to >= S (exactly one layer of look-ahead, L2-budget-safe).
+  const uint64_t vecs_per_slab = slab_bytes / 16;
+  const uint64_t stride = (uint64_t)gridDim.x * kLdThreads;
+  uint64_t local_sum = 0;
+  for (int slab = 1; slab < num_slabs; ++slab) {
+    while (atomicAdd(progress, 0) < slab) {
+      __nanosleep(200);
+    }
+    const ulonglong2* vectors =
+        reinterpret_cast<const ulonglong2*>(slab_pointers[slab]);
+    for (uint64_t index = (uint64_t)blockIdx.x * kLdThreads + threadIdx.x;
+         index < vecs_per_slab; index += stride) {
+      ulonglong2 v = __ldcg(&vectors[index]);
+      local_sum ^= v.x ^ v.y;
+    }
+  }
+  atomicAdd(reinterpret_cast<unsigned long long*>(checksum_out),
+            static_cast<unsigned long long>(local_sum));
+}
+
 }  // namespace sglang::sm120_stream_ceiling_detail
 
 inline void sm120_stream_ceiling_tma(tvm::ffi::TensorView checksum,
@@ -188,6 +222,42 @@ inline void sm120_stream_ceiling_tma(tvm::ffi::TensorView checksum,
       static_cast<uint64_t>(source_bytes.unwrap()),
       static_cast<uint64_t*>(checksum.data_ptr()));
   RuntimeCheck(cudaGetLastError() == cudaSuccess, "tma probe launch failed");
+}
+
+inline void sm120_prefetch_tick(tvm::ffi::TensorView progress, int64_t value) {
+  using namespace host;
+  using namespace sglang::sm120_stream_ceiling_detail;
+  SymbolicDevice device;
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(progress);
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  sm120_prefetch_tick_kernel<<<1, 32, 0, stream>>>(
+      static_cast<int*>(progress.data_ptr()), static_cast<int>(value));
+  RuntimeCheck(cudaGetLastError() == cudaSuccess, "tick launch failed");
+}
+
+inline void sm120_prefetch_persistent(tvm::ffi::TensorView checksum,
+                                      tvm::ffi::TensorView slab_pointers,
+                                      int64_t slab_bytes,
+                                      tvm::ffi::TensorView progress,
+                                      int64_t num_ctas) {
+  using namespace host;
+  using namespace sglang::sm120_stream_ceiling_detail;
+  SymbolicDevice device;
+  SymbolicSize num_slabs{"slab count"};
+  TensorMatcher({num_slabs}).with_dtype<uint64_t>().with_device<kDLCUDA>(device).verify(slab_pointers);
+  TensorMatcher({1}).with_dtype<uint64_t>().with_device(device).verify(checksum);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(progress);
+  RuntimeCheck(num_ctas >= 1 && num_ctas <= 136, "num_ctas out of range");
+  RuntimeCheck(slab_bytes > 0 && slab_bytes % 16 == 0, "slab bytes invalid");
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  sm120_prefetch_persistent_kernel<<<static_cast<uint32_t>(num_ctas), kLdThreads,
+                                     0, stream>>>(
+      static_cast<const uint64_t*>(slab_pointers.data_ptr()),
+      static_cast<uint64_t>(slab_bytes),
+      static_cast<int>(num_slabs.unwrap()),
+      static_cast<int*>(progress.data_ptr()),
+      static_cast<uint64_t*>(checksum.data_ptr()));
+  RuntimeCheck(cudaGetLastError() == cudaSuccess, "persistent prefetch launch failed");
 }
 
 inline void sm120_stream_fill(tvm::ffi::TensorView checksum,
