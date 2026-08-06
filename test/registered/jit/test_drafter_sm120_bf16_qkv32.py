@@ -30,6 +30,7 @@ _CONFIGS = (
     ("n16-s8", "drafter_sm120_bf16_qkv32_n16_s8", _GENEROUS_WORKSPACE_BYTES),
     ("n32-k128-s4", "drafter_sm120_bf16_qkv32_n32_k128_s4", _GENEROUS_WORKSPACE_BYTES),
     ("n32-k128-s5", "drafter_sm120_bf16_qkv32_n32_k128_s5", _GENEROUS_WORKSPACE_BYTES),
+    ("n32-s3", "drafter_sm120_bf16_qkv32_n32_s3", _GENEROUS_WORKSPACE_BYTES),
 )
 
 

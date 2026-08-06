@@ -74,6 +74,10 @@ def _jit_drafter_sm120_bf16_qkv32_module():
                     "drafter_sm120_bf16_qkv32_n32_k128_s5",
                     "drafter_sm120_bf16_qkv32_n32_k128_s5",
                 ),
+                (
+                    "drafter_sm120_bf16_qkv32_n32_s3",
+                    "drafter_sm120_bf16_qkv32_n32_s3",
+                ),
             ],
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=_cuda_flags(),

@@ -172,6 +172,7 @@ using N16S6Family = KernelFamily<16, 6>;
 using N16S8Family = KernelFamily<16, 8>;
 using N32K128S4Family = KernelFamily<32, 4, 128>;
 using N32K128S5Family = KernelFamily<32, 5, 128>;
+using N32S3Family = KernelFamily<32, 3>;
 
 
 
@@ -303,6 +304,7 @@ SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n32_s4, 32, 4)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n32_s6, 32, 6)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s6, 16, 6)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s8, 16, 8)
+SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n32_s3, 32, 3)
 
 #define SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER_K(name, tile_n, stages, tile_k) \
   inline void name(                                                   \
