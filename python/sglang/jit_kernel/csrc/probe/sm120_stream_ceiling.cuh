@@ -150,6 +150,24 @@ extern "C" __global__ void __launch_bounds__(kLdThreads) sm120_stream_ld_kernel(
             static_cast<unsigned long long>(local_sum));
 }
 
+extern "C" __global__ void __launch_bounds__(kLdThreads) sm120_stream_fill_kernel(
+    const uint8_t* __restrict__ source, uint64_t total_bytes,
+    uint64_t* __restrict__ checksum_out) {
+  // Cache-FILLING reader: default global loads populate L2, so a pass over a
+  // weight slab leaves it L2-resident for a consumer that follows.
+  const uint64_t vecs_total = total_bytes / 16;
+  const uint64_t stride = (uint64_t)gridDim.x * kLdThreads;
+  uint64_t index = (uint64_t)blockIdx.x * kLdThreads + threadIdx.x;
+  const ulonglong2* vectors = reinterpret_cast<const ulonglong2*>(source);
+  uint64_t local_sum = 0;
+  for (; index < vecs_total; index += stride) {
+    ulonglong2 v = __ldcg(&vectors[index]);
+    local_sum ^= v.x ^ v.y;
+  }
+  atomicAdd(reinterpret_cast<unsigned long long*>(checksum_out),
+            static_cast<unsigned long long>(local_sum));
+}
+
 }  // namespace sglang::sm120_stream_ceiling_detail
 
 inline void sm120_stream_ceiling_tma(tvm::ffi::TensorView checksum,
@@ -170,6 +188,25 @@ inline void sm120_stream_ceiling_tma(tvm::ffi::TensorView checksum,
       static_cast<uint64_t>(source_bytes.unwrap()),
       static_cast<uint64_t*>(checksum.data_ptr()));
   RuntimeCheck(cudaGetLastError() == cudaSuccess, "tma probe launch failed");
+}
+
+inline void sm120_stream_fill(tvm::ffi::TensorView checksum,
+                              tvm::ffi::TensorView source,
+                              int64_t num_ctas) {
+  using namespace host;
+  using namespace sglang::sm120_stream_ceiling_detail;
+  SymbolicDevice device;
+  SymbolicSize source_bytes{"source bytes"};
+  TensorMatcher({source_bytes}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(source);
+  TensorMatcher({1}).with_dtype<uint64_t>().with_device(device).verify(checksum);
+  RuntimeCheck(num_ctas >= 1 && num_ctas <= 4096, "num_ctas out of range");
+  RuntimeCheck(source_bytes.unwrap() % 16 == 0, "source bytes must be a multiple of 16");
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  sm120_stream_fill_kernel<<<static_cast<uint32_t>(num_ctas), kLdThreads, 0, stream>>>(
+      static_cast<const uint8_t*>(source.data_ptr()),
+      static_cast<uint64_t>(source_bytes.unwrap()),
+      static_cast<uint64_t*>(checksum.data_ptr()));
+  RuntimeCheck(cudaGetLastError() == cudaSuccess, "fill probe launch failed");
 }
 
 inline void sm120_stream_ceiling_ld(tvm::ffi::TensorView checksum,

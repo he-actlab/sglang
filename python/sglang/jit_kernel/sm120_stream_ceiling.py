@@ -28,6 +28,7 @@ def _jit_sm120_stream_ceiling_module():
             cuda_wrappers=[
                 ("sm120_stream_ceiling_tma", "sm120_stream_ceiling_tma"),
                 ("sm120_stream_ceiling_ld", "sm120_stream_ceiling_ld"),
+                ("sm120_stream_fill", "sm120_stream_fill"),
             ],
         )
 
