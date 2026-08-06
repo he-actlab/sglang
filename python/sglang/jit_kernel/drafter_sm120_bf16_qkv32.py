@@ -102,6 +102,10 @@ def _jit_drafter_sm120_bf16_qkv32_module():
                     "drafter_qkv32_tmafed",
                 ),
                 (
+                    "drafter_qkv32_tmafed_streamonly",
+                    "drafter_qkv32_tmafed_streamonly",
+                ),
+                (
                     "drafter_sm120_bf16_qkv32_n32_s3_g104",
                     "drafter_sm120_bf16_qkv32_n32_s3_g104",
                 ),

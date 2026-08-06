@@ -95,7 +95,8 @@ __device__ inline uint32_t smem_u32(const void* p) {
 extern "C" __global__ void __launch_bounds__(kThreads)
 qkv32_tmafed_kernel(const __nv_bfloat16* __restrict__ activation,   // [32,1024]
                     const __nv_bfloat16* __restrict__ weight,       // [4096,1024]
-                    __nv_bfloat16* __restrict__ output) {           // [32,4096]
+                    __nv_bfloat16* __restrict__ output,             // [32,4096]
+                    int stream_only) {
   // > 48 KB of shared memory must be dynamic (opt-in set on the host side)
   extern __shared__ __align__(128) unsigned char smem_raw[];
   auto* smem_a = reinterpret_cast<__nv_bfloat16(*)[kK]>(smem_raw);
@@ -146,6 +147,22 @@ qkv32_tmafed_kernel(const __nv_bfloat16* __restrict__ activation,   // [32,1024]
     // consumer warp
     const int lane = tid;
     uint32_t consumed = 0;
+    if (stream_only) {
+      // measure the load path alone: same producer, same ring pacing, no math
+      float sink = 0.f;
+      for (int sub = sub_begin; sub < sub_end; ++sub, ++consumed) {
+        int s = consumed % kStages;
+        mbar_wait(&full[s], (consumed / kStages) & 1u);
+        // touch one value per 1 KB so the box cannot be elided
+        for (int off = lane; off < kSubN * kK; off += 32 * 16) {
+          sink += __bfloat162float(smem_b[s][0][off]);
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&empty[s]);
+      }
+      if (sink == 12345.678f) output[lane] = __float2bfloat16_rn(sink);
+      return;
+    }
     for (int sub = sub_begin; sub < sub_end; ++sub, ++consumed) {
       int s = consumed % kStages;
       mbar_wait(&full[s], (consumed / kStages) & 1u);
@@ -206,7 +223,7 @@ qkv32_tmafed_kernel(const __nv_bfloat16* __restrict__ activation,   // [32,1024]
 #else
 extern "C" __global__ void qkv32_tmafed_kernel(const __nv_bfloat16*,
                                                const __nv_bfloat16*,
-                                               __nv_bfloat16*) {}
+                                               __nv_bfloat16*, int) {}
 #endif
 
 }  // namespace sglang::drafter_qkv32_tmafed_detail
@@ -242,6 +259,35 @@ inline void drafter_qkv32_tmafed(tvm::ffi::TensorView output,
   qkv32_tmafed_kernel<<<kCtas, kThreads, kSmemBytes, stream>>>(
       static_cast<const __nv_bfloat16*>(activation.data_ptr()),
       static_cast<const __nv_bfloat16*>(weight.data_ptr()),
-      static_cast<__nv_bfloat16*>(output.data_ptr()));
+      static_cast<__nv_bfloat16*>(output.data_ptr()), 0);
   RuntimeCheck(cudaGetLastError() == cudaSuccess, "tmafed launch failed");
+}
+
+inline void drafter_qkv32_tmafed_streamonly(tvm::ffi::TensorView output,
+                                            tvm::ffi::TensorView activation,
+                                            tvm::ffi::TensorView weight,
+                                            tvm::ffi::TensorView workspace) {
+  using namespace host;
+  using namespace sglang::drafter_qkv32_tmafed_detail;
+  SymbolicDevice device;
+  SymbolicSize workspace_bytes{"workspace bytes"};
+  TensorMatcher({kM, kK}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(activation);
+  TensorMatcher({kN, kK}).with_dtype<bf16_t>().with_device(device).verify(weight);
+  TensorMatcher({kM, kN}).with_dtype<bf16_t>().with_device(device).verify(output);
+  TensorMatcher({workspace_bytes}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  static bool stream_attribute_set = false;
+  if (!stream_attribute_set) {
+    RuntimeCheck(cudaFuncSetAttribute(
+                     qkv32_tmafed_kernel,
+                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                     kSmemBytes) == cudaSuccess,
+                 "tmafed stream-only smem attribute failed");
+    stream_attribute_set = true;
+  }
+  qkv32_tmafed_kernel<<<kCtas, kThreads, kSmemBytes, stream>>>(
+      static_cast<const __nv_bfloat16*>(activation.data_ptr()),
+      static_cast<const __nv_bfloat16*>(weight.data_ptr()),
+      static_cast<__nv_bfloat16*>(output.data_ptr()), 1);
+  RuntimeCheck(cudaGetLastError() == cudaSuccess, "tmafed stream-only launch failed");
 }
