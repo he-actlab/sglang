@@ -874,6 +874,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _maybe_enable_qwen3_verifier_cublaslt_portfolio(self) -> bool:
         """Enable selected target-0 verifier tactics on the exact target worker."""
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 
         if (
             not envs.SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO.get()
@@ -894,8 +895,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         capability = torch.cuda.get_device_capability(self.gpu_id)
         if capability != (12, 0):
             return fallback(f"compute capability={capability}")
-        if not self.server_args.enable_spec_pdmux:
-            return fallback("--enable-spec-pdmux is off")
+        if not spec_sm_partition_enabled(self.server_args):
+            return fallback(
+                "neither --enable-spec-pdmux nor --enable-spec-sm-partition is on"
+            )
         if not self.spec_algorithm.is_standalone():
             return fallback(
                 f"speculative algorithm={self.server_args.speculative_algorithm}"
@@ -952,6 +955,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         compilation or launch failures remain visible instead of silently
         changing the experimental arm back to the control.
         """
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 
         if not envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get() or not self.is_draft_worker:
             return False
@@ -969,8 +973,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         capability = torch.cuda.get_device_capability(self.gpu_id)
         if capability != (12, 0):
             return fallback(f"compute capability={capability}")
-        if not self.server_args.enable_spec_pdmux:
-            return fallback("--enable-spec-pdmux is off")
+        if not spec_sm_partition_enabled(self.server_args):
+            return fallback(
+                "neither --enable-spec-pdmux nor --enable-spec-sm-partition is on"
+            )
         if not self.spec_algorithm.is_standalone():
             return fallback(
                 f"speculative algorithm={self.server_args.speculative_algorithm}"
@@ -1011,6 +1017,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _maybe_enable_qwen3_drafter_cublaslt_portfolio(self) -> bool:
         """Enable selected target-52 tactics on the exact draft worker."""
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 
         if (
             not envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get()
@@ -1031,8 +1038,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         capability = torch.cuda.get_device_capability(self.gpu_id)
         if capability != (12, 0):
             return fallback(f"compute capability={capability}")
-        if not self.server_args.enable_spec_pdmux:
-            return fallback("--enable-spec-pdmux is off")
+        if not spec_sm_partition_enabled(self.server_args):
+            return fallback(
+                "neither --enable-spec-pdmux nor --enable-spec-sm-partition is on"
+            )
         if not self.spec_algorithm.is_standalone():
             return fallback(
                 f"speculative algorithm={self.server_args.speculative_algorithm}"

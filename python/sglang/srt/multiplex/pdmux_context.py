@@ -397,16 +397,23 @@ def _cublas_sm_count_target_set(n: int) -> None:
 def spec_pdmux_sm_hint_capture(model_runner):
     """Apply the partition-width cuBLAS hint around a graph-capture block.
 
-    No-op unless --enable-spec-pdmux and SGLANG_SPEC_PDMUX_SM_HINT != 0.
-    Mode 1 hints only the target worker's captures (LARGE width); mode 2 also
-    hints the draft worker's captures (SMALL width). The hint is thread-local
-    (per cuBLAS handle) and always restored, so eager/stock paths and target
-    prefill capture (full-device stream) are untouched.
+    No-op unless a green-ctx SM split is in force (spec_sm_partition_enabled:
+    --enable-spec-pdmux or --enable-spec-sm-partition) and
+    SGLANG_SPEC_PDMUX_SM_HINT != 0. Mode 1 hints only the target worker's
+    captures (LARGE width); mode 2 also hints the draft worker's captures
+    (SMALL width). The hint is thread-local (per cuBLAS handle) and always
+    restored, so eager/stock paths and target prefill capture (full-device
+    stream) are untouched.
+
+    Baseline 2 takes this path too: the hint is what makes the library pick a
+    tactic for the width it will actually run on, so a partition-only control
+    that could not arm it would carry a different kernel identity from
+    production and could support no incumbent-relative claim.
     """
     from sglang.srt.environ import envs
 
     hint = 0
-    if getattr(model_runner.server_args, "enable_spec_pdmux", False):
+    if spec_sm_partition_enabled(model_runner.server_args):
         hint = envs.SGLANG_SPEC_PDMUX_SM_HINT.get()
     if hint not in (0, 1, 2):
         raise ValueError(
