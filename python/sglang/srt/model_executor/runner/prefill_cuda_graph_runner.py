@@ -136,7 +136,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         #     draft runners — draft prompt ingestion runs under a later verify.
         # None => stock behavior.
         self.capture_stream_override = None
-        if model_runner.server_args.enable_spec_pdmux:
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+        if spec_sm_partition_enabled(model_runner.server_args):
             from sglang.srt.multiplex.pdmux_context import (
                 get_spec_prefill_stream,
                 get_spec_streams,

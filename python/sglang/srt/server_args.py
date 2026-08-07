@@ -2417,13 +2417,17 @@ class ServerArgs:
         bool,
         "Co-located speculative decoding on green-context streams (M1): run the forward path on the LARGE SM partition of a green-context (large, small) stream pair. Requires a speculative algorithm, tp_size=1, and CUDA; incompatible with --enable-pdmux.",
     ] = False
+    enable_spec_sm_partition: A[
+        bool,
+        "Baseline 2 (measurement control): stock speculative decoding -- one batch at a time, a single slot, no ping-pong -- with the verify forward on the LARGE SM partition and the drafter on the SMALL partition of a green-context (large, small) stream pair. Strictly sequential. Mutually exclusive with --enable-spec-pdmux, which layers the slot pool on top of the same placement and so differs from stock in more than the SM split. Uses --spec-pdmux-sm-split for the split.",
+    ] = False
     spec_pdmux_draft_prefill_graph: A[
         bool,
         "TODO-37: piecewise-graph deferred draft prompt ingestion on SMALL. Default off; initial support is TP=1 STANDALONE, S=2, and tc_piecewise prefill.",
     ] = False
     spec_pdmux_sm_split: A[
         Optional[str],
-        "SM split for --enable-spec-pdmux as 'LARGE,SMALL' (e.g. '92,16'). Default: SMALL=16 rounded up to the arch granularity, LARGE=the rest (92,16 on a 108-SM A100).",
+        "SM split for --enable-spec-pdmux or --enable-spec-sm-partition as 'LARGE,SMALL' (e.g. '92,16'). Default: SMALL=16 rounded up to the arch granularity, LARGE=the rest (92,16 on a 108-SM A100).",
     ] = None
     spec_pdmux_admit_min_new: A[
         int,
@@ -7032,6 +7036,76 @@ class ServerArgs:
             self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
         return self._mamba_cache_chunk_size
 
+    def _check_spec_sm_partition(self):
+        # Baseline 2: SM partitioning WITHOUT the co-location slot pool. Stock
+        # scheduling is inherited by construction -- every slot/ping-pong/
+        # concurrency construct is gated on enable_spec_pdmux, which stays
+        # False here -- so this only has to fail closed on the envelope the
+        # placement itself has been validated in. Explicit raises, never bare
+        # asserts (same rationale as spec-pdmux above). Split out of
+        # check_server_args so it is unit-testable without a real model path.
+        if self.enable_spec_sm_partition:
+            if self.enable_spec_pdmux:
+                raise AssertionError(
+                    "--enable-spec-sm-partition is mutually exclusive with "
+                    "--enable-spec-pdmux: both place verify on LARGE and the "
+                    "drafter on SMALL, but spec-pdmux adds the slot pool, "
+                    "which is exactly the confound baseline 2 removes."
+                )
+            if self.enable_pdmux:
+                raise AssertionError(
+                    "--enable-spec-sm-partition is incompatible with --enable-pdmux."
+                )
+            if self.speculative_algorithm is None:
+                raise AssertionError(
+                    "--enable-spec-sm-partition requires a speculative algorithm."
+                )
+            # The drafter reaches the SMALL partition through
+            # EAGLEWorkerV2._draft_stream_region; only workers deriving from it
+            # have that region, so anything else would silently run the whole
+            # forward on LARGE and quietly produce a non-partitioned "control".
+            _spec_sm_partition_supported_algos = ("EAGLE", "EAGLE3", "STANDALONE")
+            if (
+                self.speculative_algorithm.upper()
+                not in _spec_sm_partition_supported_algos
+            ):
+                raise AssertionError(
+                    "--enable-spec-sm-partition supports speculative algorithms "
+                    f"{_spec_sm_partition_supported_algos} (their workers run the "
+                    "drafter inside _draft_stream_region). Got: "
+                    f"{self.speculative_algorithm}."
+                )
+            if self.enable_multi_layer_eagle:
+                raise AssertionError(
+                    "--enable-spec-sm-partition is incompatible with "
+                    "--enable-multi-layer-eagle."
+                )
+            # The draft-side duplicate TP communicator is spec-pdmux machinery
+            # and is NOT enabled here, so draft collectives on the SMALL stream
+            # are unvalidated at tp_size > 1.
+            if self.tp_size != 1:
+                raise AssertionError(
+                    "--enable-spec-sm-partition requires tp_size=1 (the "
+                    "draft-side duplicate TP communicator is spec-pdmux only)."
+                )
+            if self.device != "cuda":
+                raise AssertionError("--enable-spec-sm-partition requires CUDA.")
+            if self.enable_dp_attention:
+                raise AssertionError(
+                    "--enable-spec-sm-partition is incompatible with "
+                    "--enable-dp-attention."
+                )
+            if self.pp_size != 1:
+                raise AssertionError(
+                    "--enable-spec-sm-partition requires pp_size=1."
+                )
+            if self.spec_pdmux_sm_split is not None:
+                parts = self.spec_pdmux_sm_split.split(",")
+                if len(parts) != 2 or not all(p.strip().isdigit() for p in parts):
+                    raise AssertionError(
+                        "--spec-pdmux-sm-split must be 'LARGE,SMALL' (two integers)."
+                    )
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -7299,6 +7373,8 @@ class ServerArgs:
                     "--spec-pdmux-draft-prefill-graph requires the tc_piecewise "
                     "prefill CUDA-graph backend."
                 )
+
+        self._check_spec_sm_partition()
 
         # Check paced admission (optimization B4) on the STOCK admission path.
         # Explicit raises, never bare asserts (same rationale as spec-pdmux above).

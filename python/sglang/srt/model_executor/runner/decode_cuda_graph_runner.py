@@ -203,12 +203,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # captured SM affinity matches the forward/replay stream. None => stock
         # behavior (graph_capture allocates its own stream).
         self.capture_stream_override = None
-        if model_runner.server_args.enable_spec_pdmux:
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+        if spec_sm_partition_enabled(model_runner.server_args):
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
             self.capture_stream_override = get_spec_streams()[0]
             logger.info(
-                "[spec-pdmux] %s: graph capture on LARGE green-ctx stream",
+                "[%s] %s: graph capture on LARGE green-ctx stream",
+                (
+                    "spec-pdmux"
+                    if model_runner.server_args.enable_spec_pdmux
+                    else "spec-sm-partition"
+                ),
                 type(self).__name__,
             )
 

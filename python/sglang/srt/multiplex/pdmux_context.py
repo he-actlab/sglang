@@ -171,6 +171,30 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     CURRENT_STREAM_GROUP = STREAM_GROUPS[CURRENT_STREAM_IDX]
 
 
+def spec_sm_partition_enabled(server_args) -> bool:
+    """SINGLE SOURCE OF TRUTH for "this run needs the (large, small) green-ctx
+    stream pair, with verify on LARGE and the drafter on SMALL".
+
+    Two modes want exactly that placement and must never diverge on it:
+
+    - ``--enable-spec-pdmux``: co-located speculative decoding (M1..M2). Layers
+      the scheduler slot pool and the concurrent path on top of the placement.
+    - ``--enable-spec-sm-partition``: baseline 2, the measurement control.
+      Placement ONLY -- stock one-batch-at-a-time scheduling, a single batch,
+      no slot pool, no ping-pong, no concurrency.
+
+    Baseline 2 exists because co-located mode differs from stock in several
+    ways at once (two resident slots, twice the users, alternating L2), so a
+    stock-vs-co-located comparison attributes nothing to the SM split. This
+    mode changes exactly one variable against stock (baseline 1): which
+    partition each speculative stage runs on.
+
+    Every green-context placement gate derives from this helper -- do not
+    re-spell the disjunction at the call sites.
+    """
+    return bool(server_args.enable_spec_pdmux or server_args.enable_spec_sm_partition)
+
+
 def resolve_spec_sm_split(
     gpu_id: int, split_str: Optional[str] = None
 ) -> Tuple[int, int]:

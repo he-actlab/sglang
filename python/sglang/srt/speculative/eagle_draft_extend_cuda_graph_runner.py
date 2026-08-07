@@ -126,12 +126,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # large-captured graph replayed on the small stream silently escapes
         # the partition (probe P2 / step-2 finding).
         self.capture_stream_override = None
-        if model_runner.server_args.enable_spec_pdmux:
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+        if spec_sm_partition_enabled(model_runner.server_args):
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
             self.capture_stream_override = get_spec_streams()[1]
             logger.info(
-                "[spec-pdmux] %s: graph capture on SMALL green-ctx stream",
+                "[%s] %s: graph capture on SMALL green-ctx stream",
+                (
+                    "spec-pdmux"
+                    if model_runner.server_args.enable_spec_pdmux
+                    else "spec-sm-partition"
+                ),
                 type(self).__name__,
             )
         self.record_nolora_graph = False
