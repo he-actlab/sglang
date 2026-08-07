@@ -191,8 +191,17 @@ def spec_sm_partition_enabled(server_args) -> bool:
 
     Every green-context placement gate derives from this helper -- do not
     re-spell the disjunction at the call sites.
+
+    Reads both flags with getattr. Several call sites are handed partial
+    server_args stand-ins (graph-runner unit tests build a namespace with only
+    the fields under test), and the gate this helper replaced used getattr for
+    exactly that reason; a bare attribute read turns "this run is not
+    partitioned" into an AttributeError at those sites.
     """
-    return bool(server_args.enable_spec_pdmux or server_args.enable_spec_sm_partition)
+    return bool(
+        getattr(server_args, "enable_spec_pdmux", False)
+        or getattr(server_args, "enable_spec_sm_partition", False)
+    )
 
 
 def resolve_spec_sm_split(
