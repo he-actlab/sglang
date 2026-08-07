@@ -548,11 +548,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
-        if server_args.enable_spec_pdmux:
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+        if spec_sm_partition_enabled(server_args):
             # spec-pdmux (M1 step 2): the whole forward path runs on the LARGE
             # green-context partition; the small partition is reserved for the
             # drafter (step 3). One pair per process — the target and draft
             # model runners share it (initialize_spec_stream_pair is idempotent).
+            # --enable-spec-sm-partition (baseline 2) wants the identical
+            # placement without the slot pool, so it takes this branch too.
             from sglang.srt.multiplex.pdmux_context import (
                 initialize_spec_stream_pair,
                 resolve_spec_sm_split,
@@ -565,8 +569,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.gpu_id, large_sm, small_sm
             )[0]
             logger.info(
-                "[spec-pdmux] forward_stream -> LARGE green-ctx stream "
+                "[%s] forward_stream -> LARGE green-ctx stream "
                 "(%d SMs; gpu=%d tp_rank=%d is_draft_worker=%s)",
+                "spec-pdmux" if server_args.enable_spec_pdmux else "spec-sm-partition",
                 large_sm,
                 self.gpu_id,
                 self.tp_rank,

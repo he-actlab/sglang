@@ -73,6 +73,18 @@ def get_arch_constraints(compute_capability):
         return 4, 2
     elif major == 9 and minor >= 0:
         return 8, 8
+    elif major == 12:
+        # Blackwell sm_120 (GB202, RTX PRO 6000): probed 2026-07-21 on the
+        # g7e dev box — create_greenctx_stream_by_value rejects partitions
+        # of 2-3 SMs and accepts every size >= 4, including odd sizes.
+        # (4, 2) is deliberately stricter than the raw acceptance: 2 = TPC
+        # granularity, so requested counts can't be silently rounded. The
+        # split-performance cliff on 188 SMs is unprobed — A100/GH200 split
+        # answers do not transfer (dev-env/AWS-RTXPRO6000.md).
+        # Identical to fork commit 9a78f9675, which spec-colo predates; green
+        # contexts are unreachable on this GPU without it, and it is inert for
+        # stock runs (get_arch_constraints is only called under a split).
+        return 4, 2
     else:
         raise ValueError(f"Unsupported compute capability: {major}.{minor}")
 
@@ -149,6 +161,30 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
 
     CURRENT_STREAM_IDX = 0
     CURRENT_STREAM_GROUP = STREAM_GROUPS[CURRENT_STREAM_IDX]
+
+
+def spec_sm_partition_enabled(server_args) -> bool:
+    """SINGLE SOURCE OF TRUTH for "this run needs the (large, small) green-ctx
+    stream pair, with verify on LARGE and the drafter on SMALL".
+
+    Two modes want exactly that placement and must never diverge on it:
+
+    - ``--enable-spec-pdmux``: co-located speculative decoding (M1..M2). Layers
+      the scheduler slot pool and the concurrent path on top of the placement.
+    - ``--enable-spec-sm-partition``: baseline 2, the measurement control.
+      Placement ONLY -- stock one-batch-at-a-time scheduling, a single batch,
+      no slot pool, no ping-pong, no concurrency.
+
+    Baseline 2 exists because co-located mode differs from stock in several
+    ways at once (two resident slots, twice the users, alternating L2), so a
+    stock-vs-co-located comparison attributes nothing to the SM split. This
+    mode changes exactly one variable against stock (baseline 1): which
+    partition each speculative stage runs on.
+
+    Every green-context placement gate derives from this helper -- do not
+    re-spell the disjunction at the call sites.
+    """
+    return bool(server_args.enable_spec_pdmux or server_args.enable_spec_sm_partition)
 
 
 def resolve_spec_sm_split(

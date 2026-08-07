@@ -1829,11 +1829,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @functools.cached_property
     def _spec_pdmux_small_stream(self):
         """spec-pdmux (M1 step 3): the SMALL green-ctx stream the drafter runs
-        on, or None when --enable-spec-pdmux is off. cached_property (not
+        on, or None when neither --enable-spec-pdmux nor
+        --enable-spec-sm-partition (baseline 2) is on. cached_property (not
         __init__) so StandaloneWorkerV2, which re-implements __init__ without
         calling super(), inherits it for free. The stream pair already exists
         by first use: the target ModelRunner creates it in its init."""
-        if not self.server_args.enable_spec_pdmux:
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+        if not spec_sm_partition_enabled(self.server_args):
             return None
         # spec-pdmux step 6 (M2.1): the two-slot hazard analysis (see the
         # assert in EagleDraftWorker.draft) assumes the verify plan runs on
@@ -1851,7 +1854,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         small = get_spec_streams()[1]
         logger.info(
-            "[spec-pdmux r%d] %s: draft/draft_extend compute -> SMALL green-ctx stream",
+            "[%s r%d] %s: draft/draft_extend compute -> SMALL green-ctx stream",
+            (
+                "spec-pdmux"
+                if self.server_args.enable_spec_pdmux
+                else "spec-sm-partition"
+            ),
             self.tp_rank,
             type(self).__name__,
         )

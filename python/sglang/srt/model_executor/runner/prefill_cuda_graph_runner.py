@@ -129,13 +129,32 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # stream would let prefill escape the partition (measured: brief 99%
         # SM-Active bursts at each prefill). None => stock behavior.
         self.capture_stream_override = None
-        if model_runner.server_args.enable_spec_pdmux:
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+        if spec_sm_partition_enabled(model_runner.server_args):
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
-            self.capture_stream_override = get_spec_streams()[0]
+            # Role-aware, unlike the decode runner. The DRAFT model runner also
+            # builds a prefill graph when the prefill backend is BREAKABLE
+            # (EAGLEWorkerV2.init_cuda_graphs ->
+            # init_prefill_cuda_graph(force_for_draft_worker=True)), and
+            # _draft_extend_for_prefill replays it inside _draft_stream_region
+            # on the SMALL stream. Capturing that on LARGE would bake full-chip
+            # affinity into drafter work silently -- nothing checks that a
+            # graph's replay stream matches its capture stream. Inert under the
+            # default tc_piecewise prefill backend (the draft builds no prefill
+            # graph there); load-bearing under breakable.
+            is_draft = bool(getattr(model_runner, "is_draft_worker", False))
+            self.capture_stream_override = get_spec_streams()[1 if is_draft else 0]
             logger.info(
-                "[spec-pdmux] %s: graph capture on LARGE green-ctx stream",
+                "[%s] %s: graph capture on %s green-ctx stream",
+                (
+                    "spec-pdmux"
+                    if model_runner.server_args.enable_spec_pdmux
+                    else "spec-sm-partition"
+                ),
                 type(self).__name__,
+                "SMALL" if is_draft else "LARGE",
             )
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
