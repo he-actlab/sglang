@@ -263,6 +263,82 @@ class _Qwen3VerifierCublasLtDispatch(_Qwen3CublasLtPortfolioDispatch):
         return VERIFIER_CUBLASLT_PORTFOLIO_MKNS, select_verifier_portfolio_algorithm
 
 
+class _Qwen3PortableCublasLtDispatch:
+    """Per-GPU correctness-gated tactics selected before graph capture."""
+
+    supports_linear = staticmethod(_Qwen3CublasLtPortfolioDispatch.supports_linear)
+
+    def __init__(
+        self,
+        device_index: int,
+        representative_linears: Tuple[nn.Module, ...],
+        *,
+        shape_mkns: Tuple[Tuple[int, int, int], ...],
+        worker: str,
+        realized_sm_target: int,
+        planning_context: str,
+    ) -> None:
+        from sglang.jit_kernel.cublaslt_autotune import (
+            autotune_projection_portfolio,
+        )
+        from sglang.jit_kernel.cublaslt_drafter_gemm import (
+            allocate_workspace,
+            matmul,
+        )
+
+        self._workspace = allocate_workspace(device_index)
+        if self._workspace.data_ptr() % 256:
+            raise RuntimeError("portable cuBLASLt workspace must be 256-byte aligned")
+        tuned = autotune_projection_portfolio(
+            device_index=device_index,
+            representative_linears=representative_linears,
+            shape_mkns=shape_mkns,
+            worker=worker,
+            realized_sm_target=realized_sm_target,
+            planning_context=planning_context,
+            workspace=self._workspace,
+            logger=logger,
+        )
+        self._algorithms = dict(tuned.algorithms)
+        self._decisions = dict(tuned.decisions)
+        self._matmul = matmul
+
+    @property
+    def selected_shape_count(self) -> int:
+        return len(self._algorithms)
+
+    def __call__(
+        self, linear: nn.Module, activation: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not self.supports_linear(linear):
+            return None
+        weight = linear.weight
+        if (
+            activation.ndim != 2
+            or not activation.is_cuda
+            or activation.device != weight.device
+            or activation.dtype != torch.bfloat16
+            or not activation.is_contiguous()
+            or activation.data_ptr() % 256
+        ):
+            return None
+        shape_mkn = (
+            int(activation.shape[0]),
+            int(activation.shape[1]),
+            int(weight.shape[0]),
+        )
+        algorithm = self._algorithms.get(shape_mkn)
+        if algorithm is None:
+            return None
+        return self._matmul(
+            activation,
+            weight,
+            algorithm=algorithm,
+            sm_count_target=algorithm.sm_count_target,
+            workspace=self._workspace,
+        )
+
+
 _DrafterProjectionDispatch = Callable[[nn.Module, torch.Tensor], Optional[torch.Tensor]]
 
 
@@ -884,11 +960,16 @@ class Qwen3Model(Qwen2Model):
         self._install_drafter_projection_dispatch(layers, dispatch, prepend=True)
         return True
 
-    def enable_qwen3_drafter_cublaslt_portfolio(self, device_index: int) -> bool:
-        """Install selected target-52 tactics for the exact drafter model."""
+    def enable_qwen3_drafter_cublaslt_portfolio(
+        self,
+        device_index: int,
+        realized_sm_target: int,
+        planning_context: str,
+    ) -> bool:
+        """Install portable per-GPU tactics for the exact drafter model."""
 
         layers = self._eligible_qwen3_drafter_layers(
-            device_index, _Qwen3DrafterCublasLtDispatch.supports_linear
+            device_index, _Qwen3PortableCublasLtDispatch.supports_linear
         )
         if layers is None:
             return False
@@ -899,24 +980,49 @@ class Qwen3Model(Qwen2Model):
             first.mlp.gate_up_proj,
             first.mlp.down_proj,
         )
-        dispatch = _Qwen3DrafterCublasLtDispatch(device_index, representative_linears)
+        from sglang.jit_kernel.cublaslt_drafter_gemm import DRAFTER_CUBLASLT_MKNS
+
+        dispatch = _Qwen3PortableCublasLtDispatch(
+            device_index,
+            representative_linears,
+            shape_mkns=DRAFTER_CUBLASLT_MKNS,
+            worker="drafter",
+            realized_sm_target=realized_sm_target,
+            planning_context=planning_context,
+        )
         self._install_drafter_projection_dispatch(layers, dispatch)
         return True
 
-    def enable_qwen3_verifier_cublaslt_portfolio(self, device_index: int) -> bool:
-        """Install selected target-0 tactics for the exact Qwen3-8B verifier."""
+    def enable_qwen3_verifier_cublaslt_portfolio(
+        self,
+        device_index: int,
+        realized_sm_target: int,
+        planning_context: str,
+    ) -> bool:
+        """Install portable per-GPU tactics for the exact Qwen3-8B verifier."""
 
         layers = self._eligible_qwen3_verifier_layers(
-            device_index, _Qwen3VerifierCublasLtDispatch.supports_linear
+            device_index, _Qwen3PortableCublasLtDispatch.supports_linear
         )
         if layers is None:
             return False
         first = layers[0]
         representative_linears = (
             first.self_attn.qkv_proj,
+            first.self_attn.o_proj,
+            first.mlp.gate_up_proj,
             first.mlp.down_proj,
         )
-        dispatch = _Qwen3VerifierCublasLtDispatch(device_index, representative_linears)
+        from sglang.jit_kernel.cublaslt_drafter_gemm import VERIFIER_CUBLASLT_MKNS
+
+        dispatch = _Qwen3PortableCublasLtDispatch(
+            device_index,
+            representative_linears,
+            shape_mkns=VERIFIER_CUBLASLT_MKNS,
+            worker="verifier",
+            realized_sm_target=realized_sm_target,
+            planning_context=planning_context,
+        )
         self._install_drafter_projection_dispatch(layers, dispatch)
         return True
 
@@ -980,11 +1086,25 @@ class Qwen3ForCausalLM(nn.Module):
     def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
         return self.model.enable_qwen3_drafter_tma(device_index)
 
-    def enable_qwen3_drafter_cublaslt_portfolio(self, device_index: int) -> bool:
-        return self.model.enable_qwen3_drafter_cublaslt_portfolio(device_index)
+    def enable_qwen3_drafter_cublaslt_portfolio(
+        self,
+        device_index: int,
+        realized_sm_target: int,
+        planning_context: str,
+    ) -> bool:
+        return self.model.enable_qwen3_drafter_cublaslt_portfolio(
+            device_index, realized_sm_target, planning_context
+        )
 
-    def enable_qwen3_verifier_cublaslt_portfolio(self, device_index: int) -> bool:
-        return self.model.enable_qwen3_verifier_cublaslt_portfolio(device_index)
+    def enable_qwen3_verifier_cublaslt_portfolio(
+        self,
+        device_index: int,
+        realized_sm_target: int,
+        planning_context: str,
+    ) -> bool:
+        return self.model.enable_qwen3_verifier_cublaslt_portfolio(
+            device_index, realized_sm_target, planning_context
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()

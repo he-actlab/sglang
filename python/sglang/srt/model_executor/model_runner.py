@@ -873,7 +873,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return enabled
 
     def _maybe_enable_qwen3_verifier_cublaslt_portfolio(self) -> bool:
-        """Enable selected target-0 verifier tactics on the exact target worker."""
+        """Enable portable per-GPU verifier tactics on the target worker."""
         from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 
         if (
@@ -892,9 +892,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device != "cuda":
             return fallback(f"device={self.device}")
-        capability = torch.cuda.get_device_capability(self.gpu_id)
-        if capability != (12, 0):
-            return fallback(f"compute capability={capability}")
         if not spec_sm_partition_enabled(self.server_args):
             return fallback(
                 "neither --enable-spec-pdmux nor --enable-spec-sm-partition is on"
@@ -909,7 +906,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return fallback(
                 f"dtype={self.dtype}, quantization={self.model_config.quantization}"
             )
-        if envs.SGLANG_SPEC_PDMUX_SM_HINT.get() not in (1, 2):
+        hint_mode = envs.SGLANG_SPEC_PDMUX_SM_HINT.get()
+        if hint_mode not in (1, 2):
             return fallback(
                 "SGLANG_SPEC_PDMUX_SM_HINT must be 1 or 2 so production "
                 "fallbacks retain the target-side SMHint selection"
@@ -921,18 +919,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         allocated_split = get_spec_sm_allocated_split()
-        if allocated_split is None or allocated_split[0] != 136:
+        if allocated_split is None:
             return fallback(f"allocated SM split={allocated_split}")
 
-        enable = getattr(
-            self.model, "enable_qwen3_verifier_cublaslt_portfolio", None
-        )
+        enable = getattr(self.model, "enable_qwen3_verifier_cublaslt_portfolio", None)
         if not callable(enable):
             return fallback(f"model type={type(self.model).__name__}")
 
         large_stream = get_spec_streams()[0]
         with torch.cuda.stream(large_stream):
-            enabled = enable(self.gpu_id)
+            enabled = enable(
+                self.gpu_id,
+                allocated_split[0],
+                f"smhint-{hint_mode}",
+            )
         if not enabled:
             return fallback(
                 "model is not the exact unquantized 256-byte-aligned "
@@ -940,10 +940,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         logger.info(
-            "Qwen3 verifier cuBLASLt portfolio enabled: two cached target-0 "
-            "shapes (fused QKV, down) across 36 layers; output and fused "
-            "gate-up retain production linear; allocated LARGE width=136; "
-            "draft model untouched."
+            "Qwen3 verifier cuBLASLt portfolio enabled: portable top-N "
+            "autotuner covers four exact projection shapes and retains "
+            "production per shape when no tactic wins; allocated LARGE width=%d.",
+            allocated_split[0],
         )
         return True
 
@@ -1016,7 +1016,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return True
 
     def _maybe_enable_qwen3_drafter_cublaslt_portfolio(self) -> bool:
-        """Enable selected target-52 tactics on the exact draft worker."""
+        """Enable portable per-GPU tactics on the exact draft worker."""
         from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 
         if (
@@ -1035,9 +1035,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device != "cuda":
             return fallback(f"device={self.device}")
-        capability = torch.cuda.get_device_capability(self.gpu_id)
-        if capability != (12, 0):
-            return fallback(f"compute capability={capability}")
         if not spec_sm_partition_enabled(self.server_args):
             return fallback(
                 "neither --enable-spec-pdmux nor --enable-spec-sm-partition is on"
@@ -1052,10 +1049,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return fallback(
                 f"dtype={self.dtype}, quantization={self.model_config.quantization}"
             )
-        if envs.SGLANG_SPEC_PDMUX_SM_HINT.get() != 2:
+        hint_mode = envs.SGLANG_SPEC_PDMUX_SM_HINT.get()
+        if hint_mode != 2:
             return fallback(
                 "SGLANG_SPEC_PDMUX_SM_HINT must be 2 so production fallbacks "
-                "retain target-52 selection"
+                "retain the realized SMALL-width selection"
             )
 
         from sglang.srt.multiplex.pdmux_context import (
@@ -1064,12 +1062,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         allocated_split = get_spec_sm_allocated_split()
-        required_small = envs.SGLANG_QWEN3_DRAFTER_PORTFOLIO_SMALL_WIDTH.get()
-        if allocated_split is None or allocated_split[1] != required_small:
-            return fallback(
-                f"allocated SM split={allocated_split} "
-                f"(required SMALL={required_small})"
-            )
+        if allocated_split is None:
+            return fallback(f"allocated SM split={allocated_split}")
 
         enable = getattr(self.model, "enable_qwen3_drafter_cublaslt_portfolio", None)
         if not callable(enable):
@@ -1077,7 +1071,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         small_stream = get_spec_streams()[1]
         with torch.cuda.stream(small_stream):
-            enabled = enable(self.gpu_id)
+            enabled = enable(
+                self.gpu_id,
+                allocated_split[1],
+                f"smhint-{hint_mode}",
+            )
         if not enabled:
             return fallback(
                 "model is not the exact unquantized 256-byte-aligned "
@@ -1085,9 +1083,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         logger.info(
-            "Qwen3 drafter cuBLASLt portfolio enabled: six cached target-52 "
-            "shapes across 28 layers; down32 and qkv128 retain production "
-            "linear; allocated SMALL width=52; target model untouched."
+            "Qwen3 drafter cuBLASLt portfolio enabled: portable top-N "
+            "autotuner covers eight exact projection shapes and retains "
+            "production per shape when no tactic wins; allocated SMALL width=%d.",
+            allocated_split[1],
         )
         return True
 

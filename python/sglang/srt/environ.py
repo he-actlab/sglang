@@ -741,24 +741,22 @@ class Envs:
     # models, shapes, dtypes, layouts, widths, and architectures keep the
     # production linear path. Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_TMA = EnvBool(False)
-    # Selected per-shape cuBLASLt tactics for the exact Qwen3-0.6B TP1 BF16
-    # draft worker on an allocated 52-SM SMALL context. Discovery happens once
-    # after worker creation; six exact shapes use cached target-52 algorithms,
-    # while down32, qkv128, and unsupported calls retain production linear.
-    # Requires SGLANG_SPEC_PDMUX_SM_HINT=2 so production fallbacks use the same
-    # target-52 baseline. Experimental and default-off.
+    # Portable per-GPU cuBLASLt autotuning for exact Qwen3-0.6B TP1 BF16
+    # projections. Before graph capture, each worker correctness-checks and
+    # times top-N candidates at target 0 and its realized SMALL width against
+    # production under SMHint mode 2. Stable tactic metadata is cached by the
+    # complete GPU/library/shape/layout/alignment/width/workspace/planning
+    # context; opaque descriptors are always rediscovered after process start.
+    # Nonwinning and unsupported calls retain production. Experimental/off.
     SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO = EnvBool(False)
-    # Experiment-only escape hatch: the drafter portfolio's tactics are pinned
-    # to target 52 internally, so they can be dispatched on a different SMALL
-    # width to isolate partition width from kernel identity. Default 52 keeps
-    # production behaviour byte-identical.
+    # Legacy control used only by frozen pre-portability topic branches. The
+    # portable autotuner keys directly on the realized SMALL width and ignores
+    # this value.
     SGLANG_QWEN3_DRAFTER_PORTFOLIO_SMALL_WIDTH = EnvInt(52)
-    # Selected per-shape cuBLASLt tactics for the exact Qwen3-8B TP1 BF16
-    # target/verifier worker on an allocated 136-SM LARGE context (TODO-45).
-    # Two exact verify M=128 shapes (fused QKV and down) use cached target-0
-    # algorithms — the gate selected no target-136 tactic — while output,
-    # fused gate-up, and unsupported calls retain production linear under the
-    # SMHint capture. Experimental and default-off.
+    # The matching portable search for exact Qwen3-8B TP1 BF16 verifier
+    # projections. It searches target 0 and the realized LARGE width, caches
+    # only stable metadata, and retains the SMHint production path per shape
+    # unless a correctness-gated candidate wins reproducibly. Experimental/off.
     SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO = EnvBool(False)
     # Design-FlashInferWidth (TODO-8): give FlashInfer's fa2 prefill-template
     # cuda-graph plans the realized green-context width via the PrefillPlan

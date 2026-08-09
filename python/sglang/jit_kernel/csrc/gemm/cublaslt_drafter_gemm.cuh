@@ -1010,4 +1010,14 @@ run(tvm::ffi::TensorView activation,
       "cublasLtMatmul");
 }
 
+inline int64_t library_version() {
+  return static_cast<int64_t>(CUBLAS_VERSION);
+}
+
+inline int64_t cuda_runtime_version() {
+  int version = 0;
+  detail::check_cuda(cudaRuntimeGetVersion(&version), "cudaRuntimeGetVersion");
+  return static_cast<int64_t>(version);
+}
+
 }  // namespace cublaslt_drafter_gemm

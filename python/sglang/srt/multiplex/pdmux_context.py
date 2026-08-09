@@ -211,6 +211,7 @@ def resolve_spec_sm_split(
     small = 16 rounded up to the arch multiple (>= arch min), large = rest
     rounded down to the arch multiple (e.g. 92,16 on a 108-SM A100)."""
     from sgl_kernel import spatial
+
     from sglang.srt.environ import envs
 
     total = spatial.get_sm_available(gpu_id)
@@ -403,6 +404,24 @@ def _cublas_sm_count_target_set(n: int) -> None:
 
 
 @contextmanager
+def cublas_sm_count_target(width: int):
+    """Temporarily apply one cuBLAS SM target and restore the prior value.
+
+    This setup-time form is shared by graph capture and the portable cuBLASLt
+    autotuner so their production controls use the same planning context.
+    """
+
+    if isinstance(width, bool) or not isinstance(width, int) or width < 0:
+        raise ValueError("cuBLAS SM count target must be a non-negative int")
+    previous = _cublas_sm_count_target_get()
+    _cublas_sm_count_target_set(width)
+    try:
+        yield previous
+    finally:
+        _cublas_sm_count_target_set(previous if previous > 0 else 0)
+
+
+@contextmanager
 def spec_pdmux_sm_hint_capture(model_runner):
     """Apply the partition-width cuBLAS hint around a graph-capture block.
 
@@ -440,17 +459,13 @@ def spec_pdmux_sm_hint_capture(model_runner):
     if not width:
         yield
         return
-    previous = _cublas_sm_count_target_get()
-    _cublas_sm_count_target_set(width)
-    logger.info(
-        "[spec-pdmux] SM hint: cublasSetSmCountTarget(%d) around %s graph capture "
-        "(mode %d, restore to %d after)",
-        width,
-        "draft" if getattr(model_runner, "is_draft_worker", False) else "target",
-        hint,
-        previous,
-    )
-    try:
+    with cublas_sm_count_target(width) as previous:
+        logger.info(
+            "[spec-pdmux] SM hint: cublasSetSmCountTarget(%d) around %s graph capture "
+            "(mode %d, restore to %d after)",
+            width,
+            "draft" if getattr(model_runner, "is_draft_worker", False) else "target",
+            hint,
+            previous,
+        )
         yield
-    finally:
-        _cublas_sm_count_target_set(previous if previous > 0 else 0)

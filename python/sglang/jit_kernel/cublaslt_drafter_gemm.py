@@ -147,6 +147,8 @@ def _jit_cublaslt_drafter_gemm_module():
                 "cublaslt_drafter_gemm::enumerate_custom_find_v1",
             ),
             ("run", "cublaslt_drafter_gemm::run"),
+            ("library_version", "cublaslt_drafter_gemm::library_version"),
+            ("cuda_runtime_version", "cublaslt_drafter_gemm::cuda_runtime_version"),
         ],
         extra_ldflags=["-lcublasLt", "-lcublas"],
     )
@@ -1584,6 +1586,17 @@ def matmul(
     return out
 
 
+def library_versions() -> dict[str, int | str | None]:
+    """Return the revisions that participate in portable tactic cache keys."""
+
+    module = _jit_cublaslt_drafter_gemm_module()
+    return {
+        "cuda_python_build": torch.version.cuda,
+        "cuda_runtime": int(module.cuda_runtime_version()),
+        "cublaslt_build": int(module.library_version()),
+    }
+
+
 __all__ = [
     "CublasLtCustomFindCensusResult",
     "CublasLtDrafterAlgorithm",
@@ -1609,6 +1622,7 @@ __all__ = [
     "discover_custom_find_v1_portfolio",
     "discover_heuristic_by_id_portfolio",
     "enumerate_custom_find_v1",
+    "library_versions",
     "matmul",
     "select_drafter_portfolio_algorithm",
     "select_verifier_portfolio_algorithm",

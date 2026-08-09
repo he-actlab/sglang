@@ -98,9 +98,10 @@ class Qwen3DrafterCublasLtModelTests(CustomTestCase):
         class FakeDispatch:
             instance = None
 
-            def __init__(self, device_index, representative_linears):
+            def __init__(self, device_index, representative_linears, **kwargs):
                 self.device_index = device_index
                 self.representative_linears = representative_linears
+                self.kwargs = kwargs
                 FakeDispatch.instance = self
 
             @staticmethod
@@ -121,11 +122,13 @@ class Qwen3DrafterCublasLtModelTests(CustomTestCase):
                     qkv_proj=projection((4096, 1024)),
                     o_proj=projection((1024, 2048)),
                     set_drafter_projection_dispatch=Mock(),
+                    _drafter_projection_dispatch=None,
                 )
                 self.mlp = SimpleNamespace(
                     gate_up_proj=projection((6144, 1024)),
                     down_proj=projection((1024, 3072)),
                     set_drafter_projection_dispatch=Mock(),
+                    _drafter_projection_dispatch=None,
                 )
 
         model = SimpleNamespace(
@@ -152,12 +155,14 @@ class Qwen3DrafterCublasLtModelTests(CustomTestCase):
         with (
             patch("sglang.srt.models.qwen3.Qwen3DecoderLayer", FakeLayer),
             patch(
-                "sglang.srt.models.qwen3._Qwen3DrafterCublasLtDispatch",
+                "sglang.srt.models.qwen3._Qwen3PortableCublasLtDispatch",
                 FakeDispatch,
             ),
         ):
             self.assertTrue(
-                Qwen3Model.enable_qwen3_drafter_cublaslt_portfolio(model, 0)
+                Qwen3Model.enable_qwen3_drafter_cublaslt_portfolio(
+                    model, 0, 32, "smhint-2"
+                )
             )
 
         dispatch = FakeDispatch.instance
@@ -168,6 +173,9 @@ class Qwen3DrafterCublasLtModelTests(CustomTestCase):
             dispatch.representative_linears[0],
             model.layers[0].self_attn.qkv_proj,
         )
+        self.assertEqual(dispatch.kwargs["worker"], "drafter")
+        self.assertEqual(dispatch.kwargs["realized_sm_target"], 32)
+        self.assertEqual(dispatch.kwargs["planning_context"], "smhint-2")
         for layer in model.layers:
             layer.self_attn.set_drafter_projection_dispatch.assert_called_once_with(
                 dispatch
@@ -192,7 +200,8 @@ class ModelRunnerQwen3DrafterCublasLtRoleTests(CustomTestCase):
         )
         runner.spec_algorithm = SimpleNamespace(is_standalone=lambda: True)
         runner.model = SimpleNamespace(
-            enable_qwen3_drafter_cublaslt_portfolio=Mock(return_value=True)
+            enable_qwen3_drafter_cublaslt_portfolio=Mock(return_value=True),
+            enable_qwen3_verifier_cublaslt_portfolio=Mock(return_value=True),
         )
         return runner
 
@@ -228,7 +237,6 @@ class ModelRunnerQwen3DrafterCublasLtRoleTests(CustomTestCase):
         with (
             envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.override(True),
             envs.SGLANG_SPEC_PDMUX_SM_HINT.override(2),
-            patch.object(torch.cuda, "get_device_capability", return_value=(12, 0)),
             patch.object(
                 torch.cuda,
                 "stream",
@@ -236,7 +244,7 @@ class ModelRunnerQwen3DrafterCublasLtRoleTests(CustomTestCase):
             ) as stream_context,
             patch(
                 "sglang.srt.multiplex.pdmux_context.get_spec_sm_allocated_split",
-                return_value=(136, 52),
+                return_value=(76, 32),
             ),
             patch(
                 "sglang.srt.multiplex.pdmux_context.get_spec_streams",
@@ -246,26 +254,63 @@ class ModelRunnerQwen3DrafterCublasLtRoleTests(CustomTestCase):
             self.assertTrue(runner._maybe_enable_qwen3_drafter_cublaslt_portfolio())
 
         stream_context.assert_called_once_with(small_stream)
-        runner.model.enable_qwen3_drafter_cublaslt_portfolio.assert_called_once_with(0)
+        runner.model.enable_qwen3_drafter_cublaslt_portfolio.assert_called_once_with(
+            0, 32, "smhint-2"
+        )
+
+    def test_exact_target_role_enables_on_large_stream_at_a100_width(self):
+        runner = self._runner(is_draft_worker=False)
+        large_stream = object()
+        with (
+            envs.SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO.override(True),
+            envs.SGLANG_SPEC_PDMUX_SM_HINT.override(2),
+            patch.object(
+                torch.cuda,
+                "stream",
+                side_effect=lambda stream: contextlib.nullcontext(stream),
+            ) as stream_context,
+            patch(
+                "sglang.srt.multiplex.pdmux_context.get_spec_sm_allocated_split",
+                return_value=(76, 32),
+            ),
+            patch(
+                "sglang.srt.multiplex.pdmux_context.get_spec_streams",
+                return_value=(large_stream, object()),
+            ),
+        ):
+            self.assertTrue(runner._maybe_enable_qwen3_verifier_cublaslt_portfolio())
+
+        stream_context.assert_called_once_with(large_stream)
+        runner.model.enable_qwen3_verifier_cublaslt_portfolio.assert_called_once_with(
+            0, 76, "smhint-2"
+        )
 
     def test_mode_one_keeps_production_path(self):
         runner = self._runner(is_draft_worker=True)
         with (
             envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.override(True),
             envs.SGLANG_SPEC_PDMUX_SM_HINT.override(1),
-            patch.object(torch.cuda, "get_device_capability", return_value=(12, 0)),
         ):
             self.assertFalse(runner._maybe_enable_qwen3_drafter_cublaslt_portfolio())
         runner.model.enable_qwen3_drafter_cublaslt_portfolio.assert_not_called()
 
-    def test_projection_flags_are_mutually_exclusive(self):
+    def test_projection_flags_compose_in_portfolio_then_tma_order(self):
         runner = self._runner(is_draft_worker=True)
         with (
             envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.override(True),
             envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.override(True),
-            self.assertRaisesRegex(RuntimeError, "mutually exclusive"),
+            patch.object(
+                runner,
+                "_maybe_enable_qwen3_drafter_cublaslt_portfolio",
+                return_value=True,
+            ) as portfolio,
+            patch.object(
+                runner, "_maybe_enable_qwen3_drafter_tma", return_value=True
+            ) as tma,
         ):
-            runner._maybe_enable_qwen3_drafter_projection_dispatch()
+            self.assertTrue(runner._maybe_enable_qwen3_drafter_projection_dispatch())
+        portfolio.assert_called_once_with()
+        tma.assert_called_once_with()
 
 
 if __name__ == "__main__":
