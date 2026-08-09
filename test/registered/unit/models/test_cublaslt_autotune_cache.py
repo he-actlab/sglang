@@ -1,9 +1,12 @@
 """CPU-only contracts for portable cuBLASLt cache identity and replay."""
 
 import copy
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from sglang.jit_kernel import cublaslt_autotune
 from sglang.jit_kernel.cublaslt_autotune import (
     cache_key_digest,
     make_cache_key,
@@ -96,6 +99,16 @@ class CublasLtAutotuneCacheKeyTests(CustomTestCase):
         second = _key()
         second["sm_count_targets"] = [0, 32]
         self.assertEqual(cache_key_digest(first), cache_key_digest(second))
+
+    def test_dedicated_cache_root_overrides_general_sglang_cache(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_CACHE_DIR": "/tmp/general-sglang-cache",
+                "SGLANG_CUBLASLT_AUTOTUNE_CACHE_DIR": "/tmp/raw-run/cache",
+            },
+        ):
+            self.assertEqual(str(cublaslt_autotune._cache_root()), "/tmp/raw-run/cache")
 
 
 class CublasLtAutotuneStableReplayTests(CustomTestCase):

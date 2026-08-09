@@ -161,6 +161,9 @@ def cache_key_digest(cache_key: Mapping[str, Any]) -> str:
 
 
 def _cache_root() -> Path:
+    dedicated = os.environ.get("SGLANG_CUBLASLT_AUTOTUNE_CACHE_DIR")
+    if dedicated:
+        return Path(dedicated)
     base = os.environ.get("SGLANG_CACHE_DIR", os.path.expanduser("~/.cache/sglang"))
     return Path(base) / "cublaslt_autotune"
 

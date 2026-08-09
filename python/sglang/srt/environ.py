@@ -749,6 +749,10 @@ class Envs:
     # context; opaque descriptors are always rediscovered after process start.
     # Nonwinning and unsupported calls retain production. Experimental/off.
     SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO = EnvBool(False)
+    # Optional dedicated directory for portable cuBLASLt decision records.
+    # Experiment runners set this to the raw-run directory so every reported
+    # result archives the exact stable tactic metadata it used.
+    SGLANG_CUBLASLT_AUTOTUNE_CACHE_DIR = EnvStr(None)
     # Legacy control used only by frozen pre-portability topic branches. The
     # portable autotuner keys directly on the realized SMALL width and ignores
     # this value.
