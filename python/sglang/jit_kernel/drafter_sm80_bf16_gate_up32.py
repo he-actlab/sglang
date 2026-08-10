@@ -12,10 +12,16 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 M, K, N = 32, 1024, 6144
-CONFIGS = tuple(
-    f"n{tile_n}_s{stages}"
-    for tile_n in (64, 128)
-    for stages in (3, 4, 5, 6)
+CONFIGS = (
+    *tuple(
+        f"n{tile_n}_s{stages}"
+        for tile_n in (64, 128)
+        for stages in (3, 4, 5, 6)
+    ),
+    *tuple(
+        f"n128_w8_k64_s{stages}"
+        for stages in (2, 3, 4)
+    ),
 )
 
 

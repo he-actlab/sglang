@@ -47,23 +47,11 @@ static constexpr int kN = 6144;
 static constexpr int kK = 1024;
 static constexpr size_t kAlignmentBytes = 16;
 
-template <int TileN>
-struct WarpShape;
-
-template <>
-struct WarpShape<64> {
-  using Type = cutlass::gemm::GemmShape<16, 32, 32>;
-};
-
-template <>
-struct WarpShape<128> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
-
-// Exact-M construction: unlike the incumbent 64x128 or 64x64 threadblock,
-// neither family computes an out-of-bounds second half of the M tile. N64
-// launches 96 CTAs and N128 launches 48; both use four MMA warps.
-template <int TileN, int Stages>
+// Exact-M construction: unlike the incumbent, no family computes an
+// out-of-bounds second half of the M tile. The high-warp N128 family uses K64
+// because CUTLASS's SM80 loader requires at least one A vector per loader
+// thread; the original four-warp controls retain K32.
+template <int TileN, int WarpM, int TileK, int Stages>
 using GateUp32Gemm = cutlass::gemm::device::GemmUniversal<
     ElementA,
     cutlass::layout::RowMajor,
@@ -74,8 +62,8 @@ using GateUp32Gemm = cutlass::gemm::device::GemmUniversal<
     ElementAccumulator,
     cutlass::arch::OpClassTensorOp,
     cutlass::arch::Sm80,
-    cutlass::gemm::GemmShape<32, TileN, 32>,
-    typename WarpShape<TileN>::Type,
+    cutlass::gemm::GemmShape<32, TileN, TileK>,
+    cutlass::gemm::GemmShape<WarpM, 32, TileK>,
     cutlass::gemm::GemmShape<16, 8, 16>,
     cutlass::epilogue::thread::LinearCombination<ElementOutput, 8, ElementAccumulator, ElementCompute>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
@@ -96,7 +84,7 @@ inline bool is_aligned(const void* pointer, size_t alignment) {
     host::RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   } while (false)
 
-template <int TileN, int Stages>
+template <int TileN, int WarpM, int TileK, int Stages>
 inline void drafter_sm80_bf16_gate_up32_schedule(
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView activation,
@@ -105,8 +93,12 @@ inline void drafter_sm80_bf16_gate_up32_schedule(
   using namespace host;
   using namespace sglang::drafter_sm80_bf16_gate_up32_detail;
   static_assert(TileN == 64 || TileN == 128);
-  static_assert(Stages >= 3 && Stages <= 6);
-  using Gemm = GateUp32Gemm<TileN, Stages>;
+  static_assert(WarpM == 16 || WarpM == 32);
+  static_assert(kM % WarpM == 0);
+  static_assert(TileN % 32 == 0);
+  static_assert(TileK == 32 || TileK == 64);
+  static_assert(Stages >= 2 && Stages <= 6);
+  using Gemm = GateUp32Gemm<TileN, WarpM, TileK, Stages>;
 
   SymbolicDevice device;
   SymbolicSize workspace_bytes{"workspace bytes"};
@@ -157,23 +149,26 @@ inline void drafter_sm80_bf16_gate_up32_schedule(
   SGLANG_DRAFTER_GATE_UP32_CUTLASS_CHECK(gemm.run(stream));
 }
 
-#define SGLANG_DRAFTER_GATE_UP32_DEFINE(name, tile_n, stages)                                    \
-  inline void name(                                                                              \
-      tvm::ffi::TensorView output,                                                               \
-      tvm::ffi::TensorView activation,                                                           \
-      tvm::ffi::TensorView weight,                                                               \
-      tvm::ffi::TensorView workspace) {                                                          \
-    drafter_sm80_bf16_gate_up32_schedule<tile_n, stages>(output, activation, weight, workspace); \
+#define SGLANG_DRAFTER_GATE_UP32_DEFINE(name, tile_n, warp_m, tile_k, stages)                                     \
+  inline void name(                                                                                               \
+      tvm::ffi::TensorView output,                                                                                \
+      tvm::ffi::TensorView activation,                                                                            \
+      tvm::ffi::TensorView weight,                                                                                \
+      tvm::ffi::TensorView workspace) {                                                                           \
+    drafter_sm80_bf16_gate_up32_schedule<tile_n, warp_m, tile_k, stages>(output, activation, weight, workspace); \
   }
 
-SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n64_s3, 64, 3)
-SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n64_s4, 64, 4)
-SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n64_s5, 64, 5)
-SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n64_s6, 64, 6)
-SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_s3, 128, 3)
-SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_s4, 128, 4)
-SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_s5, 128, 5)
-SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_s6, 128, 6)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n64_s3, 64, 16, 32, 3)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n64_s4, 64, 16, 32, 4)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n64_s5, 64, 16, 32, 5)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n64_s6, 64, 16, 32, 6)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_s3, 128, 32, 32, 3)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_s4, 128, 32, 32, 4)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_s5, 128, 32, 32, 5)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_s6, 128, 32, 32, 6)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_w8_k64_s2, 128, 16, 64, 2)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_w8_k64_s3, 128, 16, 64, 3)
+SGLANG_DRAFTER_GATE_UP32_DEFINE(drafter_sm80_bf16_gate_up32_n128_w8_k64_s4, 128, 16, 64, 4)
 
 #undef SGLANG_DRAFTER_GATE_UP32_DEFINE
 #undef SGLANG_DRAFTER_GATE_UP32_CUTLASS_CHECK
