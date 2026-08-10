@@ -861,13 +861,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _maybe_enable_qwen3_drafter_projection_dispatch(self) -> bool:
         self._maybe_enable_qwen3_verifier_cublaslt_portfolio()
-        # The Stage-2 TMA winners and the cuBLASLt portfolio compose per
-        # exact shape (chained dispatch: TMA specialization -> retained
-        # tactic -> production); enable the portfolio first so the TMA
-        # install prepends ahead of it.
+        # Exact-shape kernels and the cuBLASLt portfolio compose per call.
+        # Install from lowest to highest priority so each specialization can
+        # prepend: TMA -> SM80 gate_up32 -> retained tactic -> production.
         enabled = False
         if envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get():
             enabled = self._maybe_enable_qwen3_drafter_cublaslt_portfolio() or enabled
+        if envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM80_GATE_UP32.get():
+            enabled = self._maybe_enable_qwen3_drafter_sm80_gate_up32() or enabled
         if envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get():
             enabled = self._maybe_enable_qwen3_drafter_tma() or enabled
         return enabled
@@ -1012,6 +1013,78 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             "Qwen3 drafter TMA enabled: 28 layers, eight exact M=32/M=128 "
             "projection shapes, allocated SMALL width=52; target model untouched."
+        )
+        return True
+
+    def _maybe_enable_qwen3_drafter_sm80_gate_up32(self) -> bool:
+        """Enable the selected exact-M32 gate-up kernel on A100 draft workers."""
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+        if (
+            not envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM80_GATE_UP32.get()
+            or not self.is_draft_worker
+        ):
+            return False
+
+        def fallback(reason: str) -> bool:
+            logger.warning(
+                "Qwen3 drafter SM80 gate_up32 requested but unsupported "
+                "(%s); keeping the existing projection path.",
+                reason,
+            )
+            return False
+
+        if self.device != "cuda":
+            return fallback(f"device={self.device}")
+        capability = torch.cuda.get_device_capability(self.gpu_id)
+        if capability != (8, 0):
+            return fallback(f"compute capability={capability}")
+        if not spec_sm_partition_enabled(self.server_args):
+            return fallback(
+                "neither --enable-spec-pdmux nor --enable-spec-sm-partition is on"
+            )
+        if not self.spec_algorithm.is_standalone():
+            return fallback(
+                f"speculative algorithm={self.server_args.speculative_algorithm}"
+            )
+        if self.tp_size != 1 or self.pp_size != 1:
+            return fallback(f"tp_size={self.tp_size}, pp_size={self.pp_size}")
+        if self.dtype != torch.bfloat16 or self.model_config.quantization is not None:
+            return fallback(
+                f"dtype={self.dtype}, quantization={self.model_config.quantization}"
+            )
+        hint_mode = envs.SGLANG_SPEC_PDMUX_SM_HINT.get()
+        if hint_mode != 2:
+            return fallback(
+                "SGLANG_SPEC_PDMUX_SM_HINT must be 2 so non-gate_up32 "
+                "fallbacks retain the realized SMALL-width selection"
+            )
+
+        from sglang.srt.multiplex.pdmux_context import (
+            get_spec_sm_allocated_split,
+            get_spec_streams,
+        )
+
+        allocated_split = get_spec_sm_allocated_split()
+        if allocated_split != (76, 32):
+            return fallback(f"allocated SM split={allocated_split}")
+
+        enable = getattr(self.model, "enable_qwen3_drafter_sm80_gate_up32", None)
+        if not callable(enable):
+            return fallback(f"model type={type(self.model).__name__}")
+
+        small_stream = get_spec_streams()[1]
+        with torch.cuda.stream(small_stream):
+            enabled = enable(self.gpu_id)
+        if not enabled:
+            return fallback(
+                "model is not the exact unquantized Qwen3-0.6B projection family"
+            )
+
+        logger.info(
+            "Qwen3 drafter SM80 gate_up32 enabled: exact M=32 N64 stage-5 "
+            "kernel across 28 layers at allocated split 76,32; unsupported "
+            "calls retain the existing projection path."
         )
         return True
 

@@ -741,6 +741,12 @@ class Envs:
     # models, shapes, dtypes, layouts, widths, and architectures keep the
     # production linear path. Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_TMA = EnvBool(False)
+    # A100 exact-M32 gate_up projection: run the selected SM80 CUTLASS
+    # (32,1024,6144) N64 stage-5 kernel on the exact Qwen3-0.6B TP1 BF16
+    # drafter at the realized 76,32 split. Every other model, shape, width,
+    # dtype, layout, architecture, and role retains the existing chained
+    # dispatch or production linear path. Experimental and default-off.
+    SGLANG_ENABLE_QWEN3_DRAFTER_SM80_GATE_UP32 = EnvBool(False)
     # Portable per-GPU cuBLASLt autotuning for exact Qwen3-0.6B TP1 BF16
     # projections. Before graph capture, each worker correctness-checks and
     # times top-N candidates at target 0 and its realized SMALL width against

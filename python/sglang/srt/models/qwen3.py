@@ -109,6 +109,77 @@ class _Qwen3DrafterTmaDispatch:
         return self._run(activation, weight)
 
 
+class _Qwen3DrafterSm80GateUp32Dispatch:
+    """Selected exact-M32 A100 gate-up kernel with per-call fallthrough."""
+
+    _CONFIG = "n64_s5"
+    _MKN = (32, 1024, 6144)
+
+    def __init__(self, device_index: int) -> None:
+        from sglang.jit_kernel.drafter_sm80_bf16_gate_up32 import (
+            _jit_drafter_sm80_bf16_gate_up32_module,
+            drafter_sm80_bf16_gate_up32,
+        )
+
+        with torch.cuda.device(device_index):
+            _jit_drafter_sm80_bf16_gate_up32_module()
+            self._workspace = torch.empty(0, dtype=torch.uint8, device="cuda")
+        self._run = drafter_sm80_bf16_gate_up32
+
+    @staticmethod
+    def supports_linear(linear: nn.Module) -> bool:
+        weight = getattr(linear, "weight", None)
+        return bool(
+            getattr(linear, "tp_size", None) == 1
+            and isinstance(
+                getattr(linear, "quant_method", None), UnquantizedLinearMethod
+            )
+            and getattr(linear, "bias", None) is None
+            and not getattr(linear, "gather_output", False)
+            and getattr(linear, "input_is_parallel", True)
+            and not getattr(linear, "use_dp_attention_reduce", False)
+            and isinstance(weight, torch.Tensor)
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+            and weight.data_ptr() % 16 == 0
+        )
+
+    def __call__(
+        self, linear: nn.Module, activation: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not self.supports_linear(linear):
+            return None
+        weight = linear.weight
+        shape_mkn = (
+            int(activation.shape[0]) if activation.ndim == 2 else -1,
+            int(activation.shape[1]) if activation.ndim == 2 else -1,
+            int(weight.shape[0]),
+        )
+        if (
+            shape_mkn != self._MKN
+            or not activation.is_cuda
+            or activation.device != weight.device
+            or activation.dtype != torch.bfloat16
+            or not activation.is_contiguous()
+            or activation.data_ptr() % 16
+        ):
+            return None
+        output = torch.empty(
+            (self._MKN[0], self._MKN[2]),
+            dtype=torch.bfloat16,
+            device=activation.device,
+        )
+        return self._run(
+            self._CONFIG,
+            output,
+            activation,
+            weight,
+            self._workspace,
+        )
+
+
 class _Qwen3CublasLtPortfolioDispatch:
     """Fresh-process cached exact-shape cuBLASLt tactics for one worker.
 
@@ -936,7 +1007,7 @@ class Qwen3Model(Qwen2Model):
     ) -> None:
         for layer in layers:
             for module in (layer.self_attn, layer.mlp):
-                existing = module._drafter_projection_dispatch
+                existing = getattr(module, "_drafter_projection_dispatch", None)
                 combined = (
                     dispatch
                     if existing is None
@@ -957,6 +1028,20 @@ class Qwen3Model(Qwen2Model):
         dispatch = _Qwen3DrafterTmaDispatch(device_index)
         # TMA specializations take priority over any installed cuBLASLt
         # portfolio; unsupported shapes fall through to it, then production.
+        self._install_drafter_projection_dispatch(layers, dispatch, prepend=True)
+        return True
+
+    def enable_qwen3_drafter_sm80_gate_up32(self, device_index: int) -> bool:
+        """Install the selected exact-M32 A100 gate-up specialization."""
+
+        layers = self._eligible_qwen3_drafter_layers(
+            device_index, _Qwen3DrafterSm80GateUp32Dispatch.supports_linear
+        )
+        if layers is None:
+            return False
+        dispatch = _Qwen3DrafterSm80GateUp32Dispatch(device_index)
+        # The exact A100 gate-up specialization precedes any installed
+        # cuBLASLt portfolio; all unsupported calls fall through unchanged.
         self._install_drafter_projection_dispatch(layers, dispatch, prepend=True)
         return True
 
@@ -1085,6 +1170,9 @@ class Qwen3ForCausalLM(nn.Module):
 
     def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
         return self.model.enable_qwen3_drafter_tma(device_index)
+
+    def enable_qwen3_drafter_sm80_gate_up32(self, device_index: int) -> bool:
+        return self.model.enable_qwen3_drafter_sm80_gate_up32(device_index)
 
     def enable_qwen3_drafter_cublaslt_portfolio(
         self,
