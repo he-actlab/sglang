@@ -1232,7 +1232,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         logger.info(
-            "Qwen3 drafter SM80 down32 enabled: exact M=32 N128 split-K4 stage-5 "
+            "Qwen3 drafter SM80 down32 enabled: exact M=32 N1024 split-K4 stage-5 "
             "kernel across 28 layers at allocated split 76,32; unsupported "
             "calls retain the existing projection path."
         )
