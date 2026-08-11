@@ -21,6 +21,12 @@ CONFIGS = (
     "n32_s8",
     "n64_s5",
 )
+DOWN_SPLITK4_CONFIGS = (
+    "splitk4_n128_s4",
+    "splitk4_n128_s5",
+)
+DOWN_CONFIGS = (*CONFIGS, *DOWN_SPLITK4_CONFIGS)
+DOWN_SPLITK4_WORKSPACE_BYTES = 4 * M * N * 4
 
 
 def _cuda_flags() -> list[str]:
@@ -53,6 +59,9 @@ def _jit_drafter_sm80_bf16_out_down32_module() -> Module:
         (f"drafter_sm80_bf16_{shape}_{config}",) * 2
         for shape in ("out32", "down32")
         for config in CONFIGS
+    ] + [
+        (f"drafter_sm80_bf16_down32_{config}",) * 2
+        for config in DOWN_SPLITK4_CONFIGS
     ]
     with _arch_env():
         return load_jit(
@@ -93,9 +102,10 @@ def _run(
     weight: torch.Tensor,
     workspace: torch.Tensor,
 ) -> torch.Tensor:
-    if config not in CONFIGS:
+    valid_configs = DOWN_CONFIGS if shape == "down32" else CONFIGS
+    if config not in valid_configs:
         raise ValueError(
-            f"unknown {shape} config {config!r}; expected one of {CONFIGS}"
+            f"unknown {shape} config {config!r}; expected one of {valid_configs}"
         )
     if not torch.cuda.is_available():
         raise RuntimeError(f"SM80 BF16 {shape} requires CUDA.")
@@ -134,6 +144,14 @@ def _run(
         dtype=torch.uint8,
         device=device,
     )
+    required_workspace = (
+        DOWN_SPLITK4_WORKSPACE_BYTES if config in DOWN_SPLITK4_CONFIGS else 0
+    )
+    if workspace.numel() < required_workspace:
+        raise ValueError(
+            f"workspace for {shape}/{config} must contain at least "
+            f"{required_workspace} bytes, got {workspace.numel()}"
+        )
 
     module = _jit_drafter_sm80_bf16_out_down32_module()
     getattr(module, f"drafter_sm80_bf16_{shape}_{config}")(
@@ -164,7 +182,10 @@ def drafter_sm80_bf16_down32(
 
 __all__ = [
     "CONFIGS",
+    "DOWN_CONFIGS",
     "DOWN_K",
+    "DOWN_SPLITK4_CONFIGS",
+    "DOWN_SPLITK4_WORKSPACE_BYTES",
     "M",
     "N",
     "OUT_K",

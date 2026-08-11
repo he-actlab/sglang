@@ -7,6 +7,8 @@ import torch
 
 from sglang.jit_kernel.drafter_sm80_bf16_out_down32 import (
     CONFIGS,
+    DOWN_SPLITK4_CONFIGS,
+    DOWN_SPLITK4_WORKSPACE_BYTES,
     DOWN_K,
     M,
     N,
@@ -85,6 +87,77 @@ def test_candidates_are_cuda_graph_safe(shape, k, operation, config):
     assert torch.isfinite(first).all(), shape
     assert torch.equal(first, second), shape
     assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5), shape
+
+
+@pytest.mark.parametrize("seed", [20260811, 20260812])
+@pytest.mark.parametrize("config", DOWN_SPLITK4_CONFIGS)
+def test_down32_splitk4_matches_reference_and_is_deterministic(config, seed):
+    _require_sm80()
+    torch.manual_seed(seed)
+    activation = torch.randn(M, DOWN_K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(N, DOWN_K, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(
+        DOWN_SPLITK4_WORKSPACE_BYTES, device="cuda", dtype=torch.uint8
+    )
+    reference = torch.nn.functional.linear(activation.float(), weight.float()).to(
+        torch.bfloat16
+    )
+    first = drafter_sm80_bf16_down32(
+        config, output, activation, weight, workspace
+    ).clone()
+    second = drafter_sm80_bf16_down32(
+        config, output, activation, weight, workspace
+    ).clone()
+    assert torch.isfinite(first).all()
+    assert torch.equal(first, second)
+    assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5)
+
+
+@pytest.mark.parametrize("config", DOWN_SPLITK4_CONFIGS)
+def test_down32_splitk4_is_cuda_graph_and_pointer_safe(config):
+    _require_sm80()
+    torch.manual_seed(20260813)
+    activation = torch.randn(M, DOWN_K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(N, DOWN_K, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(
+        DOWN_SPLITK4_WORKSPACE_BYTES, device="cuda", dtype=torch.uint8
+    )
+    reference = torch.nn.functional.linear(activation.float(), weight.float()).to(
+        torch.bfloat16
+    )
+    drafter_sm80_bf16_down32(config, output, activation, weight, workspace)
+    torch.cuda.synchronize()
+    output_pointer = output.data_ptr()
+    workspace_pointer = workspace.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        drafter_sm80_bf16_down32(config, output, activation, weight, workspace)
+    graph.replay()
+    first = output.clone()
+    graph.replay()
+    second = output.clone()
+    torch.cuda.synchronize()
+    assert output.data_ptr() == output_pointer
+    assert workspace.data_ptr() == workspace_pointer
+    assert torch.isfinite(first).all()
+    assert torch.equal(first, second)
+    assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5)
+
+
+def test_down32_splitk4_requires_full_workspace():
+    _require_sm80()
+    activation = torch.empty(M, DOWN_K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.empty(N, DOWN_K, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(
+        DOWN_SPLITK4_WORKSPACE_BYTES - 1, device="cuda", dtype=torch.uint8
+    )
+    with pytest.raises(ValueError, match="must contain at least"):
+        drafter_sm80_bf16_down32(
+            DOWN_SPLITK4_CONFIGS[0], output, activation, weight, workspace
+        )
 
 
 def test_invalid_inputs_are_rejected_before_launch():
