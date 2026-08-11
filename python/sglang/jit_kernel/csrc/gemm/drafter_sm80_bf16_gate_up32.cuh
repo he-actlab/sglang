@@ -130,8 +130,9 @@ gate_up32_ws_n64_k32_s5_kernel(
       for (int vec = lane; vec < kWsTileN * kWsTileK / 8; vec += 32) {
         const int row = vec / (kWsTileK / 8);
         const int col = (vec % (kWsTileK / 8)) * 8;
+        const int swizzled_col = (col + (row % 8) / 2 * 8) % kWsTileK;
         cuda::memcpy_async(
-            &smem_b[stage][row][col],
+            &smem_b[stage][row][swizzled_col],
             weight + static_cast<size_t>(n_base + row) * kK + k0 + col,
             cuda::aligned_size_t<16>(16),
             pipe);
@@ -160,13 +161,17 @@ gate_up32_ws_n64_k32_s5_kernel(
 #pragma unroll
         for (int n_frag = 0; n_frag < 4; ++n_frag) {
           uint32_t b_frag[2];
-          const int group = lane / 4;
-          const int thread_in_group = lane % 4;
-          const int smem_n = warp_n * 32 + n_frag * 8 + group;
+          const int smem_n = warp_n * 32 + n_frag * 8 + lane % 8;
+          const int logical_col = kk + ((lane / 8) % 2) * 8;
+          const int swizzled_col =
+              (logical_col + (smem_n % 8) / 2 * 8) % kWsTileK;
           const __nv_bfloat16* b_ptr =
-              &smem_b[stage][smem_n][kk + thread_in_group * 2];
-          b_frag[0] = *reinterpret_cast<const uint32_t*>(b_ptr);
-          b_frag[1] = *reinterpret_cast<const uint32_t*>(b_ptr + 8);
+              &smem_b[stage][smem_n][swizzled_col];
+          const uint32_t b_addr = ws_smem_u32(b_ptr);
+          asm volatile(
+              "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+              : "=r"(b_frag[0]), "=r"(b_frag[1])
+              : "r"(b_addr));
           asm volatile(
               "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
