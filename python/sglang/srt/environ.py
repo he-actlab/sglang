@@ -747,6 +747,12 @@ class Envs:
     # dtype, layout, architecture, and role retains the existing chained
     # dispatch or production linear path. Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_SM80_GATE_UP32 = EnvBool(False)
+    # A100 exact-M32 QKV projection: run the selected SM80 CUTLASS
+    # (32,1024,4096) N128 stage-6 kernel on the exact Qwen3-0.6B TP1 BF16
+    # drafter at the realized 76,32 split. It composes with gate_up32 and all
+    # unsupported calls retain the existing chained or production path.
+    # Experimental and default-off.
+    SGLANG_ENABLE_QWEN3_DRAFTER_SM80_QKV32 = EnvBool(False)
     # Portable per-GPU cuBLASLt autotuning for exact Qwen3-0.6B TP1 BF16
     # projections. Before graph capture, each worker correctness-checks and
     # times top-N candidates at target 0 and its realized SMALL width against

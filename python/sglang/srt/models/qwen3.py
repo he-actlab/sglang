@@ -180,6 +180,24 @@ class _Qwen3DrafterSm80GateUp32Dispatch:
         )
 
 
+class _Qwen3DrafterSm80Qkv32Dispatch(_Qwen3DrafterSm80GateUp32Dispatch):
+    """Selected exact-M32 A100 QKV kernel with per-call fallthrough."""
+
+    _CONFIG = "n128_s6"
+    _MKN = (32, 1024, 4096)
+
+    def __init__(self, device_index: int) -> None:
+        from sglang.jit_kernel.drafter_sm80_bf16_qkv32 import (
+            _jit_drafter_sm80_bf16_qkv32_module,
+            drafter_sm80_bf16_qkv32,
+        )
+
+        with torch.cuda.device(device_index):
+            _jit_drafter_sm80_bf16_qkv32_module()
+            self._workspace = torch.empty(0, dtype=torch.uint8, device="cuda")
+        self._run = drafter_sm80_bf16_qkv32
+
+
 class _Qwen3CublasLtPortfolioDispatch:
     """Fresh-process cached exact-shape cuBLASLt tactics for one worker.
 
@@ -1045,6 +1063,20 @@ class Qwen3Model(Qwen2Model):
         self._install_drafter_projection_dispatch(layers, dispatch, prepend=True)
         return True
 
+    def enable_qwen3_drafter_sm80_qkv32(self, device_index: int) -> bool:
+        """Install the selected exact-M32 A100 QKV specialization."""
+
+        layers = self._eligible_qwen3_drafter_layers(
+            device_index, _Qwen3DrafterSm80Qkv32Dispatch.supports_linear
+        )
+        if layers is None:
+            return False
+        dispatch = _Qwen3DrafterSm80Qkv32Dispatch(device_index)
+        # The exact A100 QKV specialization composes with gate_up32 and
+        # precedes any installed cuBLASLt portfolio. Other shapes fall through.
+        self._install_drafter_projection_dispatch(layers, dispatch, prepend=True)
+        return True
+
     def enable_qwen3_drafter_cublaslt_portfolio(
         self,
         device_index: int,
@@ -1173,6 +1205,9 @@ class Qwen3ForCausalLM(nn.Module):
 
     def enable_qwen3_drafter_sm80_gate_up32(self, device_index: int) -> bool:
         return self.model.enable_qwen3_drafter_sm80_gate_up32(device_index)
+
+    def enable_qwen3_drafter_sm80_qkv32(self, device_index: int) -> bool:
+        return self.model.enable_qwen3_drafter_sm80_qkv32(device_index)
 
     def enable_qwen3_drafter_cublaslt_portfolio(
         self,
