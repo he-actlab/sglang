@@ -22,6 +22,7 @@ CONFIGS = (
         f"n128_w8_k64_s{stages}"
         for stages in (2, 3, 4)
     ),
+    "ws_n64_k32_s5",
 )
 
 
