@@ -13,7 +13,14 @@ if TYPE_CHECKING:
 
 M, N = 32, 1024
 OUT_K, DOWN_K = 2048, 3072
-CONFIGS = ("n32_s4", "n32_s5", "n32_s6", "n64_s5")
+CONFIGS = (
+    "n32_s4",
+    "n32_s5",
+    "n32_s6",
+    "n32_s7",
+    "n32_s8",
+    "n64_s5",
+)
 
 
 def _cuda_flags() -> list[str]:
