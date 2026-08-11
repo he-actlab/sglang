@@ -24,6 +24,7 @@ limitations under the License.
 #include <cutlass/arch/arch.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/gemm/device/gemm_splitk_parallel.h>
 #include <cutlass/gemm/device/gemm_universal.h>
 #include <cutlass/gemm/gemm.h>
 #include <cutlass/gemm/threadblock/threadblock_swizzle.h>
@@ -47,6 +48,7 @@ static constexpr int kN = 1024;
 static constexpr int kOutK = 2048;
 static constexpr int kDownK = 3072;
 static constexpr size_t kAlignmentBytes = 16;
+static constexpr int kDownSplitKSlices = 4;
 
 template <int TileN>
 struct WarpShape;
@@ -82,6 +84,36 @@ using Projection32Gemm = cutlass::gemm::device::GemmUniversal<
     cutlass::epilogue::thread::LinearCombination<
         ElementOutput, 8, ElementAccumulator, ElementCompute>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
+    Stages,
+    8,
+    8,
+    cutlass::arch::OpMultiplyAdd>;
+
+// Preserve the incumbent down-projection parallelism while removing only its
+// inactive M rows: eight N128 tiles times four independent K slices launch 32
+// primary CTAs. Each exact-M32 CTA retains four tensor warps. The wrapper writes
+// FP32 partials to workspace and launches its reduction, so timing is complete.
+template <int Stages>
+using Down32SplitK4Gemm = cutlass::gemm::device::GemmSplitKParallel<
+    ElementA,
+    cutlass::layout::RowMajor,
+    ElementB,
+    cutlass::layout::ColumnMajor,
+    ElementOutput,
+    cutlass::layout::RowMajor,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<32, 128, 64>,
+    cutlass::gemm::GemmShape<16, 64, 64>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, 8, ElementAccumulator, ElementCompute>,
+    cutlass::epilogue::thread::Convert<
+        ElementAccumulator, 8, ElementAccumulator>,
+    cutlass::reduction::thread::ReduceAdd<
+        ElementAccumulator, ElementAccumulator, 8>,
+    cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,
     Stages,
     8,
     8,
@@ -186,6 +218,72 @@ inline void drafter_sm80_bf16_projection32_schedule(
   SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK(gemm.run(stream));
 }
 
+template <int Stages>
+inline void drafter_sm80_bf16_down32_splitk4_schedule(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  using namespace host;
+  using namespace sglang::drafter_sm80_bf16_out_down32_detail;
+  static_assert(Stages == 4 || Stages == 5);
+  using Gemm = Down32SplitK4Gemm<Stages>;
+
+  SymbolicDevice device;
+  SymbolicSize workspace_bytes{"workspace bytes"};
+  TensorMatcher({kM, kDownK})
+      .with_strides({kDownK, 1})
+      .with_dtype<bf16_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(activation);
+  TensorMatcher({kN, kDownK})
+      .with_strides({kDownK, 1})
+      .with_dtype<bf16_t>()
+      .with_device(device)
+      .verify(weight);
+  TensorMatcher({kM, kN})
+      .with_strides({kN, 1})
+      .with_dtype<bf16_t>()
+      .with_device(device)
+      .verify(output);
+  TensorMatcher({workspace_bytes})
+      .with_strides({1})
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .verify(workspace);
+
+  RuntimeCheck(is_aligned(activation.data_ptr(), kAlignmentBytes),
+               "drafter SM80 down32 split-K activation must be 16-byte aligned");
+  RuntimeCheck(is_aligned(weight.data_ptr(), kAlignmentBytes),
+               "drafter SM80 down32 split-K weight must be 16-byte aligned");
+  RuntimeCheck(is_aligned(output.data_ptr(), kAlignmentBytes),
+               "drafter SM80 down32 split-K output must be 16-byte aligned");
+
+  typename Gemm::Arguments arguments{
+      {kM, kN, kDownK},
+      {static_cast<const ElementA*>(activation.data_ptr()), kDownK},
+      {static_cast<const ElementB*>(weight.data_ptr()), kDownK},
+      {static_cast<const ElementOutput*>(output.data_ptr()), kN},
+      {static_cast<ElementOutput*>(output.data_ptr()), kN},
+      {ElementCompute(1), ElementCompute(0)},
+      kDownSplitKSlices};
+
+  const size_t required_workspace_bytes = Gemm::get_workspace_size(arguments);
+  RuntimeCheck(
+      required_workspace_bytes <= static_cast<size_t>(workspace_bytes.unwrap()),
+      "drafter SM80 down32 split-K workspace requires ",
+      required_workspace_bytes, " bytes, got ", workspace_bytes.unwrap());
+  RuntimeCheck(is_aligned(workspace.data_ptr(), kAlignmentBytes),
+               "drafter SM80 down32 split-K workspace must be 16-byte aligned");
+
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  Gemm gemm;
+  SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK(gemm.can_implement(arguments));
+  SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK(
+      gemm.initialize(arguments, workspace.data_ptr()));
+  SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK(gemm.run(stream));
+}
+
 #define SGLANG_DRAFTER_PROJECTION32_DEFINE(name, k, tile_n, stages)              \
   inline void name(                                                              \
       tvm::ffi::TensorView output,                                               \
@@ -220,6 +318,20 @@ SGLANG_DRAFTER_PROJECTION32_DEFINE(
     drafter_sm80_bf16_down32_n32_s8, 3072, 32, 8)
 SGLANG_DRAFTER_PROJECTION32_DEFINE(
     drafter_sm80_bf16_down32_n64_s5, 3072, 64, 5)
+
+inline void drafter_sm80_bf16_down32_splitk4_n128_s4(
+    tvm::ffi::TensorView output, tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {
+  drafter_sm80_bf16_down32_splitk4_schedule<4>(
+      output, activation, weight, workspace);
+}
+
+inline void drafter_sm80_bf16_down32_splitk4_n128_s5(
+    tvm::ffi::TensorView output, tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {
+  drafter_sm80_bf16_down32_splitk4_schedule<5>(
+      output, activation, weight, workspace);
+}
 
 #undef SGLANG_DRAFTER_PROJECTION32_DEFINE
 #undef SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK
