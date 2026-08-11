@@ -110,7 +110,7 @@ inline void drafter_sm80_bf16_projection32_schedule(
   using namespace sglang::drafter_sm80_bf16_out_down32_detail;
   static_assert(K == kOutK || K == kDownK);
   static_assert(TileN == 32 || TileN == 64);
-  static_assert(Stages >= 4 && Stages <= 6);
+  static_assert(Stages >= 4 && Stages <= 8);
   using Gemm = Projection32Gemm<K, TileN, Stages>;
 
   SymbolicDevice device;
@@ -203,6 +203,10 @@ SGLANG_DRAFTER_PROJECTION32_DEFINE(
 SGLANG_DRAFTER_PROJECTION32_DEFINE(
     drafter_sm80_bf16_out32_n32_s6, 2048, 32, 6)
 SGLANG_DRAFTER_PROJECTION32_DEFINE(
+    drafter_sm80_bf16_out32_n32_s7, 2048, 32, 7)
+SGLANG_DRAFTER_PROJECTION32_DEFINE(
+    drafter_sm80_bf16_out32_n32_s8, 2048, 32, 8)
+SGLANG_DRAFTER_PROJECTION32_DEFINE(
     drafter_sm80_bf16_out32_n64_s5, 2048, 64, 5)
 SGLANG_DRAFTER_PROJECTION32_DEFINE(
     drafter_sm80_bf16_down32_n32_s4, 3072, 32, 4)
@@ -210,6 +214,10 @@ SGLANG_DRAFTER_PROJECTION32_DEFINE(
     drafter_sm80_bf16_down32_n32_s5, 3072, 32, 5)
 SGLANG_DRAFTER_PROJECTION32_DEFINE(
     drafter_sm80_bf16_down32_n32_s6, 3072, 32, 6)
+SGLANG_DRAFTER_PROJECTION32_DEFINE(
+    drafter_sm80_bf16_down32_n32_s7, 3072, 32, 7)
+SGLANG_DRAFTER_PROJECTION32_DEFINE(
+    drafter_sm80_bf16_down32_n32_s8, 3072, 32, 8)
 SGLANG_DRAFTER_PROJECTION32_DEFINE(
     drafter_sm80_bf16_down32_n64_s5, 3072, 64, 5)
 
