@@ -1,21 +1,23 @@
 """Correctness and CUDA-graph gates for standalone SM80 out/down32 GEMMs."""
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.jit_kernel.drafter_sm80_bf16_out_down32 import (
     CONFIGS,
+    DOWN_K,
     DOWN_SPLITK4_CONFIGS,
     DOWN_SPLITK4_WORKSPACE_BYTES,
-    DOWN_K,
+    OUT_K,
     M,
     N,
-    OUT_K,
     drafter_sm80_bf16_down32,
     drafter_sm80_bf16_out32,
 )
+from sglang.srt.models.qwen3 import _Qwen3DrafterSm80Down32Dispatch
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -109,9 +111,17 @@ def test_down32_splitk4_matches_reference_and_is_deterministic(config, seed):
     second = drafter_sm80_bf16_down32(
         config, output, activation, weight, workspace
     ).clone()
+    relative_l2 = torch.linalg.vector_norm(
+        first.float() - reference.float()
+    ) / torch.linalg.vector_norm(reference.float())
+    cosine = torch.nn.functional.cosine_similarity(
+        first.float().reshape(1, -1), reference.float().reshape(1, -1)
+    ).item()
     assert torch.isfinite(first).all()
     assert torch.equal(first, second)
     assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5)
+    assert relative_l2.item() < 0.01
+    assert cosine > 0.9999
 
 
 @pytest.mark.parametrize("config", DOWN_SPLITK4_CONFIGS)
@@ -128,6 +138,7 @@ def test_down32_splitk4_is_cuda_graph_and_pointer_safe(config):
         torch.bfloat16
     )
     drafter_sm80_bf16_down32(config, output, activation, weight, workspace)
+    eager = output.clone()
     torch.cuda.synchronize()
     output_pointer = output.data_ptr()
     workspace_pointer = workspace.data_ptr()
@@ -143,6 +154,42 @@ def test_down32_splitk4_is_cuda_graph_and_pointer_safe(config):
     assert workspace.data_ptr() == workspace_pointer
     assert torch.isfinite(first).all()
     assert torch.equal(first, second)
+    assert torch.equal(eager, first)
+    assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5)
+
+
+def test_integrated_down32_dispatch_is_eager_graph_and_pointer_safe(monkeypatch):
+    _require_sm80()
+    torch.manual_seed(20260814)
+    activation = torch.randn(M, DOWN_K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(N, DOWN_K, device="cuda", dtype=torch.bfloat16)
+    linear = SimpleNamespace(weight=weight)
+    reference = torch.nn.functional.linear(activation.float(), weight.float()).to(
+        torch.bfloat16
+    )
+    monkeypatch.setattr(
+        _Qwen3DrafterSm80Down32Dispatch,
+        "supports_linear",
+        staticmethod(lambda _: True),
+    )
+    dispatch = _Qwen3DrafterSm80Down32Dispatch(0)
+    workspace_pointer = dispatch._workspace.data_ptr()
+    eager = dispatch(linear, activation).clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = dispatch(linear, activation)
+    graph_output_pointer = graph_output.data_ptr()
+    graph.replay()
+    first = graph_output.clone()
+    graph.replay()
+    second = graph_output.clone()
+    torch.cuda.synchronize()
+
+    assert dispatch._workspace.numel() == DOWN_SPLITK4_WORKSPACE_BYTES
+    assert dispatch._workspace.data_ptr() == workspace_pointer
+    assert graph_output.data_ptr() == graph_output_pointer
+    assert torch.equal(first, second)
+    assert torch.equal(eager, first)
     assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5)
 
 
