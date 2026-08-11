@@ -11,6 +11,7 @@ from sglang.jit_kernel.drafter_sm80_bf16_out_down32 import (
     M,
     N,
     OUT_K,
+    OUT_CONFIGS,
     drafter_sm80_bf16_down32,
     drafter_sm80_bf16_out32,
 )
@@ -85,6 +86,64 @@ def test_candidates_are_cuda_graph_safe(shape, k, operation, config):
     assert torch.isfinite(first).all(), shape
     assert torch.equal(first, second), shape
     assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5), shape
+
+
+@pytest.mark.parametrize("seed", [20260811, 20260812])
+@pytest.mark.parametrize("config", OUT_CONFIGS[len(CONFIGS) :])
+def test_out32_k64_candidates_match_fp32_reference_and_are_deterministic(
+    config, seed
+):
+    _require_sm80()
+    torch.manual_seed(seed)
+    activation = torch.randn(M, OUT_K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(N, OUT_K, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(0, device="cuda", dtype=torch.uint8)
+    reference = torch.nn.functional.linear(activation.float(), weight.float()).to(
+        torch.bfloat16
+    )
+
+    first = drafter_sm80_bf16_out32(
+        config, output, activation, weight, workspace
+    ).clone()
+    second = drafter_sm80_bf16_out32(
+        config, output, activation, weight, workspace
+    ).clone()
+
+    assert torch.isfinite(first).all()
+    assert torch.equal(first, second)
+    assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5)
+
+
+@pytest.mark.parametrize("config", OUT_CONFIGS[len(CONFIGS) :])
+def test_out32_k64_candidates_are_cuda_graph_safe(config):
+    _require_sm80()
+    torch.manual_seed(20260813)
+    activation = torch.randn(M, OUT_K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(N, OUT_K, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(0, device="cuda", dtype=torch.uint8)
+    reference = torch.nn.functional.linear(activation.float(), weight.float()).to(
+        torch.bfloat16
+    )
+
+    drafter_sm80_bf16_out32(config, output, activation, weight, workspace)
+    torch.cuda.synchronize()
+    output_pointer = output.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        drafter_sm80_bf16_out32(config, output, activation, weight, workspace)
+
+    graph.replay()
+    first = output.clone()
+    graph.replay()
+    second = output.clone()
+    torch.cuda.synchronize()
+
+    assert output.data_ptr() == output_pointer
+    assert torch.isfinite(first).all()
+    assert torch.equal(first, second)
+    assert torch.allclose(first.float(), reference.float(), rtol=0.02, atol=2.5)
 
 
 def test_invalid_inputs_are_rejected_before_launch():

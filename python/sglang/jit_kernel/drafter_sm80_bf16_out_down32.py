@@ -21,6 +21,8 @@ CONFIGS = (
     "n32_s8",
     "n64_s5",
 )
+OUT_CONFIGS = CONFIGS + ("n64k64_s6", "n64k64_s7", "n64k64_s8")
+DOWN_CONFIGS = CONFIGS
 
 
 def _cuda_flags() -> list[str]:
@@ -50,9 +52,8 @@ def _arch_env():
 @cache_once
 def _jit_drafter_sm80_bf16_out_down32_module() -> Module:
     wrappers = [
-        (f"drafter_sm80_bf16_{shape}_{config}",) * 2
-        for shape in ("out32", "down32")
-        for config in CONFIGS
+        *((f"drafter_sm80_bf16_out32_{config}",) * 2 for config in OUT_CONFIGS),
+        *((f"drafter_sm80_bf16_down32_{config}",) * 2 for config in DOWN_CONFIGS),
     ]
     with _arch_env():
         return load_jit(
@@ -93,9 +94,10 @@ def _run(
     weight: torch.Tensor,
     workspace: torch.Tensor,
 ) -> torch.Tensor:
-    if config not in CONFIGS:
+    valid_configs = OUT_CONFIGS if shape == "out32" else DOWN_CONFIGS
+    if config not in valid_configs:
         raise ValueError(
-            f"unknown {shape} config {config!r}; expected one of {CONFIGS}"
+            f"unknown {shape} config {config!r}; expected one of {valid_configs}"
         )
     if not torch.cuda.is_available():
         raise RuntimeError(f"SM80 BF16 {shape} requires CUDA.")
@@ -168,6 +170,7 @@ __all__ = [
     "M",
     "N",
     "OUT_K",
+    "OUT_CONFIGS",
     "drafter_sm80_bf16_down32",
     "drafter_sm80_bf16_out32",
 ]
