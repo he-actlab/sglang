@@ -236,31 +236,100 @@ class WidthAwareDecodeWrapper(BatchDecodeWithPagedKVCacheWrapper):
     begin_forward = plan
 
 
-def fast_decode_plan_colo(self, *args, **kwargs) -> None:
-    """Armed replay planner: upstream sync-free ``fast_decode_plan``, then a
-    width-aware re-plan so replays reproduce the armed capture partition."""
-    fast_decode_plan(self, *args, **kwargs)
+def fast_decode_plan_colo(
+    self,
+    indptr,
+    indices,
+    last_page_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    page_size,
+    pos_encoding_mode="NONE",
+    window_left=-1,
+    logits_soft_cap=None,
+    q_data_type=None,
+    kv_data_type=None,
+    data_type=None,
+    sm_scale=None,
+    rope_scale=None,
+    rope_theta=None,
+    non_blocking=True,
+    fixed_split_size=None,
+    disable_split_kv=False,
+    global_override_indptr_cpu=None,
+) -> None:
+    """Single-pass width-aware replay planner for CUDA graphs.
+
+    The earlier implementation ran upstream ``fast_decode_plan`` and then
+    discarded its full-die plan before running the width-aware planner. That
+    duplicated host planning and metadata copies on every draft iteration.
+    Captured CUDA-graph buffers are already initialized, so the armed replay
+    needs only the width-aware module plan plus the scalar state updates that
+    upstream performs after planning.
+    """
     width = getattr(self, "_spec_pdmux_decode_sm_width", 0)
     if width <= 0 or self.use_tensor_cores:
-        return
-    bound = inspect.signature(fast_decode_plan).bind(self, *args, **kwargs)
-    bound.apply_defaults()
-    p = bound.arguments
-    override = p.get("global_override_indptr_cpu")
-    indptr_host = override if override is not None else p["indptr"].cpu()
+        return fast_decode_plan(
+            self,
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            pos_encoding_mode=pos_encoding_mode,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            data_type=data_type,
+            sm_scale=sm_scale,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            non_blocking=non_blocking,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+            global_override_indptr_cpu=global_override_indptr_cpu,
+        )
+    batch_size = len(last_page_len)
+    if not self.is_cuda_graph_enabled:
+        raise ValueError("width-aware fast decode planning requires CUDA graphs")
+    if batch_size != self._fixed_batch_size:
+        raise ValueError(
+            "The batch size should be fixed in cudagraph mode, the runtime batch "
+            f"size {batch_size} mismatches the batch size set during initialization "
+            f"{self._fixed_batch_size}"
+        )
+    if len(indices) > len(self._paged_kv_indices_buf):
+        raise ValueError(
+            "The size of indices should be less than or equal to the allocated buffer"
+        )
+    indptr_host = (
+        global_override_indptr_cpu
+        if global_override_indptr_cpu is not None
+        else indptr.cpu()
+    )
     _colo_replan(
         self,
         indptr_host=indptr_host,
-        batch_size=len(p["last_page_len"]),
-        num_qo_heads=p["num_qo_heads"],
-        num_kv_heads=p["num_kv_heads"],
-        head_dim=p["head_dim"],
-        page_size=p["page_size"],
-        pos_encoding_mode=p.get("pos_encoding_mode", "NONE"),
-        window_left=p.get("window_left", -1),
-        logits_soft_cap=p.get("logits_soft_cap"),
-        q_data_type=p.get("q_data_type"),
-        kv_data_type=p.get("kv_data_type"),
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pos_encoding_mode=pos_encoding_mode,
+        window_left=window_left,
+        logits_soft_cap=logits_soft_cap,
+        q_data_type=q_data_type,
+        kv_data_type=kv_data_type,
         o_data_type=None,
-        data_type=p.get("data_type"),
+        data_type=data_type,
     )
+    self._pos_encoding_mode = pos_encoding_mode
+    self._window_left = window_left
+    self._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
+    self._sm_scale = sm_scale
+    self._rope_scale = rope_scale
+    self._rope_theta = rope_theta
