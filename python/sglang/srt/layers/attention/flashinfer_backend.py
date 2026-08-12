@@ -23,6 +23,9 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_decode_budget import (
+    resolve_decode_planning_width,
+)
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -36,10 +39,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -633,9 +636,9 @@ class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
             return result
         from flashinfer.page import get_seq_lens
 
-        bound = inspect.signature(
-            BatchPrefillWithPagedKVCacheWrapper.plan
-        ).bind(self, *args, **kwargs)
+        bound = inspect.signature(BatchPrefillWithPagedKVCacheWrapper.plan).bind(
+            self, *args, **kwargs
+        )
         bound.apply_defaults()
         p = bound.arguments
         qo_indptr_host = p["qo_indptr"].to("cpu")
@@ -674,9 +677,7 @@ class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
             qo_indptr_host=qo_indptr_host,
             kv_indptr_host=kv_indptr_host,
             kv_lens_host=kv_lens_host,
-            max_q_len=int(
-                (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
-            ),
+            max_q_len=int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()),
             max_kv_len=int(kv_lens_host.max().item()),
         )
         return result
@@ -946,11 +947,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # no plan-level hook and stays width-blind (FLASHINFER-WIDTH.md B5).
         self.spec_pdmux_colocated_reserve = 0
         width_mode = envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get()
-        if (
-            width_mode > 0
-            and self.enable_spec_pdmux
-            and self.prefill_backend == "fa2"
-        ):
+        if width_mode > 0 and self.enable_spec_pdmux and self.prefill_backend == "fa2":
             armed = model_runner.is_draft_worker or width_mode >= 2
             from sglang.srt.multiplex.pdmux_context import (
                 get_spec_sm_allocated_split,
@@ -958,17 +955,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
             allocated = get_spec_sm_allocated_split()
             if armed and allocated is not None:
-                width = (
-                    allocated[1]
-                    if model_runner.is_draft_worker
-                    else allocated[0]
-                )
+                width = allocated[1] if model_runner.is_draft_worker else allocated[0]
                 device_sms = torch.cuda.get_device_properties(
                     model_runner.gpu_id
                 ).multi_processor_count
-                self.spec_pdmux_colocated_reserve = max(
-                    0, 2 * (device_sms - width)
-                )
+                self.spec_pdmux_colocated_reserve = max(0, 2 * (device_sms - width))
                 logger.info(
                     "FlashInfer width reserve armed: worker=%s allocated "
                     "width=%d device SMs=%d num_colocated_ctas=%d "
@@ -1040,11 +1031,20 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 allocated = get_spec_sm_allocated_split()
                 if allocated is not None:
-                    self.spec_pdmux_decode_sm_width = allocated[1]
+                    physical_sms = torch.cuda.get_device_properties(
+                        model_runner.gpu_id
+                    ).multi_processor_count
+                    self.spec_pdmux_decode_sm_width = resolve_decode_planning_width(
+                        decode_width_mode,
+                        allocated_small_sms=allocated[1],
+                        physical_sms=physical_sms,
+                    )
                     logger.info(
-                        "FlashInfer decode width armed: draft worker "
-                        "allocated SMALL width=%d (fa2 CUDA-cores decode "
-                        "plans, sm_count_override)",
+                        "FlashInfer decode width armed: draft worker mode=%d "
+                        "allocated SMALL width=%d planning width=%d "
+                        "(fa2 CUDA-cores decode plans, sm_count_override)",
+                        decode_width_mode,
+                        allocated[1],
                         self.spec_pdmux_decode_sm_width,
                     )
 
@@ -1541,9 +1541,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
         if self.spec_pdmux_decode_sm_width > 0:
             for wrapper in wrappers:
-                wrapper._spec_pdmux_decode_sm_width = (
-                    self.spec_pdmux_decode_sm_width
-                )
+                wrapper._spec_pdmux_decode_sm_width = self.spec_pdmux_decode_sm_width
         return wrappers
 
     def _create_prefill_wrappers(
@@ -2548,19 +2546,29 @@ class FlashInferIndicesUpdaterPrefill:
                 if not torch.equal(dev_seq, host_seq):
                     logger.warning(
                         "[fastplan-debug] seq_lens mismatch dev=%s host=%s",
-                        dev_seq.tolist(), host_seq.tolist())
+                        dev_seq.tolist(),
+                        host_seq.tolist(),
+                    )
                 if not torch.equal(dev_qo, qo_indptr_host.to(dev_qo.dtype)):
-                    logger.warning("[fastplan-debug] qo mismatch dev=%s host=%s",
-                                   dev_qo.tolist(), qo_indptr_host.tolist())
+                    logger.warning(
+                        "[fastplan-debug] qo mismatch dev=%s host=%s",
+                        dev_qo.tolist(),
+                        qo_indptr_host.tolist(),
+                    )
                 if not torch.equal(dev_kvptr, kv_indptr_host.to(dev_kvptr.dtype)):
-                    logger.warning("[fastplan-debug] kvptr mismatch dev=%s host=%s",
-                                   dev_kvptr.tolist(), kv_indptr_host.tolist())
+                    logger.warning(
+                        "[fastplan-debug] kvptr mismatch dev=%s host=%s",
+                        dev_kvptr.tolist(),
+                        kv_indptr_host.tolist(),
+                    )
                 if use_custom_mask is not None:
                     exp_numel = int((kv_lens_host_i64 * dtn).sum())
                     if use_custom_mask.numel() < exp_numel:
                         logger.warning(
                             "[fastplan-debug] mask numel %d < expected %d",
-                            use_custom_mask.numel(), exp_numel)
+                            use_custom_mask.numel(),
+                            exp_numel,
+                        )
             if use_custom_mask is not None:
                 mask_lens = kv_lens_host_i64 * dtn  # bits per request
                 mask_indptr_host = torch.zeros(bs + 1, dtype=torch.int64)
@@ -2576,13 +2584,11 @@ class FlashInferIndicesUpdaterPrefill:
                 packed_indptr_dev = packed_indptr_host.to(torch.int32).to(
                     device, non_blocking=True
                 )
-                paged_plan_kwargs["packed_custom_mask"] = (
-                    segment_packbits_known_size(
-                        use_custom_mask.contiguous().view(-1),
-                        mask_indptr_dev,
-                        packed_indptr_dev,
-                        int(packed_indptr_host[-1]),
-                    )
+                paged_plan_kwargs["packed_custom_mask"] = segment_packbits_known_size(
+                    use_custom_mask.contiguous().view(-1),
+                    mask_indptr_dev,
+                    packed_indptr_dev,
+                    int(packed_indptr_host[-1]),
                 )
                 paged_plan_kwargs["packed_mask_indptr"] = packed_indptr_dev
                 # The mask is consumed via the packed path; don't hand the raw

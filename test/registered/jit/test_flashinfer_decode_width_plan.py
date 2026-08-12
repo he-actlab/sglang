@@ -35,6 +35,7 @@ _NUM_QO_HEADS = 16
 _NUM_KV_HEADS = 8
 _HEAD_DIM = 128
 _WIDTH = 52
+_TWO_WAVE_WIDTH = 64
 
 
 def _make_wrapper(width):
@@ -119,8 +120,72 @@ def test_replay_fast_plan_colo_reproduces_the_armed_capture():
         global_override_indptr_cpu=indptr.cpu(),
     )
     replay = list(wrapper._plan_info)
-    assert replay == armed_capture, (
-        "the armed replay planner must reproduce the armed capture partition"
+    assert (
+        replay == armed_capture
+    ), "the armed replay planner must reproduce the armed capture partition"
+
+
+def test_two_wave_plan_is_split_and_graph_correct():
+    _require_cuda()
+    torch.manual_seed(20260812)
+    stock = _make_wrapper(0)
+    candidate = _make_wrapper(_TWO_WAVE_WIDTH)
+    stock_plan = _plan(stock)
+    candidate_plan = _plan(candidate)
+
+    # DecodePlanInfo positions are fixed by FlashInfer 0.6.12. This exact
+    # workload has 8 resident blocks/SM and GQA-group grid-y=2, so width 64
+    # must produce 512 main CTAs while retaining split-KV.
+    assert stock_plan[5] == 864
+    assert candidate_plan[5] == 512
+    assert stock_plan[9] == 1
+    assert candidate_plan[9] == 1
+
+    q = torch.randn(_BS, _NUM_QO_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(
+        _BS * _KV_LEN,
+        _PAGE_SIZE,
+        _NUM_KV_HEADS,
+        _HEAD_DIM,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v = torch.randn_like(k)
+
+    stock_output = stock.run(q, (k, v))
+    eager_first = candidate.run(q, (k, v))
+    eager_second = candidate.run(q, (k, v))
+    torch.testing.assert_close(eager_first, stock_output, rtol=1e-2, atol=1e-2)
+    assert torch.equal(eager_first, eager_second)
+
+    graph_output = torch.empty_like(eager_first)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        captured = candidate.run(q, (k, v), out=graph_output)
+    assert captured.data_ptr() == graph_output.data_ptr()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_first = graph_output.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_second = graph_output.clone()
+    assert torch.equal(replay_first, replay_second)
+    torch.testing.assert_close(replay_first, stock_output, rtol=1e-2, atol=1e-2)
+
+    indptr, indices, last_page_len = _plan_args()
+    fast_decode_plan_colo(
+        candidate,
+        indptr,
+        indices,
+        last_page_len,
+        _NUM_QO_HEADS,
+        _NUM_KV_HEADS,
+        _HEAD_DIM,
+        _PAGE_SIZE,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        global_override_indptr_cpu=indptr.cpu(),
     )
 
 
@@ -130,9 +195,7 @@ def test_begin_forward_alias_routes_through_the_armed_override():
     while replays plan armed (the prefill knob's illegal-access failure
     mode)."""
 
-    assert (
-        WidthAwareDecodeWrapper.begin_forward is WidthAwareDecodeWrapper.plan
-    )
+    assert WidthAwareDecodeWrapper.begin_forward is WidthAwareDecodeWrapper.plan
     _require_cuda()
     via_begin = _make_wrapper(_WIDTH)
     indptr, indices, last_page_len = _plan_args()

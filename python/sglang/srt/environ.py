@@ -806,8 +806,9 @@ class Envs:
     # planner the realized green-context SM width via the fork-vendored
     # plan-only module (sm_count_override). The stock decode plan has no
     # width argument and splits KV for the full die. 0 = off (stock
-    # planning); 1 = arm the draft worker's decode plans with the allocated
-    # SMALL width. No effect when decode uses tensor cores (that path rides
+    # planning); 1 = arm with the allocated SMALL width; 2 = retain a bounded
+    # two-SM-wave planning budget, min(2*SMALL, physical SMs). No effect when
+    # decode uses tensor cores (that path rides
     # the prefill template and TODO-8's knob). Experimental and default-off.
     SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH = EnvInt(0)
 
