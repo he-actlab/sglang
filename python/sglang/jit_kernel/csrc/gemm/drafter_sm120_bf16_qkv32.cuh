@@ -201,6 +201,42 @@ using AmpereQkv32Gemm = cutlass::gemm::device::GemmUniversal<
     8, 8,
     cutlass::arch::OpMultiplyAdd>;
 
+// A100-winner topology ports (Design-SM80Qkv32): exact-M32 rows with a wide
+// N tile on the same classic cp.async multistage path. N128 with a 32x32x32
+// warp tile is the A100 32-SM winner (four tensor warps, 32 CTAs); N64 with
+// a 16x32x32 warp tile doubles the CTA count. Both avoid the inactive second
+// half of the incumbent's padded 64-row M tile.
+template <int TileN>
+struct AmpereWideWarpShape;
+
+template <>
+struct AmpereWideWarpShape<64> {
+  using Type = cutlass::gemm::GemmShape<16, 32, 32>;
+};
+
+template <>
+struct AmpereWideWarpShape<128> {
+  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
+};
+
+template <int TileN, int Stages>
+using AmpereWideQkv32Gemm = cutlass::gemm::device::GemmUniversal<
+    ElementA, cutlass::layout::RowMajor,
+    ElementB, cutlass::layout::ColumnMajor,
+    ElementD, cutlass::layout::RowMajor,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<32, TileN, 32>,
+    typename AmpereWideWarpShape<TileN>::Type,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<
+        ElementD, 8, ElementAccumulator, ElementCompute>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
+    Stages,
+    8, 8,
+    cutlass::arch::OpMultiplyAdd>;
+
 
 
 static constexpr int kM = 32;
@@ -390,6 +426,63 @@ inline void drafter_sm120_bf16_qkv32_amp_k64_s5(tvm::ffi::TensorView output,
     tvm::ffi::TensorView activation, tvm::ffi::TensorView weight,
     tvm::ffi::TensorView workspace) {
   drafter_qkv32_ampere_schedule<5, 64>(output, activation, weight, workspace);
+}
+
+template <int TileN, int Stages>
+inline void drafter_qkv32_ampere_wide_schedule(tvm::ffi::TensorView output,
+                                               tvm::ffi::TensorView activation,
+                                               tvm::ffi::TensorView weight,
+                                               tvm::ffi::TensorView workspace) {
+  using namespace host;
+  using namespace sglang::drafter_sm120_bf16_qkv32_detail;
+  using Gemm = AmpereWideQkv32Gemm<TileN, Stages>;
+  SymbolicDevice device;
+  SymbolicSize workspace_bytes{"workspace bytes"};
+  TensorMatcher({kM, kK}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(activation);
+  TensorMatcher({kN, kK}).with_dtype<bf16_t>().with_device(device).verify(weight);
+  TensorMatcher({kM, kN}).with_dtype<bf16_t>().with_device(device).verify(output);
+  TensorMatcher({workspace_bytes}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {kM, kN, kK},
+      1,
+      {ElementCompute(1), ElementCompute(0)},
+      activation.data_ptr(), weight.data_ptr(), output.data_ptr(), output.data_ptr(),
+      int64_t(kM) * kK, int64_t(kN) * kK, int64_t(kM) * kN, int64_t(kM) * kN,
+      kK, kK, kN, kN};
+  Gemm gemm;
+  SGLANG_DRAFTER_QKV32_CUTLASS_CHECK(gemm.can_implement(arguments));
+  size_t needed = Gemm::get_workspace_size(arguments);
+  RuntimeCheck(needed <= static_cast<size_t>(workspace_bytes.unwrap()),
+               "ampere wide qkv32 workspace requires ", needed, " bytes");
+  SGLANG_DRAFTER_QKV32_CUTLASS_CHECK(
+      gemm.initialize(arguments, needed ? workspace.data_ptr() : nullptr, stream));
+  SGLANG_DRAFTER_QKV32_CUTLASS_CHECK(gemm.run(stream));
+}
+
+inline void drafter_sm120_bf16_qkv32_amp_n64_s5(tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation, tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  drafter_qkv32_ampere_wide_schedule<64, 5>(output, activation, weight, workspace);
+}
+
+inline void drafter_sm120_bf16_qkv32_amp_n64_s6(tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation, tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  drafter_qkv32_ampere_wide_schedule<64, 6>(output, activation, weight, workspace);
+}
+
+inline void drafter_sm120_bf16_qkv32_amp_n128_s5(tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation, tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  drafter_qkv32_ampere_wide_schedule<128, 5>(output, activation, weight, workspace);
+}
+
+inline void drafter_sm120_bf16_qkv32_amp_n128_s6(tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation, tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  drafter_qkv32_ampere_wide_schedule<128, 6>(output, activation, weight, workspace);
 }
 
 // Knob 1 proper: force the persistent grid to two CTAs per SM.

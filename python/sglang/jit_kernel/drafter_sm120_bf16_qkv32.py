@@ -98,6 +98,22 @@ def _jit_drafter_sm120_bf16_qkv32_module():
                     "drafter_sm120_bf16_qkv32_amp_k64_s5",
                 ),
                 (
+                    "drafter_sm120_bf16_qkv32_amp_n64_s5",
+                    "drafter_sm120_bf16_qkv32_amp_n64_s5",
+                ),
+                (
+                    "drafter_sm120_bf16_qkv32_amp_n64_s6",
+                    "drafter_sm120_bf16_qkv32_amp_n64_s6",
+                ),
+                (
+                    "drafter_sm120_bf16_qkv32_amp_n128_s5",
+                    "drafter_sm120_bf16_qkv32_amp_n128_s5",
+                ),
+                (
+                    "drafter_sm120_bf16_qkv32_amp_n128_s6",
+                    "drafter_sm120_bf16_qkv32_amp_n128_s6",
+                ),
+                (
                     "drafter_qkv32_tmafed",
                     "drafter_qkv32_tmafed",
                 ),
