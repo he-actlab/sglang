@@ -192,8 +192,24 @@ extern "C" __global__ void __launch_bounds__(kLdThreads) sm120_stream_ld_kernel(
     ulonglong2 v = __ldcv(&vectors[index]);
     local_sum ^= v.x ^ v.y;
   }
-  atomicAdd(reinterpret_cast<unsigned long long*>(checksum_out),
-            static_cast<unsigned long long>(local_sum));
+  // Reduce inside the CTA first: per-thread atomics to one global address
+  // serialize (~106k atomics at 416 CTAs) and dominate short-slab timings.
+  __shared__ uint64_t cta_sum[kLdThreads / 32];
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_sum ^= __shfl_down_sync(0xffffffffu, local_sum, offset);
+  }
+  if ((threadIdx.x & 31) == 0) {
+    cta_sum[threadIdx.x >> 5] = local_sum;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    uint64_t block_sum = 0;
+    for (int warp = 0; warp < kLdThreads / 32; ++warp) {
+      block_sum ^= cta_sum[warp];
+    }
+    atomicAdd(reinterpret_cast<unsigned long long*>(checksum_out),
+              static_cast<unsigned long long>(block_sum));
+  }
 }
 
 extern "C" __global__ void __launch_bounds__(kLdThreads) sm120_stream_fill_kernel(
