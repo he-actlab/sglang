@@ -839,6 +839,15 @@ class Envs:
     SGLANG_DRAFT_EXTEND_NCU_RANGE_NAME = EnvStr(
         "SGLANG_DRAFT_EXTEND_M128_REPLAY"
     )
+    # Emit one synchronized NVTX range around an exact live draft call. This
+    # is a mechanism-only Nsight Compute selector: it is disabled by default,
+    # records the selected batch/sequence-length identity, and never supplies
+    # latency numbers.
+    SGLANG_DRAFT_NCU_RANGE = EnvBool(False)
+    SGLANG_DRAFT_NCU_REPLAY_INDEX = EnvInt(21)
+    SGLANG_DRAFT_NCU_BATCH_SIZE = EnvInt(32)
+    SGLANG_DRAFT_NCU_RANGE_NAME = EnvStr("SGLANG_DRAFT_M32_REPLAY")
+    SGLANG_DRAFT_NCU_IDENTITY_OUT = EnvStr("/tmp/sglang-draft-ncu-identity.json")
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

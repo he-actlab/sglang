@@ -134,16 +134,27 @@ logger = logging.getLogger(__name__)
 # If both are set, NVTX wins (a counter run is already timing-invalid).
 import atexit
 import functools
+import hashlib
 import json
 import os
 
 _NVTX_PROFILE = os.environ.get("SGLANG_NVTX_PROFILE", "0") == "1"
-_PHASE_EVENTS = (
-    os.environ.get("SGLANG_PHASE_EVENTS", "0") == "1" and not _NVTX_PROFILE
-)
-_PHASE_EVENTS_OUT = os.environ.get(
-    "SGLANG_PHASE_EVENTS_OUT", "/tmp/phase_times.jsonl"
-)
+_PHASE_EVENTS = os.environ.get("SGLANG_PHASE_EVENTS", "0") == "1" and not _NVTX_PROFILE
+_DRAFT_NCU_RANGE = bool(envs.SGLANG_DRAFT_NCU_RANGE.get())
+_DRAFT_NCU_REPLAY_INDEX = int(envs.SGLANG_DRAFT_NCU_REPLAY_INDEX.get())
+_DRAFT_NCU_BATCH_SIZE = int(envs.SGLANG_DRAFT_NCU_BATCH_SIZE.get())
+_DRAFT_NCU_RANGE_NAME = envs.SGLANG_DRAFT_NCU_RANGE_NAME.get().strip()
+_DRAFT_NCU_IDENTITY_OUT = envs.SGLANG_DRAFT_NCU_IDENTITY_OUT.get()
+_DRAFT_NCU_MATCHES = 0
+if _DRAFT_NCU_RANGE and (
+    _DRAFT_NCU_REPLAY_INDEX < 1
+    or _DRAFT_NCU_BATCH_SIZE < 1
+    or not _DRAFT_NCU_RANGE_NAME
+):
+    raise ValueError(
+        "draft NCU selector requires positive index/batch and a range name"
+    )
+_PHASE_EVENTS_OUT = os.environ.get("SGLANG_PHASE_EVENTS_OUT", "/tmp/phase_times.jsonl")
 
 
 class _PhaseEventLog:
@@ -315,6 +326,50 @@ _ACCEPT_HIST_LOG = _AcceptHistLog(_ACCEPT_HIST_OUT) if _ACCEPT_HIST else None
 
 def _profile_phase(name):
     def deco(fn):
+        if name == "draft" and _DRAFT_NCU_RANGE:
+
+            @functools.wraps(fn)
+            def draft_ncu_wrapper(*args, **kwargs):
+                global _DRAFT_NCU_MATCHES
+                batch = kwargs.get("batch")
+                if batch is None and len(args) > 1:
+                    batch = args[1]
+                batch_size = batch.batch_size()
+                if batch_size != _DRAFT_NCU_BATCH_SIZE:
+                    return fn(*args, **kwargs)
+                _DRAFT_NCU_MATCHES += 1
+                if _DRAFT_NCU_MATCHES != _DRAFT_NCU_REPLAY_INDEX:
+                    return fn(*args, **kwargs)
+
+                seq_lens = batch.seq_lens.detach().cpu().tolist()
+                identity = {
+                    "schema_version": 1,
+                    "phase": "draft",
+                    "matching_replay_index": _DRAFT_NCU_MATCHES,
+                    "batch_size": batch_size,
+                    "seq_lens": seq_lens,
+                    "seq_lens_sum": sum(seq_lens),
+                    "range_name": _DRAFT_NCU_RANGE_NAME,
+                }
+                identity["seq_lens_sha256"] = hashlib.sha256(
+                    json.dumps(seq_lens, separators=(",", ":")).encode()
+                ).hexdigest()
+                tmp = _DRAFT_NCU_IDENTITY_OUT + ".tmp"
+                with open(tmp, "w") as file:
+                    json.dump(identity, file, indent=2, sort_keys=True)
+                    file.write("\n")
+                os.replace(tmp, _DRAFT_NCU_IDENTITY_OUT)
+
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_push(_DRAFT_NCU_RANGE_NAME)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    torch.cuda.synchronize()
+                    torch.cuda.nvtx.range_pop()
+
+            return draft_ncu_wrapper
+
         if _NVTX_PROFILE:
 
             @functools.wraps(fn)
@@ -811,9 +866,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ev.record(torch.get_device_module(self.device).current_stream())
         return gpu[:n]
 
-    def _ip_local_batch_view(
-        self, batch: ScheduleBatch, my_pos: List[int], key: str
-    ):
+    def _ip_local_batch_view(self, batch: ScheduleBatch, my_pos: List[int], key: str):
         """Shallow local view of `batch` restricted to this rank's owned rows.
         Returns (local_batch, owned_idx_gpu). Only the fields the draft-side
         prepare/forward paths consume are re-sliced; everything else is
@@ -898,9 +951,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         send = torch.zeros((max_cnt, num_steps), dtype=torch.int64, device=device)
         if draft_tokens_local is not None:
             send[: len(my_pos)].copy_(draft_tokens_local.view(-1, num_steps))
-        recv = torch.empty(
-            (tp * max_cnt, num_steps), dtype=torch.int64, device=device
-        )
+        recv = torch.empty((tp * max_cnt, num_steps), dtype=torch.int64, device=device)
         from sglang.srt.distributed import parallel_state as _ps
 
         dup = _ps._PDMUX_PREFILL_TP_GROUP
@@ -1575,9 +1626,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             "implemented (the fused extend would have to be partitioned across "
             "ranks too)."
         )
-        merged_batch, merged_result, sizes = self._spec_pdmux_merge_for_extend(
-            pendings
-        )
+        merged_batch, merged_result, sizes = self._spec_pdmux_merge_for_extend(pendings)
         self._draft_extend_for_decode_impl(merged_batch, merged_result)
         # Split the merged next-draft state back into each slot's OWN live
         # EagleDraftInput (the object the slot's spec_info already points at and
@@ -1660,21 +1709,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         pos_by_rank = self._ip_partition(batch)
         my_pos = pos_by_rank[self.tp_rank]
-        full_topk_p = torch.zeros(
-            (bs, self.topk), dtype=torch.float32, device=device
-        )
-        full_topk_index = torch.zeros(
-            (bs, self.topk), dtype=torch.int64, device=device
-        )
+        full_topk_p = torch.zeros((bs, self.topk), dtype=torch.float32, device=device)
+        full_topk_index = torch.zeros((bs, self.topk), dtype=torch.int64, device=device)
         if my_pos:
             local_batch, owned_idx = self._ip_local_batch_view(
                 batch, my_pos, "ext_owned"
             )
             # Per-req blocks of the verify tree: predict tokens + the tree's
             # cache locations (the extend's write targets), ndt per request.
-            local_batch.out_cache_loc = (
-                batch.out_cache_loc.view(bs, ndt)[owned_idx].reshape(-1)
-            )
+            local_batch.out_cache_loc = batch.out_cache_loc.view(bs, ndt)[
+                owned_idx
+            ].reshape(-1)
             local_result = SimpleNamespace(
                 logits_output=SimpleNamespace(hidden_states=None),
                 next_token_ids=batch_result.next_token_ids.view(bs, ndt)[
@@ -2167,9 +2212,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         for _, p in pend:
                             self.draft_worker.spec_pdmux_fused_extend([p])
                     else:
-                        self.draft_worker.spec_pdmux_fused_extend(
-                            [p for _, p in pend]
-                        )
+                        self.draft_worker.spec_pdmux_fused_extend([p for _, p in pend])
                 for _, p in pend:
                     if p["on_relay"] is not None:
                         # FutureMap stash on the small stream, per slot (its own
@@ -2256,13 +2299,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     try:
-                        next_draft_input = (
-                            self.draft_worker._draft_extend_for_prefill(
-                                p["batch"],
-                                p["hidden_states"],
-                                p["next_token_ids"],
-                                p["mm_input_embeds"],
-                            )
+                        next_draft_input = self.draft_worker._draft_extend_for_prefill(
+                            p["batch"],
+                            p["hidden_states"],
+                            p["next_token_ids"],
+                            p["mm_input_embeds"],
                         )
                     except ValueError as e:
                         # Plan-vs-q mismatch context (trunk bug #5 class): the
@@ -2747,9 +2788,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # verify() records the other verify_input fields on the
                 # forward stream (record_stream_for_v2_verify); draft_probs
                 # is the one small-stream allocation it does not cover.
-                record_stream_each(
-                    (verify_input.draft_probs,), dev.current_stream()
-                )
+                record_stream_each((verify_input.draft_probs,), dev.current_stream())
                 # Steady-state key move: launch the deferred extends(+stash)
                 # now, AFTER this tick's draft is in the small FIFO and BEFORE
                 # this tick's verify is enqueued on large, so the whole

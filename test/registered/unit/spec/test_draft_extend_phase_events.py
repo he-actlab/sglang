@@ -40,6 +40,51 @@ class _RecordSink:
 
 
 class DraftExtendPhaseEventTests(CustomTestCase):
+    def test_exact_draft_ncu_selector_ranges_only_declared_match(self):
+        calls = []
+
+        def execute(owner, batch):
+            del owner
+            calls.append(batch.batch_size())
+            return "ok"
+
+        class Batch:
+            seq_lens = __import__("torch").tensor([7, 11])
+
+            @staticmethod
+            def batch_size():
+                return 2
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.object(worker_module, "_DRAFT_NCU_RANGE", True),
+            patch.object(worker_module, "_DRAFT_NCU_REPLAY_INDEX", 2),
+            patch.object(worker_module, "_DRAFT_NCU_BATCH_SIZE", 2),
+            patch.object(worker_module, "_DRAFT_NCU_RANGE_NAME", "EXACT_DRAFT"),
+            patch.object(
+                worker_module,
+                "_DRAFT_NCU_IDENTITY_OUT",
+                str(Path(tmpdir) / "identity.json"),
+            ),
+            patch.object(worker_module, "_DRAFT_NCU_MATCHES", 0),
+            patch.object(worker_module.torch.cuda, "synchronize") as synchronize,
+            patch.object(worker_module.torch.cuda.nvtx, "range_push") as push,
+            patch.object(worker_module.torch.cuda.nvtx, "range_pop") as pop,
+        ):
+            wrapped = worker_module._profile_phase("draft")(execute)
+            self.assertEqual(wrapped(object(), Batch()), "ok")
+            self.assertEqual(wrapped(object(), Batch()), "ok")
+            self.assertEqual(wrapped(object(), Batch()), "ok")
+            identity = json.loads((Path(tmpdir) / "identity.json").read_text())
+
+        self.assertEqual(calls, [2, 2, 2])
+        self.assertEqual(synchronize.call_count, 2)
+        push.assert_called_once_with("EXACT_DRAFT")
+        pop.assert_called_once_with()
+        self.assertEqual(identity["matching_replay_index"], 2)
+        self.assertEqual(identity["seq_lens"], [7, 11])
+        self.assertEqual(identity["seq_lens_sum"], 18)
+
     def test_phase_log_adds_identity_only_to_draft_extend(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "phase.jsonl"
