@@ -1,4 +1,4 @@
-"""Standalone exact-M32 BF16 out/down GEMM candidates for NVIDIA SM80."""
+"""Standalone exact-M32 BF16 out/down GEMM candidates for NVIDIA SM120."""
 
 from __future__ import annotations
 
@@ -154,7 +154,8 @@ def _run(
             f"{required_workspace} bytes, got {workspace.numel()}"
         )
 
-    module = _jit_drafter_sm120_bf16_out_down32_module()
+    with torch.cuda.device(device):
+        module = _jit_drafter_sm120_bf16_out_down32_module()
     getattr(module, f"drafter_sm120_bf16_{shape}_{config}")(
         output, activation, weight, workspace
     )

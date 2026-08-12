@@ -28,7 +28,11 @@ _CORRECTNESS_SEEDS = (20260812, 20260813)
 
 
 def _sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (12, 0)
+        and torch.cuda.get_device_properties().multi_processor_count == 188
+    )
 
 
 def _cases():

@@ -24,7 +24,11 @@ _WORKSPACE_BYTES = 1_048_576
 
 
 def _sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (12, 0)
+        and torch.cuda.get_device_properties().multi_processor_count == 188
+    )
 
 
 @pytest.mark.skipif(not _sm120_available(), reason="SM120 is required")

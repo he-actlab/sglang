@@ -1,4 +1,4 @@
-"""Standalone exact-M32 BF16 gate-up GEMM candidates for NVIDIA SM80."""
+"""Standalone exact-M32 BF16 gate-up GEMM candidates for NVIDIA SM120."""
 
 from __future__ import annotations
 
@@ -127,7 +127,8 @@ def drafter_sm120_bf16_gate_up32(
         device=device,
     )
 
-    module = _jit_drafter_sm120_bf16_gate_up32_module()
+    with torch.cuda.device(device):
+        module = _jit_drafter_sm120_bf16_gate_up32_module()
     getattr(module, f"drafter_sm120_bf16_gate_up32_{config}")(
         output, activation, weight, workspace
     )
