@@ -36,6 +36,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -792,6 +793,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.enable_mis = model_runner.server_args.enable_mis
         # spec-pdmux M2.6: gates the sync-free TARGET_VERIFY fast plan install.
         self.enable_spec_pdmux = model_runner.server_args.enable_spec_pdmux
+        self.enable_spec_green_context = spec_sm_partition_enabled(
+            model_runner.server_args
+        )
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -1020,7 +1024,7 @@ class FlashInferAttnBackend(AttentionBackend):
         decode_width_mode = envs.SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH.get()
         if (
             decode_width_mode > 0
-            and self.enable_spec_pdmux
+            and self.enable_spec_green_context
             and model_runner.is_draft_worker
         ):
             if self.decode_use_tensor_cores:
