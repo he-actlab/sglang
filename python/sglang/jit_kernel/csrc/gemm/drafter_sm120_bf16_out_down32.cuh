@@ -50,6 +50,35 @@ static constexpr int kDownK = 3072;
 static constexpr size_t kAlignmentBytes = 16;
 static constexpr int kDownSplitKSlices = 4;
 
+template <int TileN, int TileK, int WarpN, int Stages>
+using Projection32SplitKGemm = cutlass::gemm::device::GemmSplitKParallel<
+    ElementA,
+    cutlass::layout::RowMajor,
+    ElementB,
+    cutlass::layout::ColumnMajor,
+    ElementOutput,
+    cutlass::layout::RowMajor,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<32, TileN, TileK>,
+    cutlass::gemm::GemmShape<16, WarpN, TileK>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<ElementOutput, 8, ElementAccumulator, ElementCompute>,
+    cutlass::epilogue::thread::Convert<ElementAccumulator, 8, ElementAccumulator>,
+    cutlass::reduction::thread::ReduceAdd<ElementAccumulator, ElementAccumulator, 8>,
+    cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,
+    Stages,
+    8,
+    8,
+    cutlass::arch::OpMultiplyAdd>;
+
+template <int Stages>
+using Projection32SplitK3N64 = Projection32SplitKGemm<64, 32, 32, Stages>;
+
+template <int Stages>
+using Projection32SplitK6N128 = Projection32SplitKGemm<128, 64, 64, Stages>;
+
 // Serial split-K: GemmUniversal in kGemm mode with batch_count > 1 runs all
 // k-slices in ONE kernel, ordered per output tile by a workspace semaphore —
 // no separate reduction launch. The wide family reuses the split-K-parallel
@@ -146,6 +175,72 @@ using Down32SplitK4Gemm = cutlass::gemm::device::GemmSplitKParallel<
     8,
     cutlass::arch::OpMultiplyAdd>;
 
+template <int Splits>
+__global__ void projection32_splitk_reduce_kernel(ElementOutput* output, const ElementAccumulator* partials) {
+  const int row = blockIdx.x;
+  const int partition_stride = kM * kN;
+  for (int column = threadIdx.x; column < kN; column += blockDim.x) {
+    const int index = row * kN + column;
+    ElementAccumulator value = partials[index];
+#pragma unroll
+    for (int split = 1; split < Splits; ++split) {
+      value += partials[split * partition_stride + index];
+    }
+    output[index] = ElementOutput(value);
+  }
+}
+
+template <int Splits>
+__global__ void projection32_splitk_fused_rmsnorm_kernel(
+    ElementOutput* output,
+    ElementOutput* residual,
+    const ElementOutput* norm_weight,
+    const ElementAccumulator* partials,
+    float epsilon) {
+  __shared__ float warp_sums[32];
+  const int row = blockIdx.x;
+  const int partition_stride = kM * kN;
+  float square_sum = 0.0f;
+
+  for (int column = threadIdx.x; column < kN; column += blockDim.x) {
+    const int index = row * kN + column;
+    ElementAccumulator gemm_value = partials[index];
+#pragma unroll
+    for (int split = 1; split < Splits; ++split) {
+      gemm_value += partials[split * partition_stride + index];
+    }
+    // Preserve the live two-kernel boundary: split-K first rounds the GEMM
+    // result to BF16, then fused_add_rmsnorm performs its FP32 residual add.
+    const float value = float(ElementOutput(gemm_value)) + float(residual[index]);
+    square_sum += value * value;
+    residual[index] = ElementOutput(value);
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    square_sum += __shfl_down_sync(0xffffffff, square_sum, offset);
+  }
+  if ((threadIdx.x & 31) == 0) {
+    warp_sums[threadIdx.x >> 5] = square_sum;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    for (int warp = 0; warp < blockDim.x / 32; ++warp) {
+      total += warp_sums[warp];
+    }
+    warp_sums[0] = rsqrtf(epsilon + total / float(kN));
+  }
+  __syncthreads();
+
+  const float inverse_rms = warp_sums[0];
+  for (int column = threadIdx.x; column < kN; column += blockDim.x) {
+    const int index = row * kN + column;
+    output[index] = ElementOutput(float(residual[index]) * float(norm_weight[column]) * inverse_rms);
+  }
+}
+
 inline bool is_aligned(const void* pointer, size_t alignment) {
   return reinterpret_cast<uintptr_t>(pointer) % alignment == 0;
 }
@@ -158,6 +253,200 @@ inline bool is_aligned(const void* pointer, size_t alignment) {
     host::RuntimeCheck(                                                                  \
         error == cutlass::Status::kSuccess, cutlassGetStatusString(error));               \
   } while (false)
+
+template <typename Gemm, int K, int Splits>
+inline void drafter_sm120_bf16_projection32_splitk_mainloop(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace,
+    cudaStream_t stream) {
+  using namespace host;
+  using namespace sglang::drafter_sm120_bf16_out_down32_detail;
+  typename Gemm::Arguments arguments{
+      {kM, kN, K},
+      {static_cast<const ElementA*>(activation.data_ptr()), K},
+      {static_cast<const ElementB*>(weight.data_ptr()), K},
+      {static_cast<const ElementOutput*>(output.data_ptr()), kN},
+      {static_cast<ElementOutput*>(output.data_ptr()), kN},
+      {ElementCompute(1), ElementCompute(0)},
+      Splits};
+
+  const size_t required_workspace_bytes = Gemm::get_workspace_size(arguments);
+  RuntimeCheck(
+      required_workspace_bytes <= static_cast<size_t>(workspace.numel()),
+      "drafter SM120 projection32 split-K workspace requires ",
+      required_workspace_bytes,
+      " bytes, got ",
+      workspace.numel());
+  SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK(Gemm::can_implement(arguments));
+
+  typename Gemm::ThreadblockSwizzle threadblock_swizzle;
+  const cutlass::gemm::GemmCoord grid_shape = threadblock_swizzle.get_tiled_shape(
+      arguments.problem_size,
+      {Gemm::ThreadblockShape::kM, Gemm::ThreadblockShape::kN, Gemm::ThreadblockShape::kK},
+      Splits);
+  cutlass::TensorRef<ElementAccumulator, cutlass::layout::RowMajor> workspace_ref(
+      static_cast<ElementAccumulator*>(workspace.data_ptr()), kN);
+  const int64_t partition_stride = int64_t(kM) * int64_t(kN);
+  typename Gemm::GemmKernel::Params params{
+      arguments.problem_size,
+      grid_shape,
+      arguments.ref_A.non_const_ref(),
+      arguments.ref_B.non_const_ref(),
+      workspace_ref,
+      arguments.convert,
+      partition_stride};
+
+  const dim3 grid = threadblock_swizzle.get_grid_shape(grid_shape);
+  const dim3 block(Gemm::GemmKernel::kThreadCount, 1, 1);
+  const int smem_size = int(sizeof(typename Gemm::GemmKernel::SharedStorage));
+  if (smem_size >= (48 << 10)) {
+    const cudaError_t attribute_status = cudaFuncSetAttribute(
+        cutlass::Kernel<typename Gemm::GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    RuntimeCheck(
+        attribute_status == cudaSuccess,
+        "failed to set projection32 split-K dynamic shared memory: ",
+        cudaGetErrorString(attribute_status));
+  }
+  cutlass::Kernel<typename Gemm::GemmKernel><<<grid, block, smem_size, stream>>>(params);
+  const cudaError_t launch_status = cudaGetLastError();
+  RuntimeCheck(
+      launch_status == cudaSuccess,
+      "failed to launch projection32 split-K mainloop: ",
+      cudaGetErrorString(launch_status));
+}
+
+template <typename Gemm, int K, int Splits>
+inline void drafter_sm120_bf16_projection32_splitk_schedule(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  using namespace host;
+  using namespace sglang::drafter_sm120_bf16_out_down32_detail;
+  SymbolicDevice device;
+  SymbolicSize workspace_bytes{"workspace bytes"};
+  TensorMatcher({kM, K}).with_strides({K, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(activation);
+  TensorMatcher({kN, K}).with_strides({K, 1}).with_dtype<bf16_t>().with_device(device).verify(weight);
+  TensorMatcher({kM, kN}).with_strides({kN, 1}).with_dtype<bf16_t>().with_device(device).verify(output);
+  TensorMatcher({workspace_bytes}).with_strides({1}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  RuntimeCheck(
+      is_aligned(activation.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 split-K activation must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(weight.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 split-K weight must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(output.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 split-K output must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(workspace.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 split-K workspace must be 16-byte aligned");
+
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  drafter_sm120_bf16_projection32_splitk_mainloop<Gemm, K, Splits>(output, activation, weight, workspace, stream);
+  projection32_splitk_reduce_kernel<Splits><<<kM, 128, 0, stream>>>(
+      static_cast<ElementOutput*>(output.data_ptr()), static_cast<const ElementAccumulator*>(workspace.data_ptr()));
+  const cudaError_t reduction_status = cudaGetLastError();
+  RuntimeCheck(
+      reduction_status == cudaSuccess,
+      "failed to launch projection32 split-K reduction: ",
+      cudaGetErrorString(reduction_status));
+}
+
+template <typename Gemm, int K, int Splits>
+inline void drafter_sm120_bf16_projection32_splitk_fused_rmsnorm_schedule(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView residual,
+    tvm::ffi::TensorView norm_weight,
+    tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace,
+    float epsilon) {
+  using namespace host;
+  using namespace sglang::drafter_sm120_bf16_out_down32_detail;
+  SymbolicDevice device;
+  SymbolicSize workspace_bytes{"workspace bytes"};
+  TensorMatcher({kM, K}).with_strides({K, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(activation);
+  TensorMatcher({kN, K}).with_strides({K, 1}).with_dtype<bf16_t>().with_device(device).verify(weight);
+  TensorMatcher({kM, kN}).with_strides({kN, 1}).with_dtype<bf16_t>().with_device(device).verify(output);
+  TensorMatcher({kM, kN}).with_strides({kN, 1}).with_dtype<bf16_t>().with_device(device).verify(residual);
+  TensorMatcher({kN}).with_strides({1}).with_dtype<bf16_t>().with_device(device).verify(norm_weight);
+  TensorMatcher({workspace_bytes}).with_strides({1}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  RuntimeCheck(epsilon > 0.0f, "drafter SM120 projection32 fused RMSNorm epsilon must be positive");
+  RuntimeCheck(
+      is_aligned(activation.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 fused activation must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(weight.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 fused weight must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(output.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 fused output must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(residual.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 fused residual must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(norm_weight.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 fused norm weight must be 16-byte aligned");
+  RuntimeCheck(
+      is_aligned(workspace.data_ptr(), kAlignmentBytes),
+      "drafter SM120 projection32 fused workspace must be 16-byte aligned");
+
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  drafter_sm120_bf16_projection32_splitk_mainloop<Gemm, K, Splits>(output, activation, weight, workspace, stream);
+  projection32_splitk_fused_rmsnorm_kernel<Splits><<<kM, 128, 0, stream>>>(
+      static_cast<ElementOutput*>(output.data_ptr()),
+      static_cast<ElementOutput*>(residual.data_ptr()),
+      static_cast<const ElementOutput*>(norm_weight.data_ptr()),
+      static_cast<const ElementAccumulator*>(workspace.data_ptr()),
+      epsilon);
+  const cudaError_t reduction_status = cudaGetLastError();
+  RuntimeCheck(
+      reduction_status == cudaSuccess,
+      "failed to launch projection32 fused split-K reduction/RMSNorm: ",
+      cudaGetErrorString(reduction_status));
+}
+
+#define SGLANG_DRAFTER_SPLITK32_DEFINE(name, family, k, stages, splits)                 \
+  inline void name(                                                                     \
+      tvm::ffi::TensorView output,                                                      \
+      tvm::ffi::TensorView activation,                                                  \
+      tvm::ffi::TensorView weight,                                                      \
+      tvm::ffi::TensorView workspace) {                                                 \
+    drafter_sm120_bf16_projection32_splitk_schedule<                                    \
+        sglang::drafter_sm120_bf16_out_down32_detail::family<stages>,                   \
+        k,                                                                              \
+        splits>(output, activation, weight, workspace);                                 \
+  }                                                                                     \
+  inline void name##_fused_rmsnorm(                                                     \
+      tvm::ffi::TensorView output,                                                      \
+      tvm::ffi::TensorView residual,                                                    \
+      tvm::ffi::TensorView norm_weight,                                                 \
+      tvm::ffi::TensorView activation,                                                  \
+      tvm::ffi::TensorView weight,                                                      \
+      tvm::ffi::TensorView workspace,                                                   \
+      float epsilon) {                                                                  \
+    drafter_sm120_bf16_projection32_splitk_fused_rmsnorm_schedule<                      \
+        sglang::drafter_sm120_bf16_out_down32_detail::family<stages>,                   \
+        k,                                                                              \
+        splits>(output, residual, norm_weight, activation, weight, workspace, epsilon); \
+  }
+
+#define SGLANG_DRAFTER_SPLITK32_FAMILY(shape, k)                                                                 \
+  SGLANG_DRAFTER_SPLITK32_DEFINE(drafter_sm120_bf16_##shape##_splitk3_n64_s5, Projection32SplitK3N64, k, 5, 3)   \
+  SGLANG_DRAFTER_SPLITK32_DEFINE(drafter_sm120_bf16_##shape##_splitk3_n64_s6, Projection32SplitK3N64, k, 6, 3)   \
+  SGLANG_DRAFTER_SPLITK32_DEFINE(drafter_sm120_bf16_##shape##_splitk3_n64_s7, Projection32SplitK3N64, k, 7, 3)   \
+  SGLANG_DRAFTER_SPLITK32_DEFINE(drafter_sm120_bf16_##shape##_splitk3_n64_s8, Projection32SplitK3N64, k, 8, 3)   \
+  SGLANG_DRAFTER_SPLITK32_DEFINE(drafter_sm120_bf16_##shape##_splitk6_n128_s3, Projection32SplitK6N128, k, 3, 6) \
+  SGLANG_DRAFTER_SPLITK32_DEFINE(drafter_sm120_bf16_##shape##_splitk6_n128_s4, Projection32SplitK6N128, k, 4, 6)
+
+SGLANG_DRAFTER_SPLITK32_FAMILY(out32, 2048)
+SGLANG_DRAFTER_SPLITK32_FAMILY(down32, 3072)
+
+#undef SGLANG_DRAFTER_SPLITK32_FAMILY
+#undef SGLANG_DRAFTER_SPLITK32_DEFINE
 
 template <int K, int TileN, int Stages>
 inline void drafter_sm120_bf16_projection32_schedule(
