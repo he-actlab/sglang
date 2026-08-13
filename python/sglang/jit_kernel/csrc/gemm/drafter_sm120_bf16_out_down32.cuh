@@ -50,6 +50,29 @@ static constexpr int kDownK = 3072;
 static constexpr size_t kAlignmentBytes = 16;
 static constexpr int kDownSplitKSlices = 4;
 
+// Serial split-K: GemmUniversal in kGemm mode with batch_count > 1 runs all
+// k-slices in ONE kernel, ordered per output tile by a workspace semaphore —
+// no separate reduction launch. The wide family reuses the split-K-parallel
+// mainloop shapes (32x128x64 threadblock, 16x64x64 warp) on the universal
+// device path so the boundary cost can be isolated at matched geometry.
+template <int Stages>
+using Down32WideUniversalGemm = cutlass::gemm::device::GemmUniversal<
+    ElementA, cutlass::layout::RowMajor,
+    ElementB, cutlass::layout::ColumnMajor,
+    ElementOutput, cutlass::layout::RowMajor,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<32, 128, 64>,
+    cutlass::gemm::GemmShape<16, 64, 64>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, 8, ElementAccumulator, ElementCompute>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
+    Stages,
+    8, 8,
+    cutlass::arch::OpMultiplyAdd>;
+
 template <int TileN>
 struct WarpShape;
 
@@ -88,6 +111,10 @@ using Projection32Gemm = cutlass::gemm::device::GemmUniversal<
     8,
     8,
     cutlass::arch::OpMultiplyAdd>;
+
+// Light-tile serial family: the existing 32xN64x32 universal path.
+template <int Stages>
+using Down32SerialLightGemm = Projection32Gemm<kDownK, 64, Stages>;
 
 // Preserve the incumbent down-projection parallelism while removing only its
 // inactive M rows: eight N128 tiles times four independent K slices launch 32
@@ -328,4 +355,82 @@ inline void drafter_sm120_bf16_down32_splitk4_n128_s4(
 
 
 #undef SGLANG_DRAFTER_PROJECTION32_DEFINE
+
+
+template <typename Gemm, int Splits>
+inline void drafter_sm120_bf16_down32_serial_schedule(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace) {
+  using namespace host;
+  using namespace sglang::drafter_sm120_bf16_out_down32_detail;
+  SymbolicDevice device;
+  SymbolicSize workspace_bytes{"workspace bytes"};
+  TensorMatcher({kM, kDownK}).with_strides({kDownK, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(activation);
+  TensorMatcher({kN, kDownK}).with_strides({kDownK, 1}).with_dtype<bf16_t>().with_device(device).verify(weight);
+  TensorMatcher({kM, kN}).with_strides({kN, 1}).with_dtype<bf16_t>().with_device(device).verify(output);
+  TensorMatcher({workspace_bytes}).with_strides({1}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  RuntimeCheck(is_aligned(activation.data_ptr(), kAlignmentBytes),
+               "drafter SM120 down32 serial activation must be 16-byte aligned");
+  RuntimeCheck(is_aligned(weight.data_ptr(), kAlignmentBytes),
+               "drafter SM120 down32 serial weight must be 16-byte aligned");
+  RuntimeCheck(is_aligned(output.data_ptr(), kAlignmentBytes),
+               "drafter SM120 down32 serial output must be 16-byte aligned");
+
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {kM, kN, kDownK},
+      Splits,
+      {ElementCompute(1), ElementCompute(0)},
+      activation.data_ptr(),
+      weight.data_ptr(),
+      output.data_ptr(),
+      output.data_ptr(),
+      int64_t(kM) * kDownK,
+      int64_t(kN) * kDownK,
+      int64_t(kM) * kN,
+      int64_t(kM) * kN,
+      kDownK,
+      kDownK,
+      kN,
+      kN};
+
+  const size_t required_workspace_bytes = Gemm::get_workspace_size(arguments);
+  RuntimeCheck(
+      required_workspace_bytes <= static_cast<size_t>(workspace_bytes.unwrap()),
+      "drafter SM120 down32 serial workspace requires ",
+      required_workspace_bytes, " bytes, got ", workspace_bytes.unwrap());
+  RuntimeCheck(
+      required_workspace_bytes == 0 ||
+          is_aligned(workspace.data_ptr(), kAlignmentBytes),
+      "drafter SM120 down32 serial workspace must be 16-byte aligned");
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  void* workspace_ptr =
+      required_workspace_bytes == 0 ? nullptr : workspace.data_ptr();
+  Gemm gemm;
+  SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK(gemm.can_implement(arguments));
+  SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK(
+      gemm.initialize(arguments, workspace_ptr, stream));
+  SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK(gemm.run(stream));
+}
+
+#define SGLANG_DRAFTER_DOWN32_SERIAL_DEFINE(name, family, stages, splits)        \
+  inline void name(tvm::ffi::TensorView output, tvm::ffi::TensorView activation, \
+                   tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {\
+    using namespace sglang::drafter_sm120_bf16_out_down32_detail;               \
+    drafter_sm120_bf16_down32_serial_schedule<family<stages>, splits>(          \
+        output, activation, weight, workspace);                                  \
+  }
+
+SGLANG_DRAFTER_DOWN32_SERIAL_DEFINE(
+    drafter_sm120_bf16_down32_serial3_n64_s6, Down32SerialLightGemm, 6, 3)
+SGLANG_DRAFTER_DOWN32_SERIAL_DEFINE(
+    drafter_sm120_bf16_down32_serial6_n64_s6, Down32SerialLightGemm, 6, 6)
+SGLANG_DRAFTER_DOWN32_SERIAL_DEFINE(
+    drafter_sm120_bf16_down32_serial6_n128_s4, Down32WideUniversalGemm, 4, 6)
+SGLANG_DRAFTER_DOWN32_SERIAL_DEFINE(
+    drafter_sm120_bf16_down32_serial4_n128_s4, Down32WideUniversalGemm, 4, 4)
+#undef SGLANG_DRAFTER_DOWN32_SERIAL_DEFINE
+
 #undef SGLANG_DRAFTER_OUT_DOWN32_CUTLASS_CHECK

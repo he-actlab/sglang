@@ -10,6 +10,8 @@ from sglang.jit_kernel.drafter_sm120_bf16_out_down32 import (
     CONFIGS,
     DOWN_CONFIGS,
     DOWN_K,
+    DOWN_SERIAL_CONFIGS,
+    DOWN_SERIAL_WORKSPACE_BYTES,
     DOWN_SPLITK4_CONFIGS,
     DOWN_SPLITK4_WORKSPACE_BYTES,
     M,
@@ -39,9 +41,12 @@ def _cases():
     for config in CONFIGS:
         yield ("out32", OUT_K, config, 0)
     for config in DOWN_CONFIGS:
-        workspace = (
-            DOWN_SPLITK4_WORKSPACE_BYTES if config in DOWN_SPLITK4_CONFIGS else 0
-        )
+        if config in DOWN_SPLITK4_CONFIGS:
+            workspace = DOWN_SPLITK4_WORKSPACE_BYTES
+        elif config in DOWN_SERIAL_CONFIGS:
+            workspace = DOWN_SERIAL_WORKSPACE_BYTES
+        else:
+            workspace = 0
         yield ("down32", DOWN_K, config, workspace)
 
 

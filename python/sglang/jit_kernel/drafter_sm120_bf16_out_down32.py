@@ -26,7 +26,17 @@ CONFIGS = (
 DOWN_SPLITK4_CONFIGS = (
     "splitk4_n128_s4",
 )
-DOWN_CONFIGS = (*CONFIGS, *DOWN_SPLITK4_CONFIGS)
+# Serial split-K: one kernel, semaphore-ordered epilogue, no reduction
+# companion. Light = 32x64x32 tiles; wide = the split-K-parallel mainloop
+# shapes on the universal path.
+DOWN_SERIAL_CONFIGS = (
+    "serial3_n64_s6",
+    "serial6_n64_s6",
+    "serial6_n128_s4",
+    "serial4_n128_s4",
+)
+DOWN_SERIAL_WORKSPACE_BYTES = 1_048_576
+DOWN_CONFIGS = (*CONFIGS, *DOWN_SPLITK4_CONFIGS, *DOWN_SERIAL_CONFIGS)
 DOWN_SPLITK4_WORKSPACE_BYTES = 4 * M * N * 4
 
 
@@ -62,7 +72,7 @@ def _jit_drafter_sm120_bf16_out_down32_module() -> Module:
         for config in CONFIGS
     ] + [
         (f"drafter_sm120_bf16_down32_{config}",) * 2
-        for config in DOWN_SPLITK4_CONFIGS
+        for config in (*DOWN_SPLITK4_CONFIGS, *DOWN_SERIAL_CONFIGS)
     ]
     with _arch_env():
         return load_jit(
@@ -146,7 +156,9 @@ def _run(
         device=device,
     )
     required_workspace = (
-        DOWN_SPLITK4_WORKSPACE_BYTES if config in DOWN_SPLITK4_CONFIGS else 0
+        DOWN_SPLITK4_WORKSPACE_BYTES
+        if config in DOWN_SPLITK4_CONFIGS
+        else DOWN_SERIAL_WORKSPACE_BYTES if config in DOWN_SERIAL_CONFIGS else 0
     )
     if workspace.numel() < required_workspace:
         raise ValueError(
@@ -188,6 +200,8 @@ __all__ = [
     "DOWN_K",
     "DOWN_SPLITK4_CONFIGS",
     "DOWN_SPLITK4_WORKSPACE_BYTES",
+    "DOWN_SERIAL_CONFIGS",
+    "DOWN_SERIAL_WORKSPACE_BYTES",
     "M",
     "N",
     "OUT_K",
