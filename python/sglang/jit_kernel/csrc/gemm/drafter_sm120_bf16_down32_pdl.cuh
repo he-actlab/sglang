@@ -315,4 +315,16 @@ inline void drafter_sm120_bf16_down32_mt64_nt32_k64_s3_packed_pdl_fused_rmsnorm(
       output, residual, norm_weight, activation, weight, workspace, epsilon);
 }
 
+inline void drafter_sm120_bf16_down32_mt64_nt32_k64_s3_packed_fused_rmsnorm(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView residual,
+    tvm::ffi::TensorView norm_weight,
+    tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace,
+    float epsilon) {
+  drafter_sm120_bf16_down32_pdl_schedule<false, true>(
+      output, residual, norm_weight, activation, weight, workspace, epsilon);
+}
+
 #undef SGLANG_DRAFTER_DOWN32_PDL_CUTLASS_CHECK

@@ -12,6 +12,7 @@ CONFIGS = (
     "mt64_nt32_k64_s3_packed_pdl",
 )
 FUSED_CONFIG = "mt64_nt32_k64_s3_packed_pdl_fused_rmsnorm"
+FUSED_NO_PDL_CONFIG = "mt64_nt32_k64_s3_packed_fused_rmsnorm"
 PARTIAL_BYTES = 3 * M * N * 4
 WORKSPACE_BYTES = 1_048_576
 
@@ -45,6 +46,7 @@ def _arch_env():
 def _jit_drafter_sm120_bf16_down32_pdl_module():
     wrappers = [(f"drafter_sm120_bf16_down32_{config}",) * 2 for config in CONFIGS]
     wrappers.append((f"drafter_sm120_bf16_down32_{FUSED_CONFIG}",) * 2)
+    wrappers.append((f"drafter_sm120_bf16_down32_{FUSED_NO_PDL_CONFIG}",) * 2)
     with _arch_env():
         return load_jit(
             "drafter_sm120_bf16_down32_pdl",
@@ -147,9 +149,32 @@ def drafter_sm120_bf16_down32_pdl_fused_rmsnorm(
     return output, residual
 
 
+def drafter_sm120_bf16_down32_fused_rmsnorm_no_pdl(
+    output: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    workspace: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(eps, float) or not eps > 0.0:
+        raise ValueError(f"eps must be a positive float, got {eps!r}")
+    device = _validate_common(output, activation, weight, workspace)
+    _validate_tensor(residual, name="residual", shape=(M, N), device=device)
+    _validate_tensor(norm_weight, name="norm_weight", shape=(N,), device=device)
+    with torch.cuda.device(device):
+        module = _jit_drafter_sm120_bf16_down32_pdl_module()
+    getattr(module, f"drafter_sm120_bf16_down32_{FUSED_NO_PDL_CONFIG}")(
+        output, residual, norm_weight, activation, weight, workspace, eps
+    )
+    return output, residual
+
+
 __all__ = [
     "CONFIGS",
     "FUSED_CONFIG",
+    "FUSED_NO_PDL_CONFIG",
     "K",
     "M",
     "N",
@@ -157,5 +182,6 @@ __all__ = [
     "WORKSPACE_BYTES",
     "_jit_drafter_sm120_bf16_down32_pdl_module",
     "drafter_sm120_bf16_down32_pdl",
+    "drafter_sm120_bf16_down32_fused_rmsnorm_no_pdl",
     "drafter_sm120_bf16_down32_pdl_fused_rmsnorm",
 ]
