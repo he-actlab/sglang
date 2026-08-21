@@ -14,6 +14,7 @@ from sglang.jit_kernel.drafter_sm120_bf16_down32_pdl import (
     WORKSPACE_BYTES,
     _jit_drafter_sm120_bf16_down32_pdl_module,
     drafter_sm120_bf16_down32_pdl,
+    drafter_sm120_bf16_down32_fused_rmsnorm_no_pdl,
     drafter_sm120_bf16_down32_pdl_fused_rmsnorm,
 )
 from sglang.jit_kernel.norm import fused_add_rmsnorm
@@ -115,7 +116,14 @@ def test_drafter_sm120_bf16_down32_pdl_is_bit_identical_to_non_pdl() -> None:
 
 @pytest.mark.skipif(not _sm120_available(), reason="SM120 is required")
 @pytest.mark.parametrize("seed", _SEEDS)
-def test_drafter_sm120_bf16_down32_pdl_fused_rmsnorm(seed: int) -> None:
+@pytest.mark.parametrize(
+    "fused_op",
+    (
+        drafter_sm120_bf16_down32_pdl_fused_rmsnorm,
+        drafter_sm120_bf16_down32_fused_rmsnorm_no_pdl,
+    ),
+)
+def test_drafter_sm120_bf16_down32_pdl_fused_rmsnorm(seed: int, fused_op) -> None:
     stream = _small_stream()
     _, activation, weight, output, workspace = _inputs(seed)
     epsilon = 1e-6
@@ -151,7 +159,7 @@ def test_drafter_sm120_bf16_down32_pdl_fused_rmsnorm(seed: int) -> None:
         with torch.cuda.stream(stream):
             output.fill_(float("nan"))
             residual.copy_(initial_residual)
-            drafter_sm120_bf16_down32_pdl_fused_rmsnorm(
+            fused_op(
                 output,
                 residual,
                 norm_weight,
@@ -168,7 +176,7 @@ def test_drafter_sm120_bf16_down32_pdl_fused_rmsnorm(seed: int) -> None:
         residual.copy_(initial_residual)
     stream.synchronize()
     with torch.cuda.graph(graph, stream=stream):
-        drafter_sm120_bf16_down32_pdl_fused_rmsnorm(
+        fused_op(
             output,
             residual,
             norm_weight,
@@ -184,6 +192,42 @@ def test_drafter_sm120_bf16_down32_pdl_fused_rmsnorm(seed: int) -> None:
             graph.replay()
         stream.synchronize()
         check()
+
+
+@pytest.mark.skipif(not _sm120_available(), reason="SM120 is required")
+def test_fused_rmsnorm_no_pdl_is_bit_identical_to_pdl() -> None:
+    stream = _small_stream()
+    _, activation, weight, output_pdl, workspace = _inputs(_SEEDS[0])
+    output_no_pdl = torch.empty_like(output_pdl)
+    epsilon = 1e-6
+    norm_weight = 1.0 + 0.1 * torch.randn((N,), dtype=torch.bfloat16, device="cuda")
+    initial_residual = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    residual_pdl = initial_residual.clone()
+    residual_no_pdl = initial_residual.clone()
+    with torch.cuda.stream(stream):
+        drafter_sm120_bf16_down32_pdl_fused_rmsnorm(
+            output_pdl,
+            residual_pdl,
+            norm_weight,
+            activation,
+            weight,
+            workspace,
+            epsilon,
+        )
+    stream.synchronize()
+    with torch.cuda.stream(stream):
+        drafter_sm120_bf16_down32_fused_rmsnorm_no_pdl(
+            output_no_pdl,
+            residual_no_pdl,
+            norm_weight,
+            activation,
+            weight,
+            workspace,
+            epsilon,
+        )
+    stream.synchronize()
+    assert torch.equal(output_no_pdl, output_pdl)
+    assert torch.equal(residual_no_pdl, residual_pdl)
 
 
 if __name__ == "__main__":
