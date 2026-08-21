@@ -3,12 +3,18 @@ import logging
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
     get_pp_group,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    CommunicateSimpleFn,
+    CommunicateSummableTensorPairFn,
+    LayerCommunicator,
+    LayerScatterModes,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -107,6 +113,205 @@ class _Qwen3DrafterTmaDispatch:
         if not self._can_run(activation, weight):
             return None
         return self._run(activation, weight)
+
+
+class _Qwen3DrafterSM120KernelDispatch:
+    """Exact M=32 qkv/gate dispatch plus down-to-next-norm handoff."""
+
+    _QKV_SHAPE = (32, 1024, 4096)
+    _GATE_SHAPE = (32, 1024, 6144)
+    _DOWN_SHAPE = (32, 3072, 1024)
+
+    def __init__(
+        self,
+        device_index: int,
+        representative_layer: "Qwen3DecoderLayer",
+        next_norm: RMSNorm,
+    ) -> None:
+        from sglang.jit_kernel.drafter_sm120_bf16_down32_pdl import (
+            CONFIGS as DOWN_CONFIGS,
+            WORKSPACE_BYTES,
+            drafter_sm120_bf16_down32_fused_rmsnorm_no_pdl,
+            drafter_sm120_bf16_down32_pdl,
+        )
+        from sglang.jit_kernel.drafter_sm120_bf16_gate_up32 import (
+            drafter_sm120_bf16_gate_up32,
+        )
+        from sglang.jit_kernel.drafter_sm120_bf16_qkv32 import (
+            drafter_sm120_bf16_qkv32_amp_n128_s6,
+        )
+        from sglang.jit_kernel.norm import fused_add_rmsnorm
+
+        self._workspace = torch.empty(
+            WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=torch.device("cuda", device_index),
+        )
+        self._qkv = drafter_sm120_bf16_qkv32_amp_n128_s6
+        self._gate = drafter_sm120_bf16_gate_up32
+        self._down = drafter_sm120_bf16_down32_fused_rmsnorm_no_pdl
+        self._preflight(
+            representative_layer,
+            next_norm,
+            DOWN_CONFIGS[0],
+            drafter_sm120_bf16_down32_pdl,
+            fused_add_rmsnorm,
+        )
+
+    @staticmethod
+    def supports_linear(linear: nn.Module) -> bool:
+        weight = getattr(linear, "weight", None)
+        return bool(
+            getattr(linear, "tp_size", None) == 1
+            and isinstance(
+                getattr(linear, "quant_method", None), UnquantizedLinearMethod
+            )
+            and getattr(linear, "bias", None) is None
+            and not getattr(linear, "gather_output", False)
+            and getattr(linear, "input_is_parallel", True)
+            and not getattr(linear, "use_dp_attention_reduce", False)
+            and isinstance(weight, torch.Tensor)
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+            and weight.data_ptr() % 16 == 0
+        )
+
+    @staticmethod
+    def _activation_matches(
+        activation: torch.Tensor, weight: torch.Tensor, shape_mkn: Tuple[int, int, int]
+    ) -> bool:
+        m, k, n = shape_mkn
+        return bool(
+            activation.shape == (m, k)
+            and weight.shape == (n, k)
+            and activation.is_cuda
+            and activation.device == weight.device
+            and activation.dtype == torch.bfloat16
+            and activation.is_contiguous()
+            and activation.data_ptr() % 16 == 0
+        )
+
+    def __call__(
+        self, linear: nn.Module, activation: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not self.supports_linear(linear):
+            return None
+        weight = linear.weight
+        if self._activation_matches(activation, weight, self._QKV_SHAPE):
+            output = torch.empty(
+                (self._QKV_SHAPE[0], self._QKV_SHAPE[2]),
+                dtype=torch.bfloat16,
+                device=activation.device,
+            )
+            return self._qkv(output, activation, weight, self._workspace)
+        if self._activation_matches(activation, weight, self._GATE_SHAPE):
+            output = torch.empty(
+                (self._GATE_SHAPE[0], self._GATE_SHAPE[2]),
+                dtype=torch.bfloat16,
+                device=activation.device,
+            )
+            return self._gate("n64_s5", output, activation, weight, self._workspace)
+        return None
+
+    def fused_down_to_next_norm(
+        self,
+        linear: nn.Module,
+        activation: torch.Tensor,
+        residual: torch.Tensor,
+        next_norm: RMSNorm,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not self.supports_linear(linear)
+            or not self._activation_matches(activation, linear.weight, self._DOWN_SHAPE)
+            or residual.shape != (32, 1024)
+            or residual.dtype != torch.bfloat16
+            or residual.device != activation.device
+            or not residual.is_contiguous()
+            or next_norm.weight.shape != (1024,)
+            or next_norm.weight.dtype != torch.bfloat16
+            or next_norm.weight.device != activation.device
+            or not next_norm.weight.is_contiguous()
+        ):
+            raise RuntimeError("SM120 fused down handoff left its exact M=32 contract")
+        output = torch.empty_like(residual)
+        return self._down(
+            output,
+            residual,
+            next_norm.weight,
+            activation,
+            linear.weight,
+            self._workspace,
+            float(next_norm.variance_epsilon),
+        )
+
+    def _preflight(
+        self,
+        layer: "Qwen3DecoderLayer",
+        next_norm: RMSNorm,
+        down_config: str,
+        down_reference: Callable,
+        fused_add_rmsnorm: Callable,
+    ) -> None:
+        """Exercise the selected kernels against real model weights before capture."""
+
+        device = layer.self_attn.qkv_proj.weight.device
+        qkv_input = (
+            torch.linspace(-0.125, 0.125, 32 * 1024, dtype=torch.float32, device=device)
+            .reshape(32, 1024)
+            .to(torch.bfloat16)
+        )
+        qkv_output = self(layer.self_attn.qkv_proj, qkv_input)
+        torch.testing.assert_close(
+            qkv_output.float(),
+            F.linear(qkv_input.float(), layer.self_attn.qkv_proj.weight.float()),
+            rtol=0.02,
+            atol=2.5,
+        )
+        gate_output = self(layer.mlp.gate_up_proj, qkv_input)
+        torch.testing.assert_close(
+            gate_output.float(),
+            F.linear(qkv_input.float(), layer.mlp.gate_up_proj.weight.float()),
+            rtol=0.02,
+            atol=2.5,
+        )
+
+        down_input = (
+            torch.linspace(-0.125, 0.125, 32 * 3072, dtype=torch.float32, device=device)
+            .reshape(32, 3072)
+            .to(torch.bfloat16)
+        )
+        initial_residual = (
+            torch.linspace(-0.25, 0.25, 32 * 1024, dtype=torch.float32, device=device)
+            .reshape(32, 1024)
+            .to(torch.bfloat16)
+        )
+        expected_output = torch.empty_like(initial_residual)
+        expected_residual = initial_residual.clone()
+        down_reference(
+            down_config,
+            expected_output,
+            down_input,
+            layer.mlp.down_proj.weight,
+            self._workspace,
+        )
+        fused_add_rmsnorm(
+            expected_output,
+            expected_residual,
+            next_norm.weight,
+            float(next_norm.variance_epsilon),
+        )
+        actual_residual = initial_residual.clone()
+        actual_output, actual_residual = self.fused_down_to_next_norm(
+            layer.mlp.down_proj, down_input, actual_residual, next_norm
+        )
+        torch.cuda.current_stream(device).synchronize()
+        if not torch.equal(actual_residual, expected_residual):
+            raise RuntimeError("SM120 fused down preflight changed residual bits")
+        torch.testing.assert_close(
+            actual_output.float(), expected_output.float(), rtol=0.02, atol=0.02
+        )
 
 
 class _Qwen3CublasLtPortfolioDispatch:
@@ -427,20 +632,22 @@ class Qwen3MLP(Qwen2MLP):
     def set_drafter_tma_dispatch(self, dispatch: _Qwen3DrafterTmaDispatch) -> None:
         self.set_drafter_projection_dispatch(dispatch)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        forward_batch: ForwardBatch = None,
-    ) -> torch.Tensor:
+    def _forward_gate_up(self, x: torch.Tensor) -> torch.Tensor:
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
-
         gate_up, _ = _qwen3_drafter_projection_or_linear(
             self._drafter_projection_dispatch,
             self.gate_up_proj,
             x,
         )
-        x = self.act_fn(gate_up)
+        return self.act_fn(gate_up)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch = None,
+    ) -> torch.Tensor:
+        x = self._forward_gate_up(x)
         x, _ = _qwen3_drafter_projection_or_linear(
             self._drafter_projection_dispatch,
             self.down_proj,
@@ -448,6 +655,23 @@ class Qwen3MLP(Qwen2MLP):
             forward_batch=forward_batch,
         )
         return x
+
+    def forward_sm120_fused_down_to_next_norm(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        next_norm: RMSNorm,
+        dispatch: _Qwen3DrafterSM120KernelDispatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run gate-up, then fuse exact down32 into the following RMSNorm."""
+
+        x = self._forward_gate_up(x)
+        return dispatch.fused_down_to_next_norm(
+            self.down_proj,
+            x,
+            residual,
+            next_norm,
+        )
 
 
 class Qwen3Attention(nn.Module):
@@ -838,6 +1062,47 @@ class Qwen3DecoderLayer(nn.Module):
         )
         return hidden_states, residual
 
+    def forward_sm120_fused_handoff(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        *,
+        input_already_normalized: bool,
+        next_norm: RMSNorm,
+        dispatch: _Qwen3DrafterSM120KernelDispatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Exact TP1 path whose down projection produces the next norm input."""
+
+        if input_already_normalized:
+            if residual is None:
+                raise RuntimeError("pre-normalized SM120 handoff requires residual")
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+            )
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+        )
+        if residual is None:
+            raise RuntimeError("SM120 fused down handoff requires an MLP residual")
+        return self.mlp.forward_sm120_fused_down_to_next_norm(
+            hidden_states,
+            residual,
+            next_norm,
+            dispatch,
+        )
+
 
 class Qwen3Model(Qwen2Model):
     def __init__(
@@ -854,6 +1119,69 @@ class Qwen3Model(Qwen2Model):
             decoder_layer_type=Qwen3DecoderLayer,
             alt_stream=alt_stream,
         )
+        self._drafter_sm120_kernel_dispatch: Optional[
+            _Qwen3DrafterSM120KernelDispatch
+        ] = None
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        dispatch = self._drafter_sm120_kernel_dispatch
+        token_count = int(
+            input_embeds.shape[0] if input_embeds is not None else input_ids.shape[0]
+        )
+        if dispatch is None or token_count != 32:
+            return super().forward(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        if not self.pp_group.is_first_rank or not self.pp_group.is_last_rank:
+            raise RuntimeError("SM120 fused draft path requires PP1")
+
+        hidden_states = (
+            self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        )
+        residual = None
+        input_already_normalized = False
+        aux_hidden_states = []
+        for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    residual
+                    if input_already_normalized
+                    else (
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
+                )
+            next_norm = (
+                self.layers[i + 1].input_layernorm
+                if i + 1 < self.end_layer
+                else self.norm
+            )
+            hidden_states, residual = self.layers[i].forward_sm120_fused_handoff(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                input_already_normalized=input_already_normalized,
+                next_norm=next_norm,
+                dispatch=dispatch,
+            )
+            input_already_normalized = True
+
+        if not aux_hidden_states:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
     def _eligible_qwen3_drafter_layers(
         self,
@@ -936,7 +1264,7 @@ class Qwen3Model(Qwen2Model):
     ) -> None:
         for layer in layers:
             for module in (layer.self_attn, layer.mlp):
-                existing = module._drafter_projection_dispatch
+                existing = getattr(module, "_drafter_projection_dispatch", None)
                 combined = (
                     dispatch
                     if existing is None
@@ -945,6 +1273,42 @@ class Qwen3Model(Qwen2Model):
                     )
                 )
                 module.set_drafter_projection_dispatch(combined)
+
+    def enable_qwen3_drafter_sm120_kernel_optimized(self, device_index: int) -> bool:
+        """Install the frozen exact-M32 SM120 portfolio and fused handoff."""
+
+        layers = self._eligible_qwen3_drafter_layers(
+            device_index, _Qwen3DrafterSM120KernelDispatch.supports_linear
+        )
+        if layers is None:
+            return False
+        if any(
+            layer.layer_communicator._communicate_simple_fn
+            is not CommunicateSimpleFn._trivial
+            or layer.layer_communicator._communicate_summable_tensor_pair_fn
+            is not CommunicateSummableTensorPairFn._trivial
+            for layer in layers
+        ):
+            return False
+        next_norms = [layer.input_layernorm for layer in layers[1:]] + [self.norm]
+        if any(
+            not isinstance(norm, RMSNorm)
+            or norm.weight.shape != (1024,)
+            or norm.weight.dtype != torch.bfloat16
+            or norm.weight.device.index != device_index
+            or not norm.weight.is_contiguous()
+            or norm.weight.data_ptr() % 16
+            for norm in next_norms
+        ):
+            return False
+        dispatch = _Qwen3DrafterSM120KernelDispatch(
+            device_index,
+            layers[0],
+            next_norms[0],
+        )
+        self._install_drafter_projection_dispatch(layers, dispatch, prepend=True)
+        self._drafter_sm120_kernel_dispatch = dispatch
+        return True
 
     def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
         """Install TMA dispatch only for the exact Qwen3-0.6B TP1 model."""
@@ -1082,6 +1446,9 @@ class Qwen3ForCausalLM(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    def enable_qwen3_drafter_sm120_kernel_optimized(self, device_index: int) -> bool:
+        return self.model.enable_qwen3_drafter_sm120_kernel_optimized(device_index)
 
     def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
         return self.model.enable_qwen3_drafter_tma(device_index)

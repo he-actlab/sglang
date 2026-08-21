@@ -864,12 +864,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # The Stage-2 TMA winners and the cuBLASLt portfolio compose per
         # exact shape (chained dispatch: TMA specialization -> retained
         # tactic -> production); enable the portfolio first so the TMA
-        # install prepends ahead of it.
+        # and frozen SM120 portfolio can prepend ahead of it.
         enabled = False
         if envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get():
             enabled = self._maybe_enable_qwen3_drafter_cublaslt_portfolio() or enabled
         if envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get():
             enabled = self._maybe_enable_qwen3_drafter_tma() or enabled
+        if envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get():
+            enabled = (
+                self._maybe_enable_qwen3_drafter_sm120_kernel_optimized() or enabled
+            )
         return enabled
 
     def _maybe_enable_qwen3_verifier_cublaslt_portfolio(self) -> bool:
@@ -944,6 +948,88 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "autotuner covers four exact projection shapes and retains "
             "production per shape when no tactic wins; allocated LARGE width=%d.",
             allocated_split[0],
+        )
+        return True
+
+    def _maybe_enable_qwen3_drafter_sm120_kernel_optimized(self) -> bool:
+        """Enable the frozen three-kernel sequential Blackwell portfolio."""
+        from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+        if (
+            not envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get()
+            or not self.is_draft_worker
+        ):
+            return False
+
+        def fallback(reason: str) -> bool:
+            logger.warning(
+                "Qwen3 drafter SM120 kernel portfolio requested but unsupported "
+                "(%s); keeping the retained projection chain.",
+                reason,
+            )
+            return False
+
+        if self.device != "cuda":
+            return fallback(f"device={self.device}")
+        capability = torch.cuda.get_device_capability(self.gpu_id)
+        if capability != (12, 0):
+            return fallback(f"compute capability={capability}")
+        if (
+            not spec_sm_partition_enabled(self.server_args)
+            or not getattr(self.server_args, "enable_spec_sm_partition", False)
+            or getattr(self.server_args, "enable_spec_pdmux", False)
+        ):
+            return fallback("requires sequential --enable-spec-sm-partition only")
+        if not self.spec_algorithm.is_standalone():
+            return fallback(
+                f"speculative algorithm={self.server_args.speculative_algorithm}"
+            )
+        frozen_spec = (
+            self.server_args.speculative_num_steps,
+            self.server_args.speculative_eagle_topk,
+            self.server_args.speculative_num_draft_tokens,
+        )
+        if frozen_spec != (3, 1, 4):
+            return fallback(f"speculative knobs={frozen_spec}, expected (3, 1, 4)")
+        if self.tp_size != 1 or self.pp_size != 1:
+            return fallback(f"tp_size={self.tp_size}, pp_size={self.pp_size}")
+        if self.dtype != torch.bfloat16 or self.model_config.quantization is not None:
+            return fallback(
+                f"dtype={self.dtype}, quantization={self.model_config.quantization}"
+            )
+        if envs.SGLANG_SPEC_PDMUX_SM_HINT.get() != 2:
+            return fallback("SGLANG_SPEC_PDMUX_SM_HINT must be 2")
+        if not envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get():
+            return fallback("drafter cuBLASLt predecessor portfolio must be enabled")
+        if envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get():
+            return fallback("legacy drafter TMA must be disabled for arm identity")
+
+        from sglang.srt.multiplex.pdmux_context import (
+            get_spec_sm_allocated_split,
+            get_spec_streams,
+        )
+
+        allocated_split = get_spec_sm_allocated_split()
+        if allocated_split != (136, 52):
+            return fallback(f"allocated SM split={allocated_split}")
+        enable = getattr(
+            self.model, "enable_qwen3_drafter_sm120_kernel_optimized", None
+        )
+        if not callable(enable):
+            return fallback(f"model type={type(self.model).__name__}")
+
+        small_stream = get_spec_streams()[1]
+        with torch.cuda.stream(small_stream):
+            enabled = enable(self.gpu_id)
+        if not enabled:
+            return fallback(
+                "model or communicator is not the exact unquantized TP1 "
+                "Qwen3-0.6B family"
+            )
+        logger.info(
+            "Qwen3 drafter SM120 kernel portfolio enabled: qkv32 N128-s6, "
+            "gate_up32 N64-s5, and no-PDL down32-to-RMSNorm handoff; "
+            "M!=32 retains the predecessor chain."
         )
         return True
 

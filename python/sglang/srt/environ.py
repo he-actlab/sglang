@@ -741,6 +741,13 @@ class Envs:
     # models, shapes, dtypes, layouts, widths, and architectures keep the
     # production linear path. Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_TMA = EnvBool(False)
+    # Design-SM120DraftKernelOptimized (TODO-53): exact Qwen3-0.6B TP1 BF16
+    # M=32 qkv32 N128-s6 and gate_up32 N64-s5 specializations, plus the no-PDL
+    # down32 reduction/residual/RMSNorm handoff. ModelRunner restricts this to
+    # the sequential standalone K3/topk1/draft4 136,52 Blackwell regime. Other
+    # shapes retain the installed cuBLASLt portfolio or production linear.
+    # Experimental and default-off.
+    SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED = EnvBool(False)
     # Portable per-GPU cuBLASLt autotuning for exact Qwen3-0.6B TP1 BF16
     # projections. Before graph capture, each worker correctness-checks and
     # times top-N candidates at target 0 and its realized SMALL width against

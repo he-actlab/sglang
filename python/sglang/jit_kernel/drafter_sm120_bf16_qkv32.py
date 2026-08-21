@@ -6,6 +6,9 @@ import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
 
+M, K, N = 32, 1024, 4096
+WORKSPACE_BYTES = 1_048_576
+
 
 def _cuda_flags() -> list[str]:
     return [
@@ -125,11 +128,67 @@ def _jit_drafter_sm120_bf16_qkv32_module():
                     "drafter_sm120_bf16_qkv32_n32_s3_g104",
                     "drafter_sm120_bf16_qkv32_n32_s3_g104",
                 ),
-
             ],
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=_cuda_flags(),
         )
 
 
-__all__ = ["_jit_drafter_sm120_bf16_qkv32_module"]
+def drafter_sm120_bf16_qkv32_amp_n128_s6(
+    output: torch.Tensor,
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    workspace: torch.Tensor,
+) -> torch.Tensor:
+    """Run the retained exact-M32 qkv32 winner on the current CUDA stream."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("SM120 BF16 qkv32 requires CUDA.")
+    device = activation.device
+    capability = torch.cuda.get_device_capability(device)
+    if capability != (12, 0):
+        raise RuntimeError(
+            "SM120 BF16 qkv32 requires compute capability "
+            f"12.0, got {capability[0]}.{capability[1]}."
+        )
+    for tensor, name, shape in (
+        (activation, "activation", (M, K)),
+        (weight, "weight", (N, K)),
+        (output, "output", (M, N)),
+    ):
+        if tensor.shape != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+            )
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError(
+                f"{name} must have dtype torch.bfloat16, got {tensor.dtype}"
+            )
+        if tensor.device != device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous and on {device}")
+        if tensor.data_ptr() % 16:
+            raise ValueError(f"{name} must be 16-byte aligned")
+    if workspace.shape != (WORKSPACE_BYTES,) or workspace.dtype != torch.uint8:
+        raise ValueError(
+            f"workspace must be uint8[{WORKSPACE_BYTES}], got "
+            f"{workspace.dtype}{tuple(workspace.shape)}"
+        )
+    if workspace.device != device or not workspace.is_contiguous():
+        raise ValueError("workspace must be contiguous and on the activation device")
+    if workspace.data_ptr() % 16:
+        raise ValueError("workspace must be 16-byte aligned")
+
+    with torch.cuda.device(device):
+        module = _jit_drafter_sm120_bf16_qkv32_module()
+    module.drafter_sm120_bf16_qkv32_amp_n128_s6(output, activation, weight, workspace)
+    return output
+
+
+__all__ = [
+    "K",
+    "M",
+    "N",
+    "WORKSPACE_BYTES",
+    "_jit_drafter_sm120_bf16_qkv32_module",
+    "drafter_sm120_bf16_qkv32_amp_n128_s6",
+]
