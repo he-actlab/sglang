@@ -73,6 +73,7 @@ _is_cpu = is_cpu()
 # and its [batch * dp_size, vocab] output OOMs under DP attention with a
 # tight mem_fraction_static.
 _in_autotune_dummy_run = False
+_logged_full_device_draft_extend_lm_head = False
 
 _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_INPUT_SHAPE = (128, 1024)
 _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_WEIGHT_SHAPE = (151936, 1024)
@@ -95,6 +96,7 @@ def _use_full_device_draft_extend_lm_head(
     model_config,
 ) -> bool:
     """Fail-closed policy for the one LM head proven to benefit from width."""
+    global _logged_full_device_draft_extend_lm_head
     if not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.get():
         return False
     if logits_metadata.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
@@ -122,12 +124,19 @@ def _use_full_device_draft_extend_lm_head(
     if getattr(lm_head, "quant_config", None) is not None:
         return False
     weight = getattr(lm_head, "weight", None)
-    return bool(
+    eligible = bool(
         isinstance(weight, torch.Tensor)
         and weight.is_cuda
         and weight.dtype == torch.bfloat16
         and tuple(weight.shape) == _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_WEIGHT_SHAPE
     )
+    if eligible and not _logged_full_device_draft_extend_lm_head:
+        logger.info(
+            "Qwen3 drafter full-device draft-extend LM head armed: exact "
+            "DRAFT_EXTEND_V2 M=128 K=1024 N=151936 BF16 TP1 path"
+        )
+        _logged_full_device_draft_extend_lm_head = True
+    return eligible
 
 
 def get_in_autotune_dummy_run() -> bool:
