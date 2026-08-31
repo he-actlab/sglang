@@ -39,6 +39,15 @@ class FullDeviceLmHeadPolicyTests(CustomTestCase):
             quant_config=None,
         )
         self.metadata = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+        self.model_config = SimpleNamespace(
+            model_type="qwen3",
+            hidden_size=1024,
+            intermediate_size=3072,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            vocab_size=151936,
+        )
 
     def _eligible(
         self,
@@ -47,7 +56,8 @@ class FullDeviceLmHeadPolicyTests(CustomTestCase):
         hidden_states=None,
         lm_head=None,
         metadata=None,
-        bias=None
+        bias=None,
+        model_config=None,
     ):
         env = {
             "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD": (
@@ -60,6 +70,7 @@ class FullDeviceLmHeadPolicyTests(CustomTestCase):
                 lm_head if lm_head is not None else self.lm_head,
                 metadata if metadata is not None else self.metadata,
                 bias,
+                model_config if model_config is not None else self.model_config,
             )
 
     def test_exact_qwen3_draft_extend_lm_head_is_eligible(self):
@@ -71,6 +82,21 @@ class FullDeviceLmHeadPolicyTests(CustomTestCase):
     def test_other_forward_mode_is_ineligible(self):
         metadata = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
         self.assertFalse(self._eligible(metadata=metadata))
+
+    def test_other_model_config_is_ineligible(self):
+        for field, value in (
+            ("model_type", "other"),
+            ("hidden_size", 2048),
+            ("intermediate_size", 6144),
+            ("num_hidden_layers", 32),
+            ("num_attention_heads", 32),
+            ("num_key_value_heads", 4),
+            ("vocab_size", 152064),
+        ):
+            with self.subTest(field=field, value=value):
+                config = SimpleNamespace(**vars(self.model_config))
+                setattr(config, field, value)
+                self.assertFalse(self._eligible(model_config=config))
 
     def test_m32_draft_head_is_ineligible(self):
         self.assertFalse(self._eligible(hidden_states=_FakeCudaTensor((32, 1024))))

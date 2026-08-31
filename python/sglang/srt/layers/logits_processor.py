@@ -76,6 +76,15 @@ _in_autotune_dummy_run = False
 
 _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_INPUT_SHAPE = (128, 1024)
 _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_WEIGHT_SHAPE = (151936, 1024)
+_FULL_DEVICE_DRAFT_EXTEND_MODEL_SIGNATURE = (
+    "qwen3",
+    1024,
+    3072,
+    28,
+    16,
+    8,
+    151936,
+)
 
 
 def _use_full_device_draft_extend_lm_head(
@@ -83,11 +92,22 @@ def _use_full_device_draft_extend_lm_head(
     lm_head: VocabParallelEmbedding,
     logits_metadata: "LogitsMetadata",
     embedding_bias: Optional[torch.Tensor],
+    model_config,
 ) -> bool:
     """Fail-closed policy for the one LM head proven to benefit from width."""
     if not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.get():
         return False
     if logits_metadata.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
+        return False
+    if (
+        getattr(model_config, "model_type", None),
+        getattr(model_config, "hidden_size", None),
+        getattr(model_config, "intermediate_size", None),
+        getattr(model_config, "num_hidden_layers", None),
+        getattr(model_config, "num_attention_heads", None),
+        getattr(model_config, "num_key_value_heads", None),
+        getattr(model_config, "vocab_size", None),
+    ) != _FULL_DEVICE_DRAFT_EXTEND_MODEL_SIGNATURE:
         return False
     if embedding_bias is not None:
         return False
@@ -892,7 +912,7 @@ class LogitsProcessor(nn.Module):
         )
 
         use_full_device = _use_full_device_draft_extend_lm_head(
-            hidden_states, lm_head, logits_metadata, embedding_bias
+            hidden_states, lm_head, logits_metadata, embedding_bias, self.config
         )
         # Keep both boundaries below hidden-state gathering and above logits
         # gathering. Only the exact LM-head GEMM moves; scaling, collectives,
