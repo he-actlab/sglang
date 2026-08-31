@@ -827,6 +827,12 @@ class Envs:
     SGLANG_DRAFT_EXTEND_NCU_RANGE_NAME = EnvStr(
         "SGLANG_DRAFT_EXTEND_M128_REPLAY"
     )
+    # TODO-51: route only the exact Qwen3-0.6B TP1 BF16 padded-M=128
+    # DRAFT_EXTEND_V2 LM head through the shared plain full-device stream.
+    # The call site owns a fail-closed shape/model/phase gate; this flag does
+    # not opt any other operator into full-device placement. Experimental and
+    # default-off while serialized and concurrent integration gates run.
+    SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

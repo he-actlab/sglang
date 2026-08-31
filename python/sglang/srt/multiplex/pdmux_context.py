@@ -24,11 +24,11 @@ SPEC_STREAM_PAIR: Optional[Tuple[torch.cuda.Stream, torch.cuda.Stream]] = None
 # allocated counts instead.
 SPEC_SM_SPLIT: Optional[Tuple[int, int]] = None
 SPEC_SM_ALLOCATED_SPLIT: Optional[Tuple[int, int]] = None
-# Design-FullChipPrefill (TODO-34): a plain full-device stream for target
-# prompt prefill. Not a green-ctx partition stream — graph SM affinity bakes
-# at capture, so target-prefill graphs captured here may use the whole chip.
-# The worker fences both partitions around every use (no green-ctx kernel may
-# overlap a full-chip prefill).
+# Design-FullChipPrefill (TODO-34): a plain full-device stream shared by
+# explicitly placed full-device work. It was introduced for target prompt
+# prefill and is also the escape lane for individually selected operators.
+# It is not a green-ctx partition stream. Callers own the placement policy and
+# must fence their source partition around each use.
 SPEC_PREFILL_STREAM: Optional[torch.cuda.Stream] = None
 
 
@@ -312,6 +312,63 @@ def get_spec_prefill_stream() -> torch.cuda.Stream:
             "(initialize_spec_stream_pair must run first)"
         )
     return SPEC_PREFILL_STREAM
+
+
+def get_spec_full_device_stream() -> torch.cuda.Stream:
+    """The shared plain CUDA stream used by explicitly full-device work.
+
+    ``get_spec_prefill_stream`` remains as the compatibility name for the
+    original target-prefill caller. Both accessors return the same stream so
+    full-device work is FIFO-ordered rather than introducing another physical
+    stream.
+    """
+    return get_spec_prefill_stream()
+
+
+@contextmanager
+def spec_pdmux_full_device_operator_region(enabled: bool, *, source_partition: str):
+    """Temporarily run one explicitly selected operator on the full device.
+
+    The region adds source -> full-device -> source event edges. These become
+    internal nodes when called during CUDA graph capture and ordinary event
+    waits in eager execution. The caller must keep cross-stream tensor storage
+    alive (for example with ``Tensor.record_stream``).
+
+    This is placement infrastructure, not an operator policy: ``enabled`` and
+    the expected source partition are supplied by the individual call site.
+    """
+    if not enabled:
+        yield None
+        return
+    if source_partition not in ("large", "small"):
+        raise ValueError(
+            "source_partition must be 'large' or 'small', got " f"{source_partition!r}"
+        )
+
+    large_stream, small_stream = get_spec_streams()
+    source_stream = torch.cuda.current_stream()
+    expected_source = large_stream if source_partition == "large" else small_stream
+    if source_stream != expected_source:
+        raise RuntimeError(
+            "full-device operator region entered from the wrong stream: "
+            f"expected the {source_partition} spec-pdmux partition"
+        )
+
+    full_device_stream = get_spec_full_device_stream()
+    ready = torch.cuda.Event()
+    done = torch.cuda.Event()
+    ready.record(source_stream)
+    full_device_stream.wait_event(ready)
+    with torch.cuda.stream(full_device_stream):
+        try:
+            # The enclosing draft graph capture may carry the SMALL-width
+            # cuBLAS hint. Target 0 makes this operator choose a full-device
+            # tactic; the context restores the partition hint afterwards.
+            with cublas_sm_count_target(0):
+                yield full_device_stream
+        finally:
+            done.record(full_device_stream)
+    source_stream.wait_event(done)
 
 
 def set_current_stream_idx(idx: int):

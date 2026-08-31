@@ -47,6 +47,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.multiplex.pdmux_context import (
+    spec_pdmux_full_device_operator_region,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
@@ -70,6 +73,41 @@ _is_cpu = is_cpu()
 # and its [batch * dp_size, vocab] output OOMs under DP attention with a
 # tight mem_fraction_static.
 _in_autotune_dummy_run = False
+
+_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_INPUT_SHAPE = (128, 1024)
+_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_WEIGHT_SHAPE = (151936, 1024)
+
+
+def _use_full_device_draft_extend_lm_head(
+    hidden_states: torch.Tensor,
+    lm_head: VocabParallelEmbedding,
+    logits_metadata: "LogitsMetadata",
+    embedding_bias: Optional[torch.Tensor],
+) -> bool:
+    """Fail-closed policy for the one LM head proven to benefit from width."""
+    if not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.get():
+        return False
+    if logits_metadata.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
+        return False
+    if embedding_bias is not None:
+        return False
+    if not hidden_states.is_cuda or hidden_states.dtype != torch.bfloat16:
+        return False
+    if tuple(hidden_states.shape) != _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_INPUT_SHAPE:
+        return False
+    if hasattr(lm_head, "set_lora") or hasattr(lm_head, "apply_lora"):
+        return False
+    if getattr(lm_head, "tp_size", None) != 1:
+        return False
+    if getattr(lm_head, "quant_config", None) is not None:
+        return False
+    weight = getattr(lm_head, "weight", None)
+    return bool(
+        isinstance(weight, torch.Tensor)
+        and weight.is_cuda
+        and weight.dtype == torch.bfloat16
+        and tuple(weight.shape) == _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_WEIGHT_SHAPE
+    )
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -853,10 +891,21 @@ class LogitsProcessor(nn.Module):
             hidden_states, logits_metadata
         )
 
-        # Keep the event boundary below hidden-state gathering and above logits
-        # gathering so it measures only the exact LM-head program.
-        with draft_extend_lm_head_scope(hidden_states, lm_head):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        use_full_device = _use_full_device_draft_extend_lm_head(
+            hidden_states, lm_head, logits_metadata, embedding_bias
+        )
+        # Keep both boundaries below hidden-state gathering and above logits
+        # gathering. Only the exact LM-head GEMM moves; scaling, collectives,
+        # scatter, copies, and sampling remain on the source SMALL stream.
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_device_stream:
+            if full_device_stream is not None:
+                hidden_states.record_stream(full_device_stream)
+            with draft_extend_lm_head_scope(hidden_states, lm_head):
+                logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        if full_device_stream is not None:
+            logits.record_stream(torch.cuda.current_stream())
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
