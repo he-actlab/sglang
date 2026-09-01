@@ -389,7 +389,6 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             with probe.capture_scope(128):
                 pass
 
-
     def test_prefill_plan_capture_and_replay_are_archived(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "plan.jsonl"
@@ -436,9 +435,7 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(records[0]["prefill_plan_metadata"], capture)
             self.assertEqual(records[1]["replay_prefill_plan_metadata"], replay)
             self.assertFalse(records[1]["capture_replay_exact_match"])
-            self.assertIn(
-                "kv_chunk_size", records[1]["capture_replay_changed_fields"]
-            )
+            self.assertIn("kv_chunk_size", records[1]["capture_replay_changed_fields"])
 
     def test_prefill_plan_template_mismatch_fails_before_replay(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -505,6 +502,7 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(record["stage"], "replay")
             self.assertEqual(record["error_type"], "RuntimeError")
             self.assertIn("new batch size", record["error"])
+
     def test_factory_default_is_true_noop_and_preallocation_only_is_supported(self):
         with (
             envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("off"),
@@ -544,7 +542,6 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
                 create_surface_probe(object(), [32], 4)
         validate.assert_not_called()
 
-
     def test_plan_override_requires_equal_memory_artifact_envelope(self):
         with (
             envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("off"),
@@ -556,6 +553,7 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "PREALLOCATE=1"):
                 create_surface_probe(object(), [32], 4)
         validate.assert_not_called()
+
     def test_fixed52_validation_binds_exact_model_paths_and_server_seed(self):
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -638,15 +636,9 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(identity["server_random_seed"], 20260803)
             self.assertFalse(identity["draft_extend_flashinfer_plan_override"])
             self.assertEqual(identity["draft_extend_flashinfer_plan_width"], 0)
-            self.assertEqual(
-                identity["draft_extend_flashinfer_num_colocated_ctas"], -1
-            )
-            self.assertEqual(
-                identity["draft_extend_flashinfer_fixed_split_size"], 0
-            )
-            self.assertFalse(
-                identity["draft_extend_flashinfer_disable_split_kv"]
-            )
+            self.assertEqual(identity["draft_extend_flashinfer_num_colocated_ctas"], -1)
+            self.assertEqual(identity["draft_extend_flashinfer_fixed_split_size"], 0)
+            self.assertFalse(identity["draft_extend_flashinfer_disable_split_kv"])
             self.assertEqual(small_stream, "small-stream")
 
             invalid = (
@@ -665,6 +657,97 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
                     with self.assertRaisesRegex(RuntimeError, reason):
                         probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
                 setattr(args, field, original)
+
+    def test_stock_fullchip_validation_is_exact_and_returns_current_stream(self):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        args = SimpleNamespace(
+            model_path="Qwen/Qwen3-8B",
+            speculative_draft_model_path="Qwen/Qwen3-0.6B",
+            random_seed=20260901,
+            enable_spec_pdmux=False,
+            enable_spec_sm_partition=False,
+            spec_pdmux_slots=2,
+            max_running_requests=32,
+            disable_radix_cache=False,
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(backend=Backend.FULL, max_bs=32)
+            ),
+            get_attention_backends=lambda: ("flashinfer", "flashinfer"),
+        )
+        hf_config = SimpleNamespace(
+            architectures=["Qwen3ForCausalLM"],
+            hidden_size=1024,
+            intermediate_size=3072,
+            num_hidden_layers=28,
+            vocab_size=151936,
+            tie_word_embeddings=True,
+        )
+        runner = SimpleNamespace(
+            server_args=args,
+            model_config=SimpleNamespace(hf_config=hf_config, quantization=None),
+            gpu_id=0,
+            is_draft_worker=True,
+            device="cuda:0",
+            spec_algorithm=SimpleNamespace(is_standalone=lambda: True),
+            tp_size=1,
+            pp_size=1,
+            dtype=torch.bfloat16,
+        )
+        properties = SimpleNamespace(
+            name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            uuid="GPU-unit",
+            multi_processor_count=188,
+        )
+        with (
+            envs.SGLANG_SPEC_PDMUX_SERIALIZE.override(False),
+            envs.SGLANG_SPEC_PDMUX_SM_HINT.override(0),
+            envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.override(False),
+            envs.SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO.override(False),
+            envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.override(False),
+            envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.override(False),
+            envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.override(False),
+            envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP.override(False),
+            envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.override(0),
+            envs.SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH.override(0),
+            patch.object(
+                probe_module.torch.cuda,
+                "get_device_capability",
+                return_value=(12, 0),
+            ),
+            patch.object(
+                probe_module.torch.cuda,
+                "get_device_properties",
+                return_value=properties,
+            ),
+            patch.object(
+                probe_module.torch.cuda,
+                "current_stream",
+                return_value="full-device-stream",
+            ),
+            patch(
+                "sglang.srt.multiplex.pdmux_context.get_spec_sm_allocated_split",
+                return_value=None,
+            ),
+            patch(
+                "sglang.srt.multiplex.pdmux_context.get_spec_sm_split",
+                return_value=None,
+            ),
+        ):
+            identity, stream = probe_module._validate_fixed52_runtime(
+                runner, [1, 2, 4, 8, 16, 32], 4
+            )
+            self.assertEqual(identity["placement"], "stock-fullchip")
+            self.assertEqual(identity["concurrency"], 32)
+            self.assertIsNone(identity["requested_sm_split"])
+            self.assertEqual(stream, "full-device-stream")
+
+            args.enable_spec_sm_partition = True
+            with self.assertRaisesRegex(RuntimeError, "enable-spec-sm-partition"):
+                probe_module._validate_fixed52_runtime(runner, [32], 4)
 
 
 if __name__ == "__main__":

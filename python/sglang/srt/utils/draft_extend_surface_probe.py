@@ -294,9 +294,7 @@ class DraftExtendSurfaceProbe:
                 "draft-extend S2 FlashInfer metadata lacks plan_info/controls"
             )
         missing_plan = sorted(_PREFILL_PLAN_REQUIRED_FIELDS - plan_info.keys())
-        missing_controls = sorted(
-            _PREFILL_CONTROL_REQUIRED_FIELDS - controls.keys()
-        )
+        missing_controls = sorted(_PREFILL_CONTROL_REQUIRED_FIELDS - controls.keys())
         if missing_plan or missing_controls:
             raise RuntimeError(
                 "draft-extend S2 FlashInfer metadata schema changed: "
@@ -329,18 +327,14 @@ class DraftExtendSurfaceProbe:
                 f"draft-extend S2 planner expected 188 physical SMs, got {device_sms}"
             )
         requested_width = int(identity["draft_extend_flashinfer_plan_width"])
-        requested_reserve = int(
-            identity["draft_extend_flashinfer_num_colocated_ctas"]
-        )
+        requested_reserve = int(identity["draft_extend_flashinfer_num_colocated_ctas"])
         if requested_width > 0:
             expected_width = requested_width
             expected_reserve = 2 * (device_sms - requested_width)
         elif requested_reserve >= 0:
             expected_reserve = requested_reserve
             available_ctas = 2 * device_sms - expected_reserve
-            expected_width = (
-                available_ctas // 2 if available_ctas % 2 == 0 else None
-            )
+            expected_width = available_ctas // 2 if available_ctas % 2 == 0 else None
         else:
             execution_width = int(identity["allocated_sm_split"][1])
             expected_width = execution_width
@@ -349,9 +343,7 @@ class DraftExtendSurfaceProbe:
         expected_fixed = (
             int(identity["draft_extend_flashinfer_fixed_split_size"]) or None
         )
-        expected_disable = bool(
-            identity["draft_extend_flashinfer_disable_split_kv"]
-        )
+        expected_disable = bool(identity["draft_extend_flashinfer_disable_split_kv"])
         expected_controls = {
             "device_sms": device_sms,
             "available_ctas": expected_available_ctas,
@@ -778,10 +770,174 @@ def draft_extend_lm_head_scope(hidden_states, lm_head):
     return probe.surface_scope("lm_head", shape)
 
 
+def _validate_stock_fullchip_runtime(
+    model_runner, capture_bs: Sequence[int], num_tokens_per_bs: int
+) -> Tuple[Dict[str, Any], Any]:
+    """Fail closed unless this is the exact current stock-fullchip B1 arm."""
+
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.multiplex.pdmux_context import (
+        get_spec_sm_allocated_split,
+        get_spec_sm_split,
+    )
+
+    args = model_runner.server_args
+    hf_config = model_runner.model_config.hf_config
+    allocated_split = get_spec_sm_allocated_split()
+    requested_split = get_spec_sm_split()
+    properties = torch.cuda.get_device_properties(model_runner.gpu_id)
+    prefill_backend, decode_backend = args.get_attention_backends()
+    checks = [
+        (bool(model_runner.is_draft_worker), "runner is not the draft worker"),
+        (str(model_runner.device).startswith("cuda"), f"device={model_runner.device}"),
+        (
+            torch.cuda.get_device_capability(model_runner.gpu_id) == (12, 0),
+            f"compute capability={torch.cuda.get_device_capability(model_runner.gpu_id)}",
+        ),
+        (
+            int(properties.multi_processor_count) == 188,
+            f"physical SM count={properties.multi_processor_count}",
+        ),
+        (
+            str(args.model_path) == "Qwen/Qwen3-8B",
+            f"target model path={args.model_path}",
+        ),
+        (
+            str(args.speculative_draft_model_path) == "Qwen/Qwen3-0.6B",
+            f"draft model path={args.speculative_draft_model_path}",
+        ),
+        (args.random_seed == 20260901, f"server random seed={args.random_seed}"),
+        (model_runner.spec_algorithm.is_standalone(), "algorithm is not STANDALONE"),
+        (model_runner.tp_size == 1 and model_runner.pp_size == 1, "requires TP1/PP1"),
+        (
+            model_runner.dtype == torch.bfloat16
+            and model_runner.model_config.quantization is None,
+            "requires unquantized BF16",
+        ),
+        (not bool(args.enable_spec_pdmux), "--enable-spec-pdmux is on"),
+        (
+            not bool(getattr(args, "enable_spec_sm_partition", False)),
+            "--enable-spec-sm-partition is on",
+        ),
+        (requested_split is None, f"requested split={requested_split}"),
+        (allocated_split is None, f"allocated split={allocated_split}"),
+        (not bool(envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()), "serialization is on"),
+        (
+            int(args.max_running_requests) == 32,
+            f"max_running_requests={args.max_running_requests}",
+        ),
+        (not bool(args.disable_radix_cache), "radix cache is disabled"),
+        (
+            int(args.speculative_num_steps) == 3,
+            f"speculative_num_steps={args.speculative_num_steps}",
+        ),
+        (int(args.speculative_eagle_topk) == 1, f"topk={args.speculative_eagle_topk}"),
+        (
+            int(args.speculative_num_draft_tokens) == 4,
+            f"num_draft_tokens={args.speculative_num_draft_tokens}",
+        ),
+        (num_tokens_per_bs == 4, f"num_tokens_per_bs={num_tokens_per_bs}"),
+        (
+            any(int(bs) * num_tokens_per_bs == TARGET_M for bs in capture_bs),
+            f"capture buckets={tuple(capture_bs)} do not contain padded M=128",
+        ),
+        (
+            args.cuda_graph_config.decode.backend == Backend.FULL,
+            f"decode graph backend={args.cuda_graph_config.decode.backend}",
+        ),
+        (
+            int(args.cuda_graph_config.decode.max_bs) == 32,
+            f"decode graph max_bs={args.cuda_graph_config.decode.max_bs}",
+        ),
+        (
+            prefill_backend == "flashinfer" and decode_backend == "flashinfer",
+            f"attention backends={prefill_backend}/{decode_backend}",
+        ),
+        (envs.SGLANG_SPEC_PDMUX_SM_HINT.get() == 0, "SMHint mode is not 0"),
+        (
+            not envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.get(),
+            "drafter cuBLASLt portfolio is on",
+        ),
+        (
+            not envs.SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO.get(),
+            "verifier cuBLASLt portfolio is on",
+        ),
+        (not envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get(), "drafter TMA is on"),
+        (
+            not envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get(),
+            "SM120 draft kernels are on",
+        ),
+        (
+            not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.get(),
+            "full-device LM head is on",
+        ),
+        (
+            not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP.get(),
+            "full-device gate-up is on",
+        ),
+        (
+            envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get() == 0,
+            "FlashInfer prefill width mode is not 0",
+        ),
+        (
+            envs.SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH.get() == 0,
+            "FlashInfer decode width override is not 0",
+        ),
+        (
+            getattr(hf_config, "architectures", [None])[0] == "Qwen3ForCausalLM",
+            f"architecture={getattr(hf_config, 'architectures', None)}",
+        ),
+        (int(hf_config.hidden_size) == 1024, f"hidden_size={hf_config.hidden_size}"),
+        (
+            int(hf_config.intermediate_size) == 3072,
+            f"intermediate_size={hf_config.intermediate_size}",
+        ),
+        (
+            int(hf_config.num_hidden_layers) == 28,
+            f"num_hidden_layers={hf_config.num_hidden_layers}",
+        ),
+        (int(hf_config.vocab_size) == 151936, f"vocab_size={hf_config.vocab_size}"),
+        (bool(hf_config.tie_word_embeddings), "LM head is not tied"),
+    ]
+    failures = [reason for passed, reason in checks if not passed]
+    if failures:
+        raise RuntimeError(
+            "draft-extend surface probe rejects stock-fullchip: " + "; ".join(failures)
+        )
+    identity = {
+        "placement": "stock-fullchip",
+        "model_architecture": hf_config.architectures[0],
+        "target_model_path": str(args.model_path),
+        "draft_model_path": str(args.speculative_draft_model_path),
+        "server_random_seed": int(args.random_seed),
+        "dtype": str(model_runner.dtype),
+        "gpu_name": properties.name,
+        "gpu_uuid": str(getattr(properties, "uuid", "unknown")),
+        "compute_capability": [12, 0],
+        "requested_sm_split": None,
+        "allocated_sm_split": None,
+        "serialized": False,
+        "concurrency": int(args.max_running_requests),
+        "capture_bs": [int(bs) for bs in capture_bs],
+        "sm_hint_mode": 0,
+        "drafter_cublaslt_portfolio": False,
+        "verifier_cublaslt_portfolio": False,
+        "drafter_tma": False,
+        "flashinfer_prefill_width_mode": 0,
+        "flashinfer_decode_width_mode": 0,
+    }
+    return identity, torch.cuda.current_stream(model_runner.gpu_id)
+
+
 def _validate_fixed52_runtime(
     model_runner, capture_bs: Sequence[int], num_tokens_per_bs: int
 ) -> Tuple[Dict[str, Any], Any]:
     """Fail closed unless this is the workbook's immutable denominator."""
+
+    if not bool(model_runner.server_args.enable_spec_pdmux):
+        return _validate_stock_fullchip_runtime(
+            model_runner, capture_bs, num_tokens_per_bs
+        )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.multiplex.pdmux_context import (
@@ -969,7 +1125,12 @@ def create_surface_probe(
     require_plan_metadata = bool(
         envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE.get()
     )
-    if mode == "off" and not ncu_range and not preallocate and not require_plan_metadata:
+    if (
+        mode == "off"
+        and not ncu_range
+        and not preallocate
+        and not require_plan_metadata
+    ):
         return None
     if mode not in ("off", "capture-only", "measure"):
         raise ValueError(
