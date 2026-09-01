@@ -723,11 +723,6 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
                 "get_device_properties",
                 return_value=properties,
             ),
-            patch.object(
-                probe_module.torch.cuda,
-                "current_stream",
-                return_value="full-device-stream",
-            ),
             patch(
                 "sglang.srt.multiplex.pdmux_context.get_spec_sm_allocated_split",
                 return_value=None,
@@ -743,7 +738,7 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(identity["placement"], "stock-fullchip")
             self.assertEqual(identity["concurrency"], 32)
             self.assertIsNone(identity["requested_sm_split"])
-            self.assertEqual(stream, "full-device-stream")
+            self.assertIsNone(stream)
 
             args.enable_spec_sm_partition = True
             with self.assertRaisesRegex(RuntimeError, "enable-spec-sm-partition"):

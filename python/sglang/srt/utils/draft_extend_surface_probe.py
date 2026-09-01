@@ -926,7 +926,9 @@ def _validate_stock_fullchip_runtime(
         "flashinfer_prefill_width_mode": 0,
         "flashinfer_decode_width_mode": 0,
     }
-    return identity, torch.cuda.current_stream(model_runner.gpu_id)
+    # Stock execution has no alternate partition stream. CUDA graph replay uses
+    # its replay stream, which is intentionally not the construction-time stream.
+    return identity, None
 
 
 def _validate_fixed52_runtime(
