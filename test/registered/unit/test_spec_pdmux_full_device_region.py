@@ -12,6 +12,7 @@ from sglang.srt.layers.logits_processor import (
     _use_full_device_draft_extend_lm_head,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models import qwen3
 from sglang.srt.multiplex import pdmux_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -135,6 +136,127 @@ class FullDeviceLmHeadPolicyTests(CustomTestCase):
             with self.subTest(head=head):
                 self.assertFalse(self._eligible(lm_head=head))
         self.assertFalse(self._eligible(bias=_FakeCudaTensor((151936,))))
+
+
+class FullDeviceGateUpPolicyTests(CustomTestCase):
+    def setUp(self):
+        self.activation = _FakeCudaTensor((128, 1024))
+        self.linear = SimpleNamespace(weight=_FakeCudaTensor((6144, 1024)))
+        self.forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2
+        )
+
+    def _eligible(
+        self,
+        *,
+        enabled=True,
+        activation=None,
+        linear=None,
+        forward_batch=None,
+        supports_linear=True,
+    ):
+        env = {
+            "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP": (
+                "1" if enabled else "0"
+            )
+        }
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(
+                qwen3._Qwen3DrafterSM120KernelDispatch,
+                "supports_linear",
+                return_value=supports_linear,
+            ),
+        ):
+            return qwen3._use_full_device_draft_extend_gate_up(
+                activation if activation is not None else self.activation,
+                linear if linear is not None else self.linear,
+                forward_batch if forward_batch is not None else self.forward_batch,
+            )
+
+    def test_exact_qwen3_draft_extend_gate_up_is_eligible(self):
+        self.assertTrue(self._eligible())
+
+    def test_default_off_policy_is_inert(self):
+        self.assertFalse(self._eligible(enabled=False))
+
+    def test_other_forward_mode_is_ineligible(self):
+        self.assertFalse(
+            self._eligible(
+                forward_batch=SimpleNamespace(forward_mode=ForwardMode.DECODE)
+            )
+        )
+
+    def test_other_shape_is_ineligible(self):
+        self.assertFalse(
+            self._eligible(activation=_FakeCudaTensor((32, 1024)))
+        )
+        self.assertFalse(
+            self._eligible(
+                linear=SimpleNamespace(weight=_FakeCudaTensor((6144, 2048)))
+            )
+        )
+
+    def test_unsupported_linear_is_ineligible(self):
+        self.assertFalse(self._eligible(supports_linear=False))
+
+
+class FullDeviceGateUpCallSiteTests(CustomTestCase):
+    def test_wide_path_bypasses_partition_tactic_and_records_lifetimes(self):
+        calls = []
+        source_stream = object()
+        full_stream = object()
+        activation = SimpleNamespace(
+            record_stream=lambda stream: calls.append(("activation", stream))
+        )
+        output = SimpleNamespace(
+            record_stream=lambda stream: calls.append(("output", stream))
+        )
+        mlp = object.__new__(qwen3.Qwen3MLP)
+        mlp._drafter_projection_dispatch = object()
+        mlp.gate_up_proj = object()
+        mlp.act_fn = lambda tensor: tensor
+
+        @contextmanager
+        def region(enabled, *, source_partition):
+            self.assertTrue(enabled)
+            self.assertEqual(source_partition, "small")
+            yield full_stream
+
+        def projection(dispatch, linear, tensor):
+            calls.append(("dispatch", dispatch, linear, tensor))
+            return output, None
+
+        with (
+            patch.object(
+                qwen3,
+                "get_global_server_args",
+                return_value=SimpleNamespace(rl_on_policy_target=None),
+            ),
+            patch.object(
+                qwen3,
+                "_use_full_device_draft_extend_gate_up",
+                return_value=True,
+            ),
+            patch.object(
+                qwen3,
+                "spec_pdmux_full_device_operator_region",
+                side_effect=region,
+            ),
+            patch.object(
+                qwen3,
+                "_qwen3_drafter_projection_or_linear",
+                side_effect=projection,
+            ),
+            patch.object(
+                qwen3.torch.cuda, "current_stream", return_value=source_stream
+            ),
+        ):
+            self.assertIs(mlp._forward_gate_up(activation, object()), output)
+
+        self.assertEqual(calls[0], ("activation", full_stream))
+        self.assertIsNone(calls[1][1])
+        self.assertEqual(calls[2], ("output", source_stream))
 
 
 class _FakeEvent:

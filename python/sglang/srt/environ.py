@@ -833,6 +833,11 @@ class Envs:
     # not opt any other operator into full-device placement. Experimental and
     # default-off while serialized and concurrent integration gates run.
     SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD = EnvBool(False)
+    # Route only the exact Qwen3-0.6B TP1 BF16 M=128 draft-extend gate-up
+    # projection through the shared full-device stream. The Qwen3 call site
+    # owns the phase/shape/linear gate and bypasses the cached 52-SM tactic so
+    # target 0 can select a full-device schedule. Experimental and default-off.
+    SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

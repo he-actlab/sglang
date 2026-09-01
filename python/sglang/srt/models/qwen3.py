@@ -9,6 +9,7 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import (
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
@@ -31,7 +32,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -39,6 +44,9 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.multiplex.pdmux_context import (
+    spec_pdmux_full_device_operator_region,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
@@ -55,6 +63,10 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
+_logged_full_device_draft_extend_gate_up = False
+
+_FULL_DEVICE_DRAFT_EXTEND_GATE_UP_INPUT_SHAPE = (128, 1024)
+_FULL_DEVICE_DRAFT_EXTEND_GATE_UP_WEIGHT_SHAPE = (6144, 1024)
 if _use_aiter:
     try:
         from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
@@ -604,6 +616,37 @@ def _qwen3_drafter_projection_or_linear(
 _qwen3_drafter_tma_or_linear = _qwen3_drafter_projection_or_linear
 
 
+def _use_full_device_draft_extend_gate_up(
+    activation: torch.Tensor,
+    linear: nn.Module,
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    """Fail-closed policy for the exact M=128 drafter gate-up projection."""
+    global _logged_full_device_draft_extend_gate_up
+    if not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP.get():
+        return False
+    if (
+        forward_batch is None
+        or forward_batch.forward_mode != ForwardMode.DRAFT_EXTEND_V2
+    ):
+        return False
+    if not activation.is_cuda or activation.dtype != torch.bfloat16:
+        return False
+    if tuple(activation.shape) != _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_INPUT_SHAPE:
+        return False
+    if not _Qwen3DrafterSM120KernelDispatch.supports_linear(linear):
+        return False
+    weight = linear.weight
+    eligible = tuple(weight.shape) == _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_WEIGHT_SHAPE
+    if eligible and not _logged_full_device_draft_extend_gate_up:
+        logger.info(
+            "Qwen3 drafter full-device draft-extend gate-up armed: exact "
+            "DRAFT_EXTEND_V2 M=128 K=1024 N=6144 BF16 TP1 path"
+        )
+        _logged_full_device_draft_extend_gate_up = True
+    return eligible
+
+
 class Qwen3MLP(Qwen2MLP):
     """Qwen3-local MLP with an optional per-instance projection-dispatch seam."""
 
@@ -632,14 +675,28 @@ class Qwen3MLP(Qwen2MLP):
     def set_drafter_tma_dispatch(self, dispatch: _Qwen3DrafterTmaDispatch) -> None:
         self.set_drafter_projection_dispatch(dispatch)
 
-    def _forward_gate_up(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_gate_up(
+        self, x: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+    ) -> torch.Tensor:
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
-        gate_up, _ = _qwen3_drafter_projection_or_linear(
-            self._drafter_projection_dispatch,
-            self.gate_up_proj,
-            x,
+        use_full_device = _use_full_device_draft_extend_gate_up(
+            x, self.gate_up_proj, forward_batch
         )
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_device_stream:
+            if full_device_stream is not None:
+                x.record_stream(full_device_stream)
+            gate_up, _ = _qwen3_drafter_projection_or_linear(
+                # The retained portfolio caches a 52-SM tactic. Bypass it in
+                # the wide region so target 0 can select the full-device tactic.
+                None if use_full_device else self._drafter_projection_dispatch,
+                self.gate_up_proj,
+                x,
+            )
+        if full_device_stream is not None:
+            gate_up.record_stream(torch.cuda.current_stream())
         return self.act_fn(gate_up)
 
     def forward(
@@ -647,7 +704,7 @@ class Qwen3MLP(Qwen2MLP):
         x: torch.Tensor,
         forward_batch: ForwardBatch = None,
     ) -> torch.Tensor:
-        x = self._forward_gate_up(x)
+        x = self._forward_gate_up(x, forward_batch)
         x, _ = _qwen3_drafter_projection_or_linear(
             self._drafter_projection_dispatch,
             self.down_proj,
