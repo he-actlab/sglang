@@ -46,6 +46,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.multiplex.pdmux_context import (
     spec_pdmux_full_device_operator_region,
+    spec_pdmux_qkv128_operator_region,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -64,9 +65,12 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
 _logged_full_device_draft_extend_gate_up = False
+_logged_dedicated_draft_extend_qkv128 = False
 
 _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_INPUT_SHAPE = (128, 1024)
 _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_WEIGHT_SHAPE = (6144, 1024)
+_DEDICATED_DRAFT_EXTEND_QKV128_INPUT_SHAPE = (128, 1024)
+_DEDICATED_DRAFT_EXTEND_QKV128_WEIGHT_SHAPE = (4096, 1024)
 if _use_aiter:
     try:
         from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
@@ -647,6 +651,36 @@ def _use_full_device_draft_extend_gate_up(
     return eligible
 
 
+def _use_dedicated_draft_extend_qkv128(
+    activation: torch.Tensor,
+    linear: nn.Module,
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    """Fail-closed policy for the exact M=128 drafter QKV projection."""
+    global _logged_dedicated_draft_extend_qkv128
+    if not envs.SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM.get():
+        return False
+    if (
+        forward_batch is None
+        or forward_batch.forward_mode != ForwardMode.DRAFT_EXTEND_V2
+    ):
+        return False
+    if not activation.is_cuda or activation.dtype != torch.bfloat16:
+        return False
+    if tuple(activation.shape) != _DEDICATED_DRAFT_EXTEND_QKV128_INPUT_SHAPE:
+        return False
+    if not _Qwen3DrafterSM120KernelDispatch.supports_linear(linear):
+        return False
+    eligible = tuple(linear.weight.shape) == _DEDICATED_DRAFT_EXTEND_QKV128_WEIGHT_SHAPE
+    if eligible and not _logged_dedicated_draft_extend_qkv128:
+        logger.info(
+            "Qwen3 drafter dedicated qkv128 stream armed: exact "
+            "DRAFT_EXTEND_V2 M=128 K=1024 N=4096 BF16 TP1 path"
+        )
+        _logged_dedicated_draft_extend_qkv128 = True
+    return eligible
+
+
 class Qwen3MLP(Qwen2MLP):
     """Qwen3-local MLP with an optional per-instance projection-dispatch seam."""
 
@@ -849,12 +883,22 @@ class Qwen3Attention(nn.Module):
     def set_drafter_tma_dispatch(self, dispatch: _Qwen3DrafterTmaDispatch) -> None:
         self.set_drafter_projection_dispatch(dispatch)
 
-    def forward_prepare_native(self, positions, hidden_states):
-        qkv, _ = _qwen3_drafter_projection_or_linear(
-            self._drafter_projection_dispatch,
-            self.qkv_proj,
-            hidden_states,
+    def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
+        use_qkv128_stream = _use_dedicated_draft_extend_qkv128(
+            hidden_states, self.qkv_proj, forward_batch
         )
+        with spec_pdmux_qkv128_operator_region(
+            use_qkv128_stream, source_partition="small"
+        ) as qkv128_stream:
+            if qkv128_stream is not None:
+                hidden_states.record_stream(qkv128_stream)
+            qkv, _ = _qwen3_drafter_projection_or_linear(
+                None if use_qkv128_stream else self._drafter_projection_dispatch,
+                self.qkv_proj,
+                hidden_states,
+            )
+        if qkv128_stream is not None:
+            qkv.record_stream(torch.cuda.current_stream())
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -974,6 +1018,7 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(

@@ -142,9 +142,7 @@ class FullDeviceGateUpPolicyTests(CustomTestCase):
     def setUp(self):
         self.activation = _FakeCudaTensor((128, 1024))
         self.linear = SimpleNamespace(weight=_FakeCudaTensor((6144, 1024)))
-        self.forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.DRAFT_EXTEND_V2
-        )
+        self.forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
 
     def _eligible(
         self,
@@ -188,16 +186,70 @@ class FullDeviceGateUpPolicyTests(CustomTestCase):
         )
 
     def test_other_shape_is_ineligible(self):
+        self.assertFalse(self._eligible(activation=_FakeCudaTensor((32, 1024))))
         self.assertFalse(
-            self._eligible(activation=_FakeCudaTensor((32, 1024)))
-        )
-        self.assertFalse(
-            self._eligible(
-                linear=SimpleNamespace(weight=_FakeCudaTensor((6144, 2048)))
-            )
+            self._eligible(linear=SimpleNamespace(weight=_FakeCudaTensor((6144, 2048))))
         )
 
     def test_unsupported_linear_is_ineligible(self):
+        self.assertFalse(self._eligible(supports_linear=False))
+
+
+class DedicatedQkv128PolicyTests(CustomTestCase):
+    def setUp(self):
+        self.activation = _FakeCudaTensor((128, 1024))
+        self.linear = SimpleNamespace(weight=_FakeCudaTensor((4096, 1024)))
+        self.forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+
+    def _eligible(
+        self,
+        *,
+        enabled=True,
+        activation=None,
+        linear=None,
+        forward_batch=None,
+        supports_linear=True,
+    ):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM": (
+                        "1" if enabled else "0"
+                    )
+                },
+                clear=False,
+            ),
+            patch.object(
+                qwen3._Qwen3DrafterSM120KernelDispatch,
+                "supports_linear",
+                return_value=supports_linear,
+            ),
+        ):
+            return qwen3._use_dedicated_draft_extend_qkv128(
+                activation if activation is not None else self.activation,
+                linear if linear is not None else self.linear,
+                forward_batch if forward_batch is not None else self.forward_batch,
+            )
+
+    def test_exact_qwen3_draft_extend_qkv128_is_eligible(self):
+        self.assertTrue(self._eligible())
+
+    def test_default_off_policy_is_inert(self):
+        self.assertFalse(self._eligible(enabled=False))
+
+    def test_other_forward_mode_is_ineligible(self):
+        self.assertFalse(
+            self._eligible(
+                forward_batch=SimpleNamespace(forward_mode=ForwardMode.DECODE)
+            )
+        )
+
+    def test_other_shape_or_unsupported_linear_is_ineligible(self):
+        self.assertFalse(self._eligible(activation=_FakeCudaTensor((32, 1024))))
+        self.assertFalse(
+            self._eligible(linear=SimpleNamespace(weight=_FakeCudaTensor((6144, 1024))))
+        )
         self.assertFalse(self._eligible(supports_linear=False))
 
 
@@ -259,6 +311,79 @@ class FullDeviceGateUpCallSiteTests(CustomTestCase):
         self.assertEqual(calls[2], ("output", source_stream))
 
 
+class DedicatedQkv128CallSiteTests(CustomTestCase):
+    def test_qkv128_path_bypasses_partition_tactic_and_records_lifetimes(self):
+        calls = []
+        source_stream = object()
+        qkv128_stream = object()
+        hidden_states = SimpleNamespace(
+            record_stream=lambda stream: calls.append(("input", stream))
+        )
+        q = object()
+        k = object()
+        v = object()
+
+        class QkvOutput:
+            def record_stream(self, stream):
+                calls.append(("output", stream))
+
+            def split(self, sizes, dim):
+                calls.append(("split", sizes, dim))
+                return q, k, v
+
+        output = QkvOutput()
+        attention = object.__new__(qwen3.Qwen3Attention)
+        attention._drafter_projection_dispatch = object()
+        attention.qkv_proj = object()
+        attention.q_size = 2
+        attention.kv_size = 1
+        attention.q_norm = object()
+        attention.k_norm = object()
+        attention.head_dim = 128
+        attention.alt_stream = None
+        attention.rotary_emb = lambda positions, q_value, k_value: (q_value, k_value)
+
+        @contextmanager
+        def region(enabled, *, source_partition):
+            self.assertTrue(enabled)
+            self.assertEqual(source_partition, "small")
+            yield qkv128_stream
+
+        def projection(dispatch, linear, tensor):
+            calls.append(("dispatch", dispatch, linear, tensor))
+            return output, None
+
+        with (
+            patch.object(
+                qwen3, "_use_dedicated_draft_extend_qkv128", return_value=True
+            ),
+            patch.object(
+                qwen3,
+                "spec_pdmux_qkv128_operator_region",
+                side_effect=region,
+            ),
+            patch.object(
+                qwen3,
+                "_qwen3_drafter_projection_or_linear",
+                side_effect=projection,
+            ),
+            patch.object(qwen3, "apply_qk_norm", return_value=(q, k)),
+            patch.object(
+                qwen3.torch.cuda, "current_stream", return_value=source_stream
+            ),
+        ):
+            result = attention.forward_prepare_native(
+                positions=object(),
+                hidden_states=hidden_states,
+                forward_batch=object(),
+            )
+
+        self.assertEqual(result, (q, k, v))
+        self.assertEqual(calls[0], ("input", qkv128_stream))
+        self.assertIsNone(calls[1][1])
+        self.assertEqual(calls[2], ("output", source_stream))
+
+
 class _FakeEvent:
     next_id = 0
 
@@ -290,6 +415,7 @@ class FullDeviceOperatorRegionTests(CustomTestCase):
         self.large = _FakeStream("large", self.calls)
         self.small = _FakeStream("small", self.calls)
         self.full = _FakeStream("full", self.calls)
+        self.qkv128 = _FakeStream("qkv128", self.calls)
 
     @contextmanager
     def _stream_context(self, stream):
@@ -360,6 +486,38 @@ class FullDeviceOperatorRegionTests(CustomTestCase):
                 ("hint-exit", 0),
                 ("record", 1, self.full),
                 ("stream-exit", "full"),
+                ("wait", "small", 1),
+            ],
+        )
+
+    def test_small_qkv128_small_event_chain_and_hint_restore(self):
+        patches = self._patches(self.small)
+        with (
+            patches[0],
+            patches[1],
+            patch.object(pdmux_context, "SPEC_QKV128_STREAM", self.qkv128),
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with pdmux_context.spec_pdmux_qkv128_operator_region(
+                True, source_partition="small"
+            ) as stream:
+                self.assertIs(stream, self.qkv128)
+                self.calls.append(("operator", stream.name))
+
+        self.assertEqual(
+            self.calls,
+            [
+                ("record", 0, self.small),
+                ("wait", "qkv128", 0),
+                ("stream-enter", "qkv128"),
+                ("hint-enter", 0),
+                ("operator", "qkv128"),
+                ("hint-exit", 0),
+                ("record", 1, self.qkv128),
+                ("stream-exit", "qkv128"),
                 ("wait", "small", 1),
             ],
         )

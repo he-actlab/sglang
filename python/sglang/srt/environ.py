@@ -838,6 +838,11 @@ class Envs:
     # owns the phase/shape/linear gate and bypasses the cached 52-SM tactic so
     # target 0 can select a full-device schedule. Experimental and default-off.
     SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP = EnvBool(False)
+    # Route only the exact Qwen3-0.6B TP1 BF16 M=128 draft-extend QKV
+    # projection through a dedicated plain CUDA stream. The 52-SM draft
+    # partition remains the source/destination; the stock 128-CTA QKV grid
+    # bounds effective occupancy on this fourth stream. Experimental/off.
+    SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

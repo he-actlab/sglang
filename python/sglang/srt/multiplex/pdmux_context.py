@@ -30,6 +30,10 @@ SPEC_SM_ALLOCATED_SPLIT: Optional[Tuple[int, int]] = None
 # It is not a green-ctx partition stream. Callers own the placement policy and
 # must fence their source partition around each use.
 SPEC_PREFILL_STREAM: Optional[torch.cuda.Stream] = None
+# A second plain CUDA escape lane used only by the exact draft-extend qkv128
+# route. It coexists with (and fences back to) the 52-SM drafter partition;
+# the stock qkv kernel's 128-CTA grid bounds its effective device occupancy.
+SPEC_QKV128_STREAM: Optional[torch.cuda.Stream] = None
 
 
 @dataclass
@@ -259,6 +263,7 @@ def initialize_spec_stream_pair(
     Idempotent: repeat calls (target + draft model runners share one process)
     return the existing pair, and must ask for the same split."""
     global SPEC_PREFILL_STREAM
+    global SPEC_QKV128_STREAM
     global SPEC_SM_ALLOCATED_SPLIT
     global SPEC_SM_SPLIT
     global SPEC_STREAM_PAIR
@@ -268,6 +273,8 @@ def initialize_spec_stream_pair(
                 f"spec-pdmux stream pair already initialized with split "
                 f"{SPEC_SM_SPLIT}, cannot re-initialize with {(large_sm, small_sm)}"
             )
+        if SPEC_QKV128_STREAM is None and _dedicated_qkv128_stream_enabled():
+            SPEC_QKV128_STREAM = torch.cuda.Stream(device=gpu_id)
         return SPEC_STREAM_PAIR
     from sgl_kernel import spatial
 
@@ -280,6 +287,8 @@ def initialize_spec_stream_pair(
     SPEC_SM_SPLIT = (large_sm, small_sm)
     SPEC_SM_ALLOCATED_SPLIT = (allocated_large, allocated_small)
     SPEC_PREFILL_STREAM = torch.cuda.Stream(device=gpu_id)
+    if _dedicated_qkv128_stream_enabled():
+        SPEC_QKV128_STREAM = torch.cuda.Stream(device=gpu_id)
     logger.info(
         "[spec-pdmux] green-ctx allocation requested=(%d,%d) "
         "allocated=(%d,%d) physical=%d gpu=%d",
@@ -323,6 +332,56 @@ def get_spec_full_device_stream() -> torch.cuda.Stream:
     stream.
     """
     return get_spec_prefill_stream()
+
+
+def _dedicated_qkv128_stream_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM.get()
+
+
+def get_spec_qkv128_stream() -> torch.cuda.Stream:
+    """The dedicated plain CUDA stream for the exact qkv128 route."""
+    if SPEC_QKV128_STREAM is None:
+        raise RuntimeError(
+            "spec-pdmux qkv128 stream not initialized "
+            "(enable its flag before initialize_spec_stream_pair)"
+        )
+    return SPEC_QKV128_STREAM
+
+
+@contextmanager
+def spec_pdmux_qkv128_operator_region(enabled: bool, *, source_partition: str):
+    """Run one exact qkv128 projection on its dedicated plain CUDA stream."""
+    if not enabled:
+        yield None
+        return
+    if source_partition not in ("large", "small"):
+        raise ValueError(
+            "source_partition must be 'large' or 'small', got " f"{source_partition!r}"
+        )
+
+    large_stream, small_stream = get_spec_streams()
+    source_stream = torch.cuda.current_stream()
+    expected_source = large_stream if source_partition == "large" else small_stream
+    if source_stream != expected_source:
+        raise RuntimeError(
+            "qkv128 operator region entered from the wrong stream: "
+            f"expected the {source_partition} spec-pdmux partition"
+        )
+
+    qkv128_stream = get_spec_qkv128_stream()
+    ready = torch.cuda.Event()
+    done = torch.cuda.Event()
+    ready.record(source_stream)
+    qkv128_stream.wait_event(ready)
+    with torch.cuda.stream(qkv128_stream):
+        try:
+            with cublas_sm_count_target(0):
+                yield qkv128_stream
+        finally:
+            done.record(qkv128_stream)
+    source_stream.wait_event(done)
 
 
 @contextmanager

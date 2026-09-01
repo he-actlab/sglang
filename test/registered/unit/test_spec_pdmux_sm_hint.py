@@ -123,6 +123,12 @@ class SpecPdmuxAllocationTests(CustomTestCase):
                 "Stream",
                 return_value="prefill-stream",
             ),
+            patch.object(pdmux_context, "SPEC_QKV128_STREAM", None),
+            patch.dict(
+                os.environ,
+                {"SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM": "0"},
+                clear=False,
+            ),
         ]
         self.mocks = [item.start() for item in patches]
         for item in patches:
@@ -135,6 +141,25 @@ class SpecPdmuxAllocationTests(CustomTestCase):
         self.assertEqual(pdmux_context.get_spec_sm_split(), (132, 56))
         self.assertEqual(pdmux_context.get_spec_sm_allocated_split(), (136, 52))
         self.mocks[4].assert_called_once_with(132, 56, 0)
+
+    def test_enabled_qkv128_route_creates_one_additional_plain_stream(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM": "1"},
+                clear=False,
+            ),
+            patch.object(
+                pdmux_context.torch.cuda,
+                "Stream",
+                side_effect=("prefill-stream", "qkv128-stream"),
+            ) as stream_mock,
+        ):
+            pdmux_context.initialize_spec_stream_pair(0, 132, 56)
+
+        self.assertEqual(pdmux_context.get_spec_qkv128_stream(), "qkv128-stream")
+        self.assertEqual(stream_mock.call_count, 2)
+        stream_mock.assert_any_call(device=0)
 
     def test_repeat_initialization_is_idempotent(self):
         first = pdmux_context.initialize_spec_stream_pair(0, 132, 56)
