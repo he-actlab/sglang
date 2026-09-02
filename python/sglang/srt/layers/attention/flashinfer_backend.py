@@ -75,6 +75,13 @@ def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
     return (max_bs + mul_base - 1) // mul_base * mul_base
 
 
+def _flashinfer_width_planning_enabled(width_mode: int, server_args) -> bool:
+    """Arm width-aware planning under either green-context placement mode."""
+    from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
+
+    return width_mode > 0 and spec_sm_partition_enabled(server_args)
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
@@ -943,8 +950,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.spec_pdmux_colocated_reserve = 0
         width_mode = envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get()
         if (
-            width_mode > 0
-            and self.enable_spec_pdmux
+            _flashinfer_width_planning_enabled(
+                width_mode, model_runner.server_args
+            )
             and self.prefill_backend == "fa2"
         ):
             armed = model_runner.is_draft_worker or width_mode >= 2

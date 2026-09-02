@@ -18,6 +18,9 @@ alone -- stays inert by construction rather than by remembering to negate it.
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.layers.attention.flashinfer_backend import (
+    _flashinfer_width_planning_enabled,
+)
 from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_utils import spec_pdmux_concurrent_enabled
@@ -49,6 +52,22 @@ class TestSpecSmPartitionPredicate(CustomTestCase):
 
     def test_on_for_partition_only_mode(self):
         self.assertTrue(spec_sm_partition_enabled(_args(enable_spec_sm_partition=True)))
+
+
+class TestFlashInferWidthPlanningPlacement(CustomTestCase):
+    """Width planning follows placement, not the co-location scheduler."""
+
+    def test_off_when_width_mode_is_zero(self):
+        args = _args(enable_spec_sm_partition=True)
+        self.assertFalse(_flashinfer_width_planning_enabled(0, args))
+
+    def test_on_for_colocated_mode(self):
+        args = _args(enable_spec_pdmux=True)
+        self.assertTrue(_flashinfer_width_planning_enabled(1, args))
+
+    def test_on_for_partition_only_mode(self):
+        args = _args(enable_spec_sm_partition=True)
+        self.assertTrue(_flashinfer_width_planning_enabled(1, args))
 
 
 class TestSpecSmPartitionControlIdentity(CustomTestCase):
