@@ -934,12 +934,16 @@ def _validate_stock_fullchip_runtime(
 def _validate_fixed52_runtime(
     model_runner, capture_bs: Sequence[int], num_tokens_per_bs: int
 ) -> Tuple[Dict[str, Any], Any]:
-    """Fail closed unless this is the workbook's immutable denominator."""
+    """Fail closed unless this is an exact supported partitioned arm."""
 
-    if not bool(model_runner.server_args.enable_spec_pdmux):
+    args = model_runner.server_args
+    enable_pdmux = bool(getattr(args, "enable_spec_pdmux", False))
+    enable_partition = bool(getattr(args, "enable_spec_sm_partition", False))
+    if not enable_pdmux and not enable_partition:
         return _validate_stock_fullchip_runtime(
             model_runner, capture_bs, num_tokens_per_bs
         )
+    flashinfer_hint = enable_partition and not enable_pdmux
 
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.multiplex.pdmux_context import (
@@ -948,7 +952,6 @@ def _validate_fixed52_runtime(
         get_spec_streams,
     )
 
-    args = model_runner.server_args
     hf_config = model_runner.model_config.hf_config
     allocated_split = get_spec_sm_allocated_split()
     requested_split = get_spec_sm_split()
@@ -975,7 +978,7 @@ def _validate_fixed52_runtime(
             f"draft model path={args.speculative_draft_model_path}",
         ),
         (
-            args.random_seed == 20260803,
+            args.random_seed == (20260902 if flashinfer_hint else 20260803),
             f"server random seed={args.random_seed}",
         ),
         (model_runner.spec_algorithm.is_standalone(), "algorithm is not STANDALONE"),
@@ -985,13 +988,22 @@ def _validate_fixed52_runtime(
             and model_runner.model_config.quantization is None,
             "requires unquantized BF16",
         ),
-        (bool(args.enable_spec_pdmux), "--enable-spec-pdmux is off"),
+        (
+            enable_pdmux != enable_partition,
+            "exactly one partition mode must be enabled",
+        ),
         (requested_split == (132, 56), f"requested split={requested_split}"),
         (allocated_split == (136, 52), f"allocated split={allocated_split}"),
-        (bool(envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()), "serialization is off"),
-        (int(args.spec_pdmux_slots) == 2, f"spec_pdmux_slots={args.spec_pdmux_slots}"),
         (
-            int(args.max_running_requests) == 64,
+            bool(envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()) == (not flashinfer_hint),
+            "serialization differs from selected arm",
+        ),
+        (
+            flashinfer_hint or int(args.spec_pdmux_slots) == 2,
+            f"spec_pdmux_slots={args.spec_pdmux_slots}",
+        ),
+        (
+            int(args.max_running_requests) == (32 if flashinfer_hint else 64),
             f"max_running_requests={args.max_running_requests}",
         ),
         (not bool(args.disable_radix_cache), "radix cache is disabled"),
@@ -1014,7 +1026,8 @@ def _validate_fixed52_runtime(
             f"decode graph backend={args.cuda_graph_config.decode.backend}",
         ),
         (
-            int(args.cuda_graph_config.decode.max_bs) == 64,
+            int(args.cuda_graph_config.decode.max_bs)
+            == (32 if flashinfer_hint else 64),
             f"decode graph max_bs={args.cuda_graph_config.decode.max_bs}",
         ),
         (
@@ -1035,8 +1048,29 @@ def _validate_fixed52_runtime(
             "drafter TMA must remain off for the S2 denominator",
         ),
         (
-            envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get() == 2,
-            "FlashInfer prefill width mode is not 2",
+            not flashinfer_hint
+            or envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get(),
+            "SM120 draft kernels are off",
+        ),
+        (
+            not flashinfer_hint
+            or envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get(),
+            "draft-extend GEMM integration is off",
+        ),
+        (
+            not flashinfer_hint
+            or not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.get(),
+            "full-device LM head is on",
+        ),
+        (
+            not flashinfer_hint
+            or not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP.get(),
+            "full-device gate-up is on",
+        ),
+        (
+            envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get()
+            == (1 if flashinfer_hint else 2),
+            "FlashInfer prefill width mode differs from selected arm",
         ),
         (
             envs.SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH.get() == 0,
@@ -1061,11 +1095,12 @@ def _validate_fixed52_runtime(
     failures = [reason for passed, reason in checks if not passed]
     if failures:
         raise RuntimeError(
-            "draft-extend surface probe only supports the immutable fixed-52 "
-            f"S2 denominator: {'; '.join(failures)}"
+            "draft-extend surface probe rejects the selected partitioned arm: "
+            f"{'; '.join(failures)}"
         )
 
     identity = {
+        "placement": "flashinfer-hint" if flashinfer_hint else "fixed52",
         "model_architecture": hf_config.architectures[0],
         "model_path": str(args.speculative_draft_model_path),
         "target_model_path": str(args.model_path),
@@ -1078,8 +1113,8 @@ def _validate_fixed52_runtime(
         "compute_capability": [12, 0],
         "requested_sm_split": list(requested_split),
         "allocated_sm_split": list(allocated_split),
-        "serialized": True,
-        "slots": int(args.spec_pdmux_slots),
+        "serialized": not flashinfer_hint,
+        "slots": None if flashinfer_hint else int(args.spec_pdmux_slots),
         "concurrency": int(args.max_running_requests),
         "speculative_num_steps": int(args.speculative_num_steps),
         "speculative_topk": int(args.speculative_eagle_topk),
@@ -1093,6 +1128,12 @@ def _validate_fixed52_runtime(
         "drafter_cublaslt_portfolio": True,
         "verifier_cublaslt_portfolio": True,
         "drafter_tma": False,
+        "drafter_sm120_kernel_optimized": bool(
+            envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get()
+        ),
+        "draft_extend_gemm_integration": bool(
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
+        ),
         "flashinfer_prefill_width_mode": int(
             envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get()
         ),

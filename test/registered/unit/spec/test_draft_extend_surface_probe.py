@@ -741,7 +741,99 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertIsNone(stream)
 
             args.enable_spec_sm_partition = True
-            with self.assertRaisesRegex(RuntimeError, "enable-spec-sm-partition"):
+            with self.assertRaisesRegex(RuntimeError, "selected partitioned arm"):
+                probe_module._validate_fixed52_runtime(runner, [32], 4)
+
+    def test_flashinfer_hint_validation_accepts_exact_sequential_partition(self):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        args = SimpleNamespace(
+            model_path="Qwen/Qwen3-8B",
+            speculative_draft_model_path="Qwen/Qwen3-0.6B",
+            random_seed=20260902,
+            enable_spec_pdmux=False,
+            enable_spec_sm_partition=True,
+            spec_pdmux_slots=2,
+            max_running_requests=32,
+            disable_radix_cache=False,
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(backend=Backend.FULL, max_bs=32)
+            ),
+            get_attention_backends=lambda: ("flashinfer", "flashinfer"),
+        )
+        hf_config = SimpleNamespace(
+            architectures=["Qwen3ForCausalLM"],
+            hidden_size=1024,
+            intermediate_size=3072,
+            num_hidden_layers=28,
+            vocab_size=151936,
+            tie_word_embeddings=True,
+        )
+        runner = SimpleNamespace(
+            server_args=args,
+            model_config=SimpleNamespace(hf_config=hf_config, quantization=None),
+            gpu_id=0,
+            is_draft_worker=True,
+            device="cuda:0",
+            spec_algorithm=SimpleNamespace(is_standalone=lambda: True),
+            tp_size=1,
+            pp_size=1,
+            dtype=torch.bfloat16,
+        )
+        properties = SimpleNamespace(
+            name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            uuid="GPU-unit",
+            multi_processor_count=188,
+        )
+        with (
+            envs.SGLANG_SPEC_PDMUX_SERIALIZE.override(False),
+            envs.SGLANG_SPEC_PDMUX_SM_HINT.override(2),
+            envs.SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO.override(True),
+            envs.SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO.override(True),
+            envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.override(False),
+            envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.override(True),
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
+            envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.override(False),
+            envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP.override(False),
+            envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.override(1),
+            envs.SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH.override(0),
+            patch.object(
+                probe_module.torch.cuda, "get_device_capability", return_value=(12, 0)
+            ),
+            patch.object(
+                probe_module.torch.cuda,
+                "get_device_properties",
+                return_value=properties,
+            ),
+            patch(
+                "sglang.srt.multiplex.pdmux_context.get_spec_sm_allocated_split",
+                return_value=(136, 52),
+            ),
+            patch(
+                "sglang.srt.multiplex.pdmux_context.get_spec_sm_split",
+                return_value=(132, 56),
+            ),
+            patch(
+                "sglang.srt.multiplex.pdmux_context.get_spec_streams",
+                return_value=(object(), "small-stream"),
+            ),
+        ):
+            identity, stream = probe_module._validate_fixed52_runtime(
+                runner, [1, 2, 4, 8, 16, 32], 4
+            )
+            self.assertEqual(identity["placement"], "flashinfer-hint")
+            self.assertFalse(identity["serialized"])
+            self.assertIsNone(identity["slots"])
+            self.assertEqual(identity["flashinfer_prefill_width_mode"], 1)
+            self.assertTrue(identity["drafter_sm120_kernel_optimized"])
+            self.assertTrue(identity["draft_extend_gemm_integration"])
+            self.assertEqual(stream, "small-stream")
+
+            args.random_seed = 1
+            with self.assertRaisesRegex(RuntimeError, "server random seed"):
                 probe_module._validate_fixed52_runtime(runner, [32], 4)
 
 
