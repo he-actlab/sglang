@@ -49,6 +49,22 @@ def test_drafter_sm120_bf16_down128_compiles_and_loads() -> None:
 
 
 @pytest.mark.skipif(not _sm120_available(), reason="SM120 is required")
+def test_drafter_sm120_bf16_down128_accepts_production_workspace() -> None:
+    stream = _small_stream()
+    device = torch.device("cuda", torch.cuda.current_device())
+    activation = torch.zeros((M, K), dtype=torch.bfloat16, device=device)
+    weight = torch.zeros((N, K), dtype=torch.bfloat16, device=device)
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    with torch.cuda.stream(stream):
+        drafter_sm120_bf16_down128_splitk3(
+            CONFIGS[0], output, activation, weight, workspace
+        )
+    stream.synchronize()
+    assert torch.count_nonzero(output) == 0
+
+
+@pytest.mark.skipif(not _sm120_available(), reason="SM120 is required")
 @pytest.mark.parametrize("config", CONFIGS)
 @pytest.mark.parametrize("seed", _CORRECTNESS_SEEDS)
 def test_drafter_sm120_bf16_down128_correctness(seed: int, config: str) -> None:

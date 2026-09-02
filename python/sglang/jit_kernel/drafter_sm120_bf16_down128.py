@@ -105,7 +105,6 @@ def _validate(
         (activation, "activation", (M, K), torch.bfloat16),
         (weight, "weight", (N, K), torch.bfloat16),
         (output, "output", (M, N), torch.bfloat16),
-        (workspace, "workspace", (WORKSPACE_BYTES,), torch.uint8),
     ]
     if residual is not None and norm_weight is not None:
         tensors.extend(
@@ -116,6 +115,19 @@ def _validate(
         )
     for tensor, name, shape, dtype in tensors:
         _validate_tensor(tensor, name=name, shape=shape, dtype=dtype, device=device)
+    if workspace.ndim != 1 or workspace.numel() < WORKSPACE_BYTES:
+        raise ValueError(
+            f"workspace must contain at least {WORKSPACE_BYTES} bytes, "
+            f"got shape {tuple(workspace.shape)}"
+        )
+    if workspace.dtype != torch.uint8:
+        raise TypeError(f"workspace must have dtype torch.uint8, got {workspace.dtype}")
+    if workspace.device != device:
+        raise ValueError(f"workspace must be on {device}, got {workspace.device}")
+    if not workspace.is_contiguous():
+        raise ValueError("workspace must be contiguous")
+    if workspace.data_ptr() % 16:
+        raise ValueError("workspace must be 16-byte aligned")
 
 
 def drafter_sm120_bf16_down128_splitk3(
