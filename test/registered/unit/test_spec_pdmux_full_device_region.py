@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     _use_full_device_draft_extend_lm_head,
 )
@@ -79,6 +80,10 @@ class FullDeviceLmHeadPolicyTests(CustomTestCase):
 
     def test_default_off_policy_is_inert(self):
         self.assertFalse(self._eligible(enabled=False))
+
+    def test_composite_gemm_switch_enables_policy(self):
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
+            self.assertTrue(self._eligible(enabled=False))
 
     def test_other_forward_mode_is_ineligible(self):
         metadata = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
@@ -178,6 +183,10 @@ class FullDeviceGateUpPolicyTests(CustomTestCase):
     def test_default_off_policy_is_inert(self):
         self.assertFalse(self._eligible(enabled=False))
 
+    def test_composite_gemm_switch_enables_policy(self):
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
+            self.assertTrue(self._eligible(enabled=False))
+
     def test_other_forward_mode_is_ineligible(self):
         self.assertFalse(
             self._eligible(
@@ -237,6 +246,10 @@ class DedicatedQkv128PolicyTests(CustomTestCase):
 
     def test_default_off_policy_is_inert(self):
         self.assertFalse(self._eligible(enabled=False))
+
+    def test_composite_gemm_switch_enables_policy(self):
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
+            self.assertTrue(self._eligible(enabled=False))
 
     def test_other_forward_mode_is_ineligible(self):
         self.assertFalse(

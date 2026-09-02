@@ -97,7 +97,10 @@ def _use_full_device_draft_extend_lm_head(
 ) -> bool:
     """Fail-closed policy for the one LM head proven to benefit from width."""
     global _logged_full_device_draft_extend_lm_head
-    if not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.get():
+    if not (
+        envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.get()
+        or envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
+    ):
         return False
     if logits_metadata.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
         return False

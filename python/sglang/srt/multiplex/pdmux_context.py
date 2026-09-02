@@ -337,7 +337,10 @@ def get_spec_full_device_stream() -> torch.cuda.Stream:
 def _dedicated_qkv128_stream_enabled() -> bool:
     from sglang.srt.environ import envs
 
-    return envs.SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM.get()
+    return bool(
+        envs.SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM.get()
+        or envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
+    )
 
 
 def get_spec_qkv128_stream() -> torch.cuda.Stream:

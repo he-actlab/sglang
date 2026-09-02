@@ -748,6 +748,11 @@ class Envs:
     # shapes retain the installed cuBLASLt portfolio or production linear.
     # Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED = EnvBool(False)
+    # Exact Qwen3-0.6B TP1 BF16 M=128 draft-extend five-GEMM evaluation:
+    # dedicated qkv128 stream, fused out128/down128 residual-norm boundaries,
+    # full-device gate-up128, and full-device LM head. Requires the retained
+    # sequential 136,52 SM120 draft stack and is default-off.
+    SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION = EnvBool(False)
     # Portable per-GPU cuBLASLt autotuning for exact Qwen3-0.6B TP1 BF16
     # projections. Before graph capture, each worker correctness-checks and
     # times top-N candidates at target 0 and its realized SMALL width against

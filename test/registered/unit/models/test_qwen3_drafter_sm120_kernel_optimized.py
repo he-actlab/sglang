@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.models.qwen3 import _Qwen3DrafterSM120KernelDispatch
+from sglang.srt.models.qwen3 import (
+    _Qwen3DrafterExtendGemmIntegrationDispatch,
+    _Qwen3DrafterSM120KernelDispatch,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,6 +59,54 @@ class Qwen3DrafterSM120DispatchTests(CustomTestCase):
         dispatch._gate.assert_not_called()
 
 
+class Qwen3DraftExtendGemmDispatchTests(CustomTestCase):
+    @staticmethod
+    def _dispatch():
+        dispatch = object.__new__(_Qwen3DrafterExtendGemmIntegrationDispatch)
+        dispatch._workspace = object()
+        dispatch._out = Mock(side_effect=lambda output, *_: output.fill_(3))
+        dispatch._down = Mock(side_effect=lambda _, output, *__: output.fill_(4))
+        dispatch.supports_linear = Mock(return_value=True)
+        dispatch._activation_matches = Mock(return_value=True)
+        dispatch._boundary_matches = Mock(return_value=True)
+        return dispatch
+
+    def test_exact_out_and_down_boundaries_select_retained_kernels(self):
+        dispatch = self._dispatch()
+        activation = torch.empty((128, 2048), dtype=torch.bfloat16)
+        residual = torch.empty((128, 1024), dtype=torch.bfloat16)
+        norm = SimpleNamespace(weight=object(), variance_epsilon=1e-6)
+
+        out, out_residual = dispatch.fused_out_to_mlp_norm(
+            SimpleNamespace(weight=object()), activation, residual, norm
+        )
+        down, down_residual = dispatch.fused_down_to_next_norm(
+            SimpleNamespace(weight=object()),
+            torch.empty((128, 3072), dtype=torch.bfloat16),
+            residual,
+            norm,
+        )
+
+        self.assertTrue(torch.all(out == 3))
+        self.assertTrue(torch.all(down == 4))
+        self.assertIs(out_residual, residual)
+        self.assertIs(down_residual, residual)
+        dispatch._out.assert_called_once()
+        dispatch._down.assert_called_once()
+
+    def test_boundary_contract_fails_closed(self):
+        dispatch = self._dispatch()
+        dispatch._boundary_matches.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "exact contract"):
+            dispatch.fused_out_to_mlp_norm(
+                SimpleNamespace(weight=object()),
+                torch.empty((128, 2048), dtype=torch.bfloat16),
+                torch.empty((128, 1024), dtype=torch.bfloat16),
+                SimpleNamespace(weight=object(), variance_epsilon=1e-6),
+            )
+        dispatch._out.assert_not_called()
+
+
 class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
     @staticmethod
     def _runner(*, draft: bool = True) -> ModelRunner:
@@ -77,7 +128,8 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
         )
         runner.spec_algorithm = SimpleNamespace(is_standalone=lambda: True)
         runner.model = SimpleNamespace(
-            enable_qwen3_drafter_sm120_kernel_optimized=Mock(return_value=True)
+            enable_qwen3_drafter_sm120_kernel_optimized=Mock(return_value=True),
+            enable_qwen3_draft_extend_gemm_integration=Mock(return_value=True),
         )
         return runner
 
@@ -156,3 +208,33 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
                     runner._maybe_enable_qwen3_drafter_sm120_kernel_optimized()
                 )
             runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_not_called()
+
+    def test_draft_extend_gemm_switch_is_default_off(self):
+        self.assertIs(
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.default,
+            False,
+        )
+
+    def test_exact_draft_extend_gemm_regime_enables(self):
+        runner = self._runner()
+        with (
+            self._exact_context(),
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
+        ):
+            self.assertTrue(
+                runner._maybe_enable_qwen3_draft_extend_gemm_integration()
+            )
+        runner.model.enable_qwen3_draft_extend_gemm_integration.assert_called_once_with(
+            0
+        )
+
+    def test_draft_extend_gemm_target_worker_is_untouched(self):
+        runner = self._runner(draft=False)
+        with (
+            self._exact_context(),
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
+        ):
+            self.assertFalse(
+                runner._maybe_enable_qwen3_draft_extend_gemm_integration()
+            )
+        runner.model.enable_qwen3_draft_extend_gemm_integration.assert_not_called()
