@@ -1843,17 +1843,30 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.use_draft_extend_short_q_attention
                     and forward_batch.forward_mode.is_draft_extend_v2()
                 ):
-                    if (
-                        not causal
-                        or logits_soft_cap != 0
-                        or layer.sliding_window_size not in (None, -1)
-                        or layer.k_scale_float != 1.0
-                        or layer.v_scale_float != 1.0
-                        or tuple(q_view.shape[1:]) != (16, 128)
-                    ):
+                    call_errors = []
+                    if not causal:
+                        call_errors.append("causal=false")
+                    if logits_soft_cap != 0:
+                        call_errors.append(f"logits_soft_cap={logits_soft_cap}")
+                    if layer.sliding_window_size not in (None, -1):
+                        call_errors.append(
+                            f"sliding_window_size={layer.sliding_window_size}"
+                        )
+                    # Unquantized RadixAttention leaves these sentinels unset;
+                    # KV-cache quantization installs an explicit scale instead.
+                    if layer.k_scale_float not in (None, 1.0):
+                        call_errors.append(f"k_scale={layer.k_scale_float}")
+                    if layer.v_scale_float not in (None, 1.0):
+                        call_errors.append(f"v_scale={layer.v_scale_float}")
+                    if q_view.dtype != torch.bfloat16:
+                        call_errors.append(f"q_dtype={q_view.dtype}")
+                    if tuple(q_view.shape[1:]) != (16, 128):
+                        call_errors.append(f"q_shape={tuple(q_view.shape)}")
+                    if call_errors:
                         raise RuntimeError(
                             "draft-extend short-Q attention call left its exact "
-                            "causal/no-window/no-soft-cap/BF16 Qwen3 contract"
+                            "causal/no-window/no-soft-cap/BF16 Qwen3 contract: "
+                            + "; ".join(call_errors)
                         )
                     from sglang.jit_kernel.draft_extend_short_q_attention import (
                         draft_extend_short_q_attention,
