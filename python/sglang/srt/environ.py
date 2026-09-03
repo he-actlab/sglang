@@ -796,6 +796,15 @@ class Envs:
     SGLANG_DRAFT_EXTEND_FLASHINFER_NUM_COLOCATED_CTAS = EnvInt(-1)
     SGLANG_DRAFT_EXTEND_FLASHINFER_FIXED_SPLIT_SIZE = EnvInt(0)
     SGLANG_DRAFT_EXTEND_FLASHINFER_DISABLE_SPLIT_KV = EnvBool(False)
+    # Tile-16 control for the short-query attention experiment. This uses the
+    # existing FA2 tile-16 instantiation and is legal only with the exact
+    # fixed-Q4 graph plus the no-split planner control. Default-off.
+    SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16 = EnvBool(False)
+    # Exact Qwen3-0.6B draft-extend attention experiment: replace FA2s
+    # graph-selected Q-tile-128 kernel with the in-tree Q4/GQA2 N=8
+    # tensor-core specialization. The path is BF16/NHD/page-size-1/SM120/TP1
+    # only and rejects any configuration outside that contract. Default-off.
+    SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION = EnvBool(False)
     # Design-FlashInferDecodeWidth (TODO-47): give the fa2 CUDA-cores decode
     # planner the realized green-context SM width via the fork-vendored
     # plan-only module (sm_count_override). The stock decode plan has no

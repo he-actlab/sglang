@@ -588,6 +588,23 @@ def fast_prefill_plan(
         effective_num_colocated_ctas,
         diagnostic_override,
     ) = _effective_prefill_plan_controls(self, fixed_split_size, disable_split_kv)
+    force_q_tile_16 = bool(getattr(self, "_sglang_draft_extend_force_q_tile_16", False))
+    planner_enable_cuda_graph = self.is_cuda_graph_enabled
+    if force_q_tile_16:
+        if not effective_disable_split_kv:
+            raise RuntimeError("forced FA2 Q tile 16 requires disable_split_kv")
+        packed_max_q_len = max_q_len * num_qo_heads // num_kv_heads
+        if packed_max_q_len <= 0 or packed_max_q_len > 16:
+            raise RuntimeError(
+                "forced FA2 Q tile 16 requires packed max Q length in [1,16], "
+                f"got {packed_max_q_len}"
+            )
+        # The stock CUDA-graph planner chooses its tile from a conservative
+        # one-request upper bound. With split-KV disabled and fixed Q4/GQA2,
+        # the eager planning law has a fixed 32-CTA graph and selects the
+        # already-compiled tile-16 kernel. The wrapper still owns graph-stable
+        # device buffers; only the planner padding mode is changed.
+        planner_enable_cuda_graph = False
 
     args = [
         self._float_workspace_buffer,
@@ -601,7 +618,7 @@ def fast_prefill_plan(
         num_qo_heads,
         num_kv_heads,
         page_size,
-        self.is_cuda_graph_enabled,
+        planner_enable_cuda_graph,
         head_dim_qk,
         head_dim_vo,
         causal,
@@ -611,6 +628,16 @@ def fast_prefill_plan(
         effective_num_colocated_ctas,
     ]
     self._plan_info = self._cached_module.plan(*args)
+    if force_q_tile_16 and (
+        int(self._plan_info[3]) != 16
+        or bool(self._plan_info[13])
+        or bool(self._plan_info[14])
+    ):
+        raise RuntimeError(
+            "forced FA2 Q tile 16 planner identity changed: "
+            f"cta_tile_q={self._plan_info[3]} "
+            f"enable_cuda_graph={self._plan_info[13]} split_kv={self._plan_info[14]}"
+        )
     if diagnostic_override is not None:
         _record_draft_extend_prefill_plan_metadata(self, diagnostic_override)
 
@@ -641,9 +668,9 @@ class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
             return result
         from flashinfer.page import get_seq_lens
 
-        bound = inspect.signature(
-            BatchPrefillWithPagedKVCacheWrapper.plan
-        ).bind(self, *args, **kwargs)
+        bound = inspect.signature(BatchPrefillWithPagedKVCacheWrapper.plan).bind(
+            self, *args, **kwargs
+        )
         bound.apply_defaults()
         p = bound.arguments
         qo_indptr_host = p["qo_indptr"].to("cpu")
@@ -682,9 +709,7 @@ class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
             qo_indptr_host=qo_indptr_host,
             kv_indptr_host=kv_indptr_host,
             kv_lens_host=kv_lens_host,
-            max_q_len=int(
-                (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
-            ),
+            max_q_len=int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()),
             max_kv_len=int(kv_lens_host.max().item()),
         )
         return result
@@ -801,6 +826,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.enable_mis = model_runner.server_args.enable_mis
         # spec-pdmux M2.6: gates the sync-free TARGET_VERIFY fast plan install.
         self.enable_spec_pdmux = model_runner.server_args.enable_spec_pdmux
+        self.use_draft_extend_short_q_attention = False
+        self.draft_extend_force_q_tile_16 = False
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -952,9 +979,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.spec_pdmux_colocated_reserve = 0
         width_mode = envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get()
         if (
-            _flashinfer_width_planning_enabled(
-                width_mode, model_runner.server_args
-            )
+            _flashinfer_width_planning_enabled(width_mode, model_runner.server_args)
             and self.prefill_backend == "fa2"
         ):
             armed = model_runner.is_draft_worker or width_mode >= 2
@@ -964,17 +989,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
             allocated = get_spec_sm_allocated_split()
             if armed and allocated is not None:
-                width = (
-                    allocated[1]
-                    if model_runner.is_draft_worker
-                    else allocated[0]
-                )
+                width = allocated[1] if model_runner.is_draft_worker else allocated[0]
                 device_sms = torch.cuda.get_device_properties(
                     model_runner.gpu_id
                 ).multi_processor_count
-                self.spec_pdmux_colocated_reserve = max(
-                    0, 2 * (device_sms - width)
-                )
+                self.spec_pdmux_colocated_reserve = max(0, 2 * (device_sms - width))
                 logger.info(
                     "FlashInfer width reserve armed: worker=%s allocated "
                     "width=%d device SMs=%d num_colocated_ctas=%d "
@@ -1022,6 +1041,120 @@ class FlashInferAttnBackend(AttentionBackend):
                 controls.num_colocated_ctas,
                 controls.fixed_split_size,
                 controls.disable_split_kv,
+            )
+
+        if envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16.get():
+            if self.draft_extend_prefill_plan_override is None:
+                raise ValueError(
+                    "forced FA2 Q tile 16 requires "
+                    "SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE=1"
+                )
+            if not self.draft_extend_prefill_plan_override.disable_split_kv:
+                raise ValueError(
+                    "forced FA2 Q tile 16 requires "
+                    "SGLANG_DRAFT_EXTEND_FLASHINFER_DISABLE_SPLIT_KV=1"
+                )
+            spec = model_runner.server_args
+            if (
+                not model_runner.is_draft_worker
+                or spec.speculative_num_draft_tokens != 4
+                or model_runner.model_config.num_attention_heads
+                // model_runner.model_config.get_num_kv_heads(1)
+                != 2
+            ):
+                raise ValueError("forced FA2 Q tile 16 is restricted to draft Q4/GQA2")
+            self.draft_extend_force_q_tile_16 = True
+            logger.info(
+                "FlashInfer draft-extend Q-tile-16 control armed: fixed Q4/GQA2, "
+                "no split-KV, graph-stable 32-CTA schedule"
+            )
+
+        if envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get():
+            from sglang.srt.multiplex.pdmux_context import (
+                get_spec_sm_allocated_split,
+                spec_sm_partition_enabled,
+            )
+
+            config = model_runner.model_config
+            signature = (
+                getattr(config, "model_type", None),
+                getattr(config, "hidden_size", None),
+                getattr(config, "intermediate_size", None),
+                getattr(config, "num_hidden_layers", None),
+                getattr(config, "num_attention_heads", None),
+                getattr(config, "num_key_value_heads", None),
+                getattr(config, "vocab_size", None),
+            )
+            expected_signature = ("qwen3", 1024, 3072, 28, 16, 8, 151936)
+            errors = []
+            if not model_runner.is_draft_worker:
+                errors.append("worker is not the drafter")
+            if model_runner.device != "cuda":
+                errors.append(f"device={model_runner.device}")
+            elif torch.cuda.get_device_capability(model_runner.gpu_id) != (12, 0):
+                errors.append(
+                    "compute capability="
+                    f"{torch.cuda.get_device_capability(model_runner.gpu_id)}"
+                )
+            if signature != expected_signature:
+                errors.append(f"model signature={signature}")
+            if get_parallel().attn_tp_size != 1:
+                errors.append(f"attention TP={get_parallel().attn_tp_size}")
+            if model_runner.kv_cache_dtype != torch.bfloat16:
+                errors.append(f"KV dtype={model_runner.kv_cache_dtype}")
+            if getattr(model_runner, "dtype", None) != torch.bfloat16:
+                errors.append(f"model dtype={getattr(model_runner, 'dtype', None)}")
+            if getattr(config, "quantization", None) is not None:
+                errors.append(f"quantization={config.quantization}")
+            if self.prefill_backend != "fa2" or self.dispatch_reason is not None:
+                errors.append(
+                    f"prefill backend/dispatch={self.prefill_backend}/{self.dispatch_reason}"
+                )
+            if not spec_sm_partition_enabled(model_runner.server_args):
+                errors.append("Green Context placement is disabled")
+            if get_spec_sm_allocated_split() != (136, 52):
+                errors.append(f"allocated SM split={get_spec_sm_allocated_split()}")
+            pool = self.token_to_kv_pool
+            if getattr(pool, "page_size", None) != 1:
+                errors.append(f"KV page size={getattr(pool, 'page_size', None)}")
+            if getattr(pool, "kv_cache_layout", None) != "nhd":
+                errors.append(
+                    f"KV cache layout={getattr(pool, 'kv_cache_layout', None)}"
+                )
+            if (
+                getattr(pool, "head_num", None),
+                getattr(pool, "head_dim", None),
+                getattr(pool, "v_head_dim", None),
+            ) != (8, 128, 128):
+                errors.append(
+                    "KV pool shape="
+                    f"{(getattr(pool, 'head_num', None), getattr(pool, 'head_dim', None), getattr(pool, 'v_head_dim', None))}"
+                )
+            frozen_spec = (
+                model_runner.server_args.speculative_num_steps,
+                model_runner.server_args.speculative_eagle_topk,
+                model_runner.server_args.speculative_num_draft_tokens,
+            )
+            if frozen_spec != (3, 1, 4):
+                errors.append(f"speculative knobs={frozen_spec}")
+            if errors:
+                raise ValueError(
+                    "draft-extend short-Q attention left its exact experimental "
+                    "contract: " + "; ".join(errors)
+                )
+
+            # Compile before CUDA-graph capture; compiling lazily from the first
+            # forward would put host JIT work inside the capture path.
+            from sglang.jit_kernel.draft_extend_short_q_attention import (
+                _jit_draft_extend_short_q_attention_module,
+            )
+
+            with torch.cuda.device(model_runner.gpu_id):
+                _jit_draft_extend_short_q_attention_module()
+            self.use_draft_extend_short_q_attention = True
+            logger.info(
+                "Qwen3 draft-extend exact-N8 tensor-core attention armed: "
+                "Q4/GQA2 BF16 NHD page-size-1 on the 52-SM draft stream"
             )
 
         # Design-FlashInferDecodeWidth (TODO-47): sm_count_override for the
@@ -1550,9 +1683,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
         if self.spec_pdmux_decode_sm_width > 0:
             for wrapper in wrappers:
-                wrapper._spec_pdmux_decode_sm_width = (
-                    self.spec_pdmux_decode_sm_width
-                )
+                wrapper._spec_pdmux_decode_sm_width = self.spec_pdmux_decode_sm_width
         return wrappers
 
     def _create_prefill_wrappers(
@@ -1609,6 +1740,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     wrapper._sglang_draft_extend_prefill_plan_override = (
                         diagnostic_override
                     )
+                if draft_extend and self.draft_extend_force_q_tile_16:
+                    wrapper._sglang_draft_extend_force_q_tile_16 = True
             wrappers.append(wrapper)
         return wrappers
 
@@ -1698,30 +1831,71 @@ class FlashInferAttnBackend(AttentionBackend):
             # prefill attention program and any split/merge companions it
             # launches under the selected FlashInfer plan.
             with draft_extend_attention_scope(q, layer):
-                o = prefill_wrapper_paged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    # Disable sliding window attention for multi-item scoring:
-                    # - Sliding window could cut across item boundaries, breaking semantic coherence
-                    # - Multi-item sequences need full attention to properly handle delimiter tokens
-                    # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                    #   provide more precise attention control than simple sliding windows
-                    # - Item-aware masking takes precedence over window-based masking
-                    window_left=(
-                        layer.sliding_window_size
-                        if not (
-                            self.forward_metadata.multi_item_params
-                            and self.forward_metadata.multi_item_params.is_enabled()
+                q_view = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                if (
+                    self.use_draft_extend_short_q_attention
+                    and forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    if (
+                        not causal
+                        or logits_soft_cap != 0
+                        or layer.sliding_window_size not in (None, -1)
+                        or layer.k_scale_float != 1.0
+                        or layer.v_scale_float != 1.0
+                        or tuple(q_view.shape[1:]) != (16, 128)
+                    ):
+                        raise RuntimeError(
+                            "draft-extend short-Q attention call left its exact "
+                            "causal/no-window/no-soft-cap/BF16 Qwen3 contract"
                         )
-                        else -1
-                    ),
-                    logits_soft_cap=logits_soft_cap,
-                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                    k_scale=layer.k_scale_float,
-                    v_scale=layer.v_scale_float,
-                )
+                    from sglang.jit_kernel.draft_extend_short_q_attention import (
+                        draft_extend_short_q_attention,
+                    )
+
+                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    o = torch.empty_like(q_view)
+                    lse = torch.empty(
+                        q_view.shape[:2], dtype=torch.float32, device=q_view.device
+                    )
+                    draft_extend_short_q_attention(
+                        o,
+                        lse,
+                        q_view,
+                        k_cache,
+                        v_cache,
+                        prefill_wrapper_paged._qo_indptr_buf,
+                        prefill_wrapper_paged._paged_kv_indptr_buf,
+                        prefill_wrapper_paged._paged_kv_indices_buf,
+                        prefill_wrapper_paged._paged_kv_last_page_len_buf,
+                        layer.scaling,
+                    )
+                else:
+                    o = prefill_wrapper_paged.forward(
+                        q_view,
+                        self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        # Disable sliding window attention for multi-item scoring:
+                        # - Sliding window could cut across item boundaries, breaking semantic coherence
+                        # - Multi-item sequences need full attention to properly handle delimiter tokens
+                        # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                        #   provide more precise attention control than simple sliding windows
+                        # - Item-aware masking takes precedence over window-based masking
+                        window_left=(
+                            layer.sliding_window_size
+                            if not (
+                                self.forward_metadata.multi_item_params
+                                and self.forward_metadata.multi_item_params.is_enabled()
+                            )
+                            else -1
+                        ),
+                        logits_soft_cap=logits_soft_cap,
+                        # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                        k_scale=layer.k_scale_float,
+                        v_scale=layer.v_scale_float,
+                    )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
@@ -2557,19 +2731,29 @@ class FlashInferIndicesUpdaterPrefill:
                 if not torch.equal(dev_seq, host_seq):
                     logger.warning(
                         "[fastplan-debug] seq_lens mismatch dev=%s host=%s",
-                        dev_seq.tolist(), host_seq.tolist())
+                        dev_seq.tolist(),
+                        host_seq.tolist(),
+                    )
                 if not torch.equal(dev_qo, qo_indptr_host.to(dev_qo.dtype)):
-                    logger.warning("[fastplan-debug] qo mismatch dev=%s host=%s",
-                                   dev_qo.tolist(), qo_indptr_host.tolist())
+                    logger.warning(
+                        "[fastplan-debug] qo mismatch dev=%s host=%s",
+                        dev_qo.tolist(),
+                        qo_indptr_host.tolist(),
+                    )
                 if not torch.equal(dev_kvptr, kv_indptr_host.to(dev_kvptr.dtype)):
-                    logger.warning("[fastplan-debug] kvptr mismatch dev=%s host=%s",
-                                   dev_kvptr.tolist(), kv_indptr_host.tolist())
+                    logger.warning(
+                        "[fastplan-debug] kvptr mismatch dev=%s host=%s",
+                        dev_kvptr.tolist(),
+                        kv_indptr_host.tolist(),
+                    )
                 if use_custom_mask is not None:
                     exp_numel = int((kv_lens_host_i64 * dtn).sum())
                     if use_custom_mask.numel() < exp_numel:
                         logger.warning(
                             "[fastplan-debug] mask numel %d < expected %d",
-                            use_custom_mask.numel(), exp_numel)
+                            use_custom_mask.numel(),
+                            exp_numel,
+                        )
             if use_custom_mask is not None:
                 mask_lens = kv_lens_host_i64 * dtn  # bits per request
                 mask_indptr_host = torch.zeros(bs + 1, dtype=torch.int64)
@@ -2585,13 +2769,11 @@ class FlashInferIndicesUpdaterPrefill:
                 packed_indptr_dev = packed_indptr_host.to(torch.int32).to(
                     device, non_blocking=True
                 )
-                paged_plan_kwargs["packed_custom_mask"] = (
-                    segment_packbits_known_size(
-                        use_custom_mask.contiguous().view(-1),
-                        mask_indptr_dev,
-                        packed_indptr_dev,
-                        int(packed_indptr_host[-1]),
-                    )
+                paged_plan_kwargs["packed_custom_mask"] = segment_packbits_known_size(
+                    use_custom_mask.contiguous().view(-1),
+                    mask_indptr_dev,
+                    packed_indptr_dev,
+                    int(packed_indptr_host[-1]),
                 )
                 paged_plan_kwargs["packed_mask_indptr"] = packed_indptr_dev
                 # The mask is consumed via the packed path; don't hand the raw
