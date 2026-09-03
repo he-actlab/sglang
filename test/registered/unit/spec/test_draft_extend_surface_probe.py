@@ -90,17 +90,27 @@ def _plan_identity():
         "draft_extend_flashinfer_num_colocated_ctas": -1,
         "draft_extend_flashinfer_fixed_split_size": 0,
         "draft_extend_flashinfer_disable_split_kv": False,
+        "draft_extend_flashinfer_force_q_tile_16": False,
     }
 
 
-def _plan_metadata(*, kv_chunk_size=128, padded_batch_size=33, offset_delta=0):
+def _plan_metadata(
+    *,
+    kv_chunk_size=128,
+    padded_batch_size=33,
+    offset_delta=0,
+    cta_tile_q=128,
+    enable_cuda_graph=True,
+    split_kv=True,
+    disable_split_kv=False,
+):
     return [
         {
             "plan_info": {
                 "padded_batch_size": padded_batch_size,
                 "total_num_rows": 128,
                 "total_num_rows_offset": 400 + offset_delta,
-                "cta_tile_q": 128,
+                "cta_tile_q": cta_tile_q,
                 "request_indices_offset": 0 + offset_delta,
                 "qo_tile_indices_offset": 144 + offset_delta,
                 "kv_tile_indices_offset": 288 + offset_delta,
@@ -110,8 +120,8 @@ def _plan_metadata(*, kv_chunk_size=128, padded_batch_size=33, offset_delta=0):
                 "v_offset": 0 + offset_delta,
                 "s_offset": 2162688 + offset_delta,
                 "block_valid_mask_offset": 1104 + offset_delta,
-                "enable_cuda_graph": True,
-                "split_kv": True,
+                "enable_cuda_graph": enable_cuda_graph,
+                "split_kv": split_kv,
                 "kv_chunk_size": kv_chunk_size,
             },
             "controls": {
@@ -120,7 +130,7 @@ def _plan_metadata(*, kv_chunk_size=128, padded_batch_size=33, offset_delta=0):
                 "planning_width_sms": 52,
                 "num_colocated_ctas": 272,
                 "fixed_split_size": None,
-                "disable_split_kv": False,
+                "disable_split_kv": disable_split_kv,
             },
         }
     ]
@@ -436,6 +446,39 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertEqual(records[1]["replay_prefill_plan_metadata"], replay)
             self.assertFalse(records[1]["capture_replay_exact_match"])
             self.assertIn("kv_chunk_size", records[1]["capture_replay_changed_fields"])
+
+    def test_prefill_plan_accepts_explicit_tile16_control_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            identity = _plan_identity()
+            identity.update(
+                draft_extend_flashinfer_plan_width=52,
+                draft_extend_flashinfer_disable_split_kv=True,
+                draft_extend_flashinfer_force_q_tile_16=True,
+            )
+            probe = DraftExtendSurfaceProbe(
+                _config(
+                    mode="off",
+                    surfaces=(),
+                    output_path=str(Path(tmpdir) / "plan.jsonl"),
+                    require_plan_metadata=True,
+                    config_identity=identity,
+                ),
+                event_factory=_FakeEventFactory(),
+            )
+            self.addCleanup(probe._output.close)
+            metadata = _plan_metadata(
+                kv_chunk_size=-1,
+                padded_batch_size=32,
+                cta_tile_q=16,
+                enable_cuda_graph=False,
+                split_kv=False,
+                disable_split_kv=True,
+            )
+            probe.record_capture_prefill_plan_metadata(
+                batch_size=32,
+                num_tokens=128,
+                metadata=metadata,
+            )
 
     def test_prefill_plan_template_mismatch_fails_before_replay(self):
         with tempfile.TemporaryDirectory() as tmpdir:

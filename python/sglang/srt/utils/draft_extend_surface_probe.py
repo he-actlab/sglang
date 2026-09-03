@@ -309,6 +309,7 @@ class DraftExtendSurfaceProbe:
             "draft_extend_flashinfer_num_colocated_ctas",
             "draft_extend_flashinfer_fixed_split_size",
             "draft_extend_flashinfer_disable_split_kv",
+            "draft_extend_flashinfer_force_q_tile_16",
         }
         missing_identity = sorted(required_identity - identity.keys())
         if missing_identity:
@@ -363,15 +364,22 @@ class DraftExtendSurfaceProbe:
                 "draft-extend S2 FlashInfer total_num_rows changed: "
                 f"expected {TARGET_M}, got {plan_info['total_num_rows']}"
             )
-        if int(plan_info["cta_tile_q"]) != 128:
+        force_q_tile_16 = bool(identity["draft_extend_flashinfer_force_q_tile_16"])
+        expected_q_tile = 16 if force_q_tile_16 else 128
+        if int(plan_info["cta_tile_q"]) != expected_q_tile:
             raise RuntimeError(
-                "draft-extend S2 width-candidate law assumes cta_tile_q=128; "
-                f"got {plan_info['cta_tile_q']}"
+                "draft-extend FlashInfer Q-tile identity changed: "
+                f"expected {expected_q_tile}, got {plan_info['cta_tile_q']}"
             )
         if int(plan_info["padded_batch_size"]) <= 0:
             raise RuntimeError("FlashInfer padded_batch_size must be positive")
-        if plan_info["enable_cuda_graph"] is not True:
-            raise RuntimeError("FlashInfer diagnostic plan is not CUDA-graph enabled")
+        expected_plan_graph_mode = not force_q_tile_16
+        if plan_info["enable_cuda_graph"] is not expected_plan_graph_mode:
+            raise RuntimeError(
+                "FlashInfer planner graph-mode identity changed: "
+                f"expected {expected_plan_graph_mode}, "
+                f"got {plan_info['enable_cuda_graph']}"
+            )
         if not isinstance(plan_info["split_kv"], bool):
             raise RuntimeError("FlashInfer split_kv metadata must be boolean")
         kv_chunk_size = plan_info["kv_chunk_size"]
@@ -1154,6 +1162,9 @@ def _validate_fixed52_runtime(
         ),
         "draft_extend_flashinfer_disable_split_kv": bool(
             envs.SGLANG_DRAFT_EXTEND_FLASHINFER_DISABLE_SPLIT_KV.get()
+        ),
+        "draft_extend_flashinfer_force_q_tile_16": bool(
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16.get()
         ),
     }
     return identity, get_spec_streams()[1]
