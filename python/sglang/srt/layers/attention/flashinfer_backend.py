@@ -1043,7 +1043,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 controls.disable_split_kv,
             )
 
-        if envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16.get():
+        if (
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16.get()
+            and model_runner.is_draft_worker
+        ):
             if self.draft_extend_prefill_plan_override is None:
                 raise ValueError(
                     "forced FA2 Q tile 16 requires "
@@ -1069,7 +1072,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 "no split-KV, graph-stable 32-CTA schedule"
             )
 
-        if envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get():
+        if (
+            envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get()
+            and model_runner.is_draft_worker
+        ):
             from sglang.srt.multiplex.pdmux_context import (
                 get_spec_sm_allocated_split,
                 spec_sm_partition_enabled,
