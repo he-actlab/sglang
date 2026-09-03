@@ -1082,14 +1082,15 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             config = model_runner.model_config
+            hf_text_config = config.hf_text_config
             signature = (
-                getattr(config, "model_type", None),
-                getattr(config, "hidden_size", None),
-                getattr(config, "intermediate_size", None),
-                getattr(config, "num_hidden_layers", None),
-                getattr(config, "num_attention_heads", None),
-                getattr(config, "num_key_value_heads", None),
-                getattr(config, "vocab_size", None),
+                getattr(hf_text_config, "model_type", None),
+                getattr(hf_text_config, "hidden_size", None),
+                getattr(hf_text_config, "intermediate_size", None),
+                getattr(hf_text_config, "num_hidden_layers", None),
+                config.get_total_num_attention_heads(),
+                config.get_total_num_kv_heads(),
+                config.vocab_size,
             )
             expected_signature = ("qwen3", 1024, 3072, 28, 16, 8, 151936)
             errors = []
