@@ -197,6 +197,7 @@ def resolve_draft_extend_prefill_plan_override(
     enabled: bool,
     is_draft_worker: bool,
     enable_spec_pdmux: bool,
+    enable_spec_sm_partition: bool,
     prefill_backend: str,
     device_sms: int,
     num_kv_heads: int,
@@ -221,9 +222,10 @@ def resolve_draft_extend_prefill_plan_override(
         raise ValueError(
             f"draft-extend FlashInfer plan override requires fa2, got {prefill_backend!r}"
         )
-    if not enable_spec_pdmux:
+    if not (enable_spec_pdmux or enable_spec_sm_partition):
         raise ValueError(
-            "draft-extend FlashInfer plan override requires --enable-spec-pdmux"
+            "draft-extend FlashInfer plan override requires a Green Context "
+            "placement mode"
         )
     if device_sms <= 0:
         raise ValueError(f"device_sms must be positive, got {device_sms}")
@@ -1000,6 +1002,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 enabled=True,
                 is_draft_worker=True,
                 enable_spec_pdmux=self.enable_spec_pdmux,
+                enable_spec_sm_partition=(
+                    model_runner.server_args.enable_spec_sm_partition
+                ),
                 prefill_backend=self.prefill_backend,
                 device_sms=diagnostic_device_sms,
                 num_kv_heads=diagnostic_num_kv_heads,

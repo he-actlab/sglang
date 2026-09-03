@@ -12,6 +12,7 @@ _BASE = dict(
     enabled=True,
     is_draft_worker=True,
     enable_spec_pdmux=True,
+    enable_spec_sm_partition=False,
     prefill_backend="fa2",
     device_sms=188,
     num_kv_heads=8,
@@ -43,6 +44,16 @@ def test_default_diagnostic_control_inherits_realized_52_width():
     assert control.disable_split_kv is False
 
 
+def test_partition_only_mode_accepts_the_same_diagnostic_controls():
+    control = _resolve(
+        enable_spec_pdmux=False,
+        enable_spec_sm_partition=True,
+    )
+    assert control is not None
+    assert control.planning_width_sms == 52
+    assert control.num_colocated_ctas == 272
+
+
 def test_explicit_width_and_raw_reserve_are_equivalent_controls():
     by_width = _resolve(planning_width=136)
     by_reserve = _resolve(num_colocated_ctas=104)
@@ -72,7 +83,13 @@ def test_exact_m128_width_candidates_follow_scheduler_breakpoints():
 @pytest.mark.parametrize(
     "changes,match",
     [
-        ({"enable_spec_pdmux": False}, "requires --enable-spec-pdmux"),
+        (
+            {
+                "enable_spec_pdmux": False,
+                "enable_spec_sm_partition": False,
+            },
+            "requires a Green Context placement mode",
+        ),
         ({"prefill_backend": "fa3"}, "requires fa2"),
         ({"planning_width": -1}, "planning width must be"),
         ({"planning_width": 189}, "not exceed the device"),
