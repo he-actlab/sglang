@@ -795,6 +795,20 @@ def _validate_stock_fullchip_runtime(
     requested_split = get_spec_sm_split()
     properties = torch.cuda.get_device_properties(model_runner.gpu_id)
     prefill_backend, decode_backend = args.get_attention_backends()
+    treatment_identity = (
+        bool(envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE.get()),
+        int(envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_WIDTH.get()),
+        int(envs.SGLANG_DRAFT_EXTEND_FLASHINFER_NUM_COLOCATED_CTAS.get()),
+        int(envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FIXED_SPLIT_SIZE.get()),
+        bool(envs.SGLANG_DRAFT_EXTEND_FLASHINFER_DISABLE_SPLIT_KV.get()),
+        bool(envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16.get()),
+        bool(envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get()),
+    )
+    allowed_treatment_identities = {
+        (False, 0, -1, 0, False, False, False),
+        (True, 188, -1, 0, True, True, False),
+        (True, 188, -1, 0, True, False, True),
+    }
     checks = [
         (bool(model_runner.is_draft_worker), "runner is not the draft worker"),
         (str(model_runner.device).startswith("cuda"), f"device={model_runner.device}"),
@@ -892,6 +906,10 @@ def _validate_stock_fullchip_runtime(
             "FlashInfer decode width override is not 0",
         ),
         (
+            treatment_identity in allowed_treatment_identities,
+            f"short-query treatment identity={treatment_identity}",
+        ),
+        (
             getattr(hf_config, "architectures", [None])[0] == "Qwen3ForCausalLM",
             f"architecture={getattr(hf_config, 'architectures', None)}",
         ),
@@ -933,6 +951,13 @@ def _validate_stock_fullchip_runtime(
         "drafter_tma": False,
         "flashinfer_prefill_width_mode": 0,
         "flashinfer_decode_width_mode": 0,
+        "draft_extend_flashinfer_plan_override": treatment_identity[0],
+        "draft_extend_flashinfer_plan_width": treatment_identity[1],
+        "draft_extend_flashinfer_num_colocated_ctas": treatment_identity[2],
+        "draft_extend_flashinfer_fixed_split_size": treatment_identity[3],
+        "draft_extend_flashinfer_disable_split_kv": treatment_identity[4],
+        "draft_extend_flashinfer_force_q_tile_16": treatment_identity[5],
+        "draft_extend_short_q_attention": treatment_identity[6],
     }
     # Stock execution has no alternate partition stream. CUDA graph replay uses
     # its replay stream, which is intentionally not the construction-time stream.

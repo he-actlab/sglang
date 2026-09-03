@@ -222,10 +222,19 @@ def resolve_draft_extend_prefill_plan_override(
         raise ValueError(
             f"draft-extend FlashInfer plan override requires fa2, got {prefill_backend!r}"
         )
-    if not (enable_spec_pdmux or enable_spec_sm_partition):
+    full_device_treatment = (
+        not enable_spec_pdmux
+        and not enable_spec_sm_partition
+        and planning_width == device_sms
+        and num_colocated_ctas == -1
+        and fixed_split_size == 0
+        and disable_split_kv
+    )
+    if not (enable_spec_pdmux or enable_spec_sm_partition or full_device_treatment):
         raise ValueError(
             "draft-extend FlashInfer plan override requires a Green Context "
-            "placement mode"
+            "placement mode, except for the explicit full-device treatment "
+            "control (planning_width=device_sms, disable_split_kv=1)"
         )
     if device_sms <= 0:
         raise ValueError(f"device_sms must be positive, got {device_sms}")
@@ -1117,10 +1126,30 @@ class FlashInferAttnBackend(AttentionBackend):
                 errors.append(
                     f"prefill backend/dispatch={self.prefill_backend}/{self.dispatch_reason}"
                 )
-            if not spec_sm_partition_enabled(model_runner.server_args):
-                errors.append("Green Context placement is disabled")
-            if get_spec_sm_allocated_split() != (136, 52):
-                errors.append(f"allocated SM split={get_spec_sm_allocated_split()}")
+            allocated_split = get_spec_sm_allocated_split()
+            partitioned_contract = (
+                spec_sm_partition_enabled(model_runner.server_args)
+                and allocated_split == (136, 52)
+            )
+            plan_override = self.draft_extend_prefill_plan_override
+            full_device_contract = (
+                not spec_sm_partition_enabled(model_runner.server_args)
+                and allocated_split is None
+                and plan_override is not None
+                and plan_override.planning_width_sms
+                == torch.cuda.get_device_properties(
+                    model_runner.gpu_id
+                ).multi_processor_count
+                and plan_override.num_colocated_ctas == 0
+                and plan_override.fixed_split_size is None
+                and plan_override.disable_split_kv
+            )
+            if not (partitioned_contract or full_device_contract):
+                errors.append(
+                    "placement is neither allocated (136, 52) nor the exact "
+                    f"full-device treatment; allocated split={allocated_split}, "
+                    f"plan override={plan_override}"
+                )
             pool = self.token_to_kv_pool
             if getattr(pool, "page_size", None) != 1:
                 errors.append(f"KV page size={getattr(pool, 'page_size', None)}")
@@ -1161,7 +1190,8 @@ class FlashInferAttnBackend(AttentionBackend):
             self.use_draft_extend_short_q_attention = True
             logger.info(
                 "Qwen3 draft-extend exact-N8 tensor-core attention armed: "
-                "Q4/GQA2 BF16 NHD page-size-1 on the 52-SM draft stream"
+                "Q4/GQA2 BF16 NHD page-size-1 on the %s path",
+                "52-SM draft stream" if partitioned_contract else "full device",
             )
 
         # Design-FlashInferDecodeWidth (TODO-47): sm_count_override for the

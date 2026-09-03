@@ -54,6 +54,19 @@ def test_partition_only_mode_accepts_the_same_diagnostic_controls():
     assert control.num_colocated_ctas == 272
 
 
+def test_full_device_treatment_accepts_only_explicit_device_width_no_split():
+    control = _resolve(
+        enable_spec_pdmux=False,
+        enable_spec_sm_partition=False,
+        planning_width=188,
+        disable_split_kv=True,
+    )
+    assert control is not None
+    assert control.planning_width_sms == 188
+    assert control.num_colocated_ctas == 0
+    assert control.disable_split_kv is True
+
+
 def test_explicit_width_and_raw_reserve_are_equivalent_controls():
     by_width = _resolve(planning_width=136)
     by_reserve = _resolve(num_colocated_ctas=104)
@@ -88,7 +101,16 @@ def test_exact_m128_width_candidates_follow_scheduler_breakpoints():
                 "enable_spec_pdmux": False,
                 "enable_spec_sm_partition": False,
             },
-            "requires a Green Context placement mode",
+            "requires a Green Context placement mode, except",
+        ),
+        (
+            {
+                "enable_spec_pdmux": False,
+                "enable_spec_sm_partition": False,
+                "planning_width": 187,
+                "disable_split_kv": True,
+            },
+            "requires a Green Context placement mode, except",
         ),
         ({"prefill_backend": "fa3"}, "requires fa2"),
         ({"planning_width": -1}, "planning width must be"),
