@@ -25,6 +25,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
+    convert_flashinfer_kv_indices_to_pages_triton,
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -404,6 +405,7 @@ def _read_prefill_kv_chunk_size(wrapper, byte_offset: int) -> Optional[int]:
 def _record_draft_extend_prefill_plan_metadata(
     wrapper,
     override: DraftExtendPrefillPlanOverride,
+    page_size: int,
 ) -> None:
     """Expose JSON-shaped planner state only for the armed diagnostic path."""
 
@@ -417,9 +419,15 @@ def _record_draft_extend_prefill_plan_metadata(
     plan_info = dict(zip(_PREFILL_PLAN_INFO_FIELDS, values))
     plan_info["enable_cuda_graph"] = bool(plan_info["enable_cuda_graph"])
     plan_info["split_kv"] = bool(plan_info["split_kv"])
-    plan_info["kv_chunk_size"] = _read_prefill_kv_chunk_size(
+    kv_chunk_size = _read_prefill_kv_chunk_size(
         wrapper, plan_info["kv_chunk_size_ptr_offset"]
     )
+    # FlashInfer encodes no-split as one negative page: -1 for token pages,
+    # -P for page size P. Expose a page-size-independent semantic sentinel and
+    # leave every other value untouched so the downstream identity guard fails.
+    if not plan_info["split_kv"] and kv_chunk_size == -page_size:
+        kv_chunk_size = -1
+    plan_info["kv_chunk_size"] = kv_chunk_size
     available_ctas = 2 * override.device_sms - override.num_colocated_ctas
     wrapper._sglang_draft_extend_prefill_plan_metadata = {
         "plan_info": plan_info,
@@ -483,6 +491,25 @@ spec_pdmux_draft_workspace_buffer = None
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
+
+
+def _reshape_kv_cache_for_flashinfer_pages(
+    kv_cache: tuple[torch.Tensor, torch.Tensor], page_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expose a token-flat NHD pool through FlashInfer's paged NHD view."""
+    if page_size == 1:
+        return kv_cache
+    paged = []
+    for tensor in kv_cache:
+        if tensor.ndim != 3 or tensor.shape[0] % page_size != 0:
+            raise RuntimeError(
+                "FlashInfer real-page view requires a divisible 3-D NHD KV "
+                f"tensor, got shape={tuple(tensor.shape)} page_size={page_size}"
+            )
+        paged.append(
+            tensor.view(-1, page_size, tensor.shape[1], tensor.shape[2])
+        )
+    return paged[0], paged[1]
 
 
 def fast_prefill_plan(
@@ -648,7 +675,9 @@ def fast_prefill_plan(
             f"enable_cuda_graph={self._plan_info[13]} split_kv={self._plan_info[14]}"
         )
     if diagnostic_override is not None:
-        _record_draft_extend_prefill_plan_metadata(self, diagnostic_override)
+        _record_draft_extend_prefill_plan_metadata(
+            self, diagnostic_override, page_size
+        )
 
 
 class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
@@ -1981,6 +2010,11 @@ class FlashInferAttnBackend(AttentionBackend):
             # launches under the selected FlashInfer plan.
             with draft_extend_attention_scope(q, layer):
                 q_view = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                if forward_batch.forward_mode.is_draft_extend_v2():
+                    kv_cache = _reshape_kv_cache_for_flashinfer_pages(
+                        kv_cache, self.token_to_kv_pool.page_size
+                    )
                 if (
                     self.use_draft_extend_short_q_attention
                     and forward_batch.forward_mode.is_draft_extend_v2()
@@ -2014,9 +2048,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         draft_extend_short_q_attention,
                     )
 
-                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
-                        layer.layer_id
-                    )
+                    k_cache, v_cache = kv_cache
                     o = torch.empty_like(q_view)
                     lse = torch.empty(
                         q_view.shape[:2], dtype=torch.float32, device=q_view.device
@@ -2036,7 +2068,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 else:
                     o = prefill_wrapper_paged.forward(
                         q_view,
-                        self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                        kv_cache,
                         causal=causal,
                         sm_scale=layer.scaling,
                         # Disable sliding window attention for multi-item scoring:
@@ -2472,6 +2504,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
+        self.page_size = model_runner.page_size
         self.attn_backend = attn_backend
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -2791,6 +2824,48 @@ class FlashInferIndicesUpdaterPrefill:
                     )
                 )
 
+        # The shared request table stores one physical slot per token. Keep the
+        # legacy page-size-1 view everywhere except EAGLE draft-extend, which
+        # supports FlashInfer's real paged contract: one physical page id per
+        # logical page, page-count indptrs, and the true final-page length.
+        # Decode and target verify intentionally remain on their established
+        # flat view.
+        flashinfer_page_size = 1
+        if (
+            spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+            and self.page_size > 1
+        ):
+            flashinfer_page_size = self.page_size
+            token_kv_indptr = kv_indptr
+            token_kv_lens = token_kv_indptr[1:] - token_kv_indptr[:-1]
+            page_kv_lens = torch.div(
+                token_kv_lens + flashinfer_page_size - 1,
+                flashinfer_page_size,
+                rounding_mode="floor",
+            )
+            kv_indptr = torch.zeros_like(token_kv_indptr)
+            kv_indptr[1:] = torch.cumsum(page_kv_lens, dim=0)
+            page_indices = torch.empty(
+                (paged_kernel_lens_sum + flashinfer_page_size - 1)
+                // flashinfer_page_size
+                + bs,
+                dtype=torch.int32,
+                device=kv_indices.device,
+            )
+            convert_flashinfer_kv_indices_to_pages_triton[(bs,)](
+                kv_indices,
+                token_kv_indptr,
+                kv_indptr,
+                page_indices,
+                PAGE_SIZE=flashinfer_page_size,
+            )
+            kv_indices = page_indices
+            last_page_len = (
+                torch.remainder(token_kv_lens - 1, flashinfer_page_size) + 1
+            )
+            self.kv_last_page_len[:bs].copy_(last_page_len)
+
         # extend part
         if use_ragged:
             if self.attn_backend.enable_spec_pdmux:
@@ -2957,7 +3032,12 @@ class FlashInferIndicesUpdaterPrefill:
                 device="cpu",
             )
             kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
-            kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+            host_page_lens = torch.div(
+                seq_lens_cpu_i32 + flashinfer_page_size - 1,
+                flashinfer_page_size,
+                rounding_mode="floor",
+            )
+            kv_indptr_host[1:] = torch.cumsum(host_page_lens, dim=0)
             paged_plan_kwargs = dict(
                 qo_indptr_host=qo_indptr_host,
                 kv_indptr_host=kv_indptr_host,
@@ -2977,7 +3057,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            1,
+            flashinfer_page_size,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,

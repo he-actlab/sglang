@@ -45,6 +45,36 @@ def create_flashinfer_kv_indices_triton(
 
 
 @triton.jit
+def convert_flashinfer_kv_indices_to_pages_triton(
+    token_indices_ptr,
+    token_indptr_ptr,
+    page_indptr_ptr,
+    page_indices_ptr,
+    PAGE_SIZE: tl.constexpr,
+):
+    """Collapse token-slot metadata into FlashInfer physical-page metadata."""
+    BLOCK_SIZE: tl.constexpr = 128
+    pid = tl.program_id(axis=0)
+    token_begin = tl.load(token_indptr_ptr + pid)
+    token_end = tl.load(token_indptr_ptr + pid + 1)
+    page_begin = tl.load(page_indptr_ptr + pid)
+    num_pages = tl.cdiv(token_end - token_begin, PAGE_SIZE)
+
+    for block_start in range(0, num_pages, BLOCK_SIZE):
+        page_offset = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = page_offset < num_pages
+        token_slot = tl.load(
+            token_indices_ptr + token_begin + page_offset * PAGE_SIZE,
+            mask=mask,
+        )
+        tl.store(
+            page_indices_ptr + page_begin + page_offset,
+            token_slot // PAGE_SIZE,
+            mask=mask,
+        )
+
+
+@triton.jit
 def create_chunked_prefix_cache_kv_indices(
     req_to_token_ptr,  # (max_batch, max_context_len,)
     req_pool_indices_ptr,  # (batch_size,)

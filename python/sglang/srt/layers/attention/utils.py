@@ -17,6 +17,9 @@ from sglang.srt.layers.attention.triton_ops.cache_ops import (
     reshape_and_cache_flash as reshape_and_cache_flash,
 )
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    convert_flashinfer_kv_indices_to_pages_triton as convert_flashinfer_kv_indices_to_pages_triton,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashinfer_kv_indices_triton as create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
