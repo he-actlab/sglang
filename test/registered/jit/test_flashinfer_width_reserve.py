@@ -158,6 +158,7 @@ def _diagnostic_override(reserve, *, fixed_split_size=0, disable_split_kv=False)
         enabled=True,
         is_draft_worker=True,
         enable_spec_pdmux=True,
+        enable_spec_sm_partition=False,
         prefill_backend="fa2",
         device_sms=device_sms,
         num_kv_heads=_NUM_KV_HEADS,

@@ -800,6 +800,10 @@ class Envs:
     # existing FA2 tile-16 instantiation and is legal only with the exact
     # fixed-Q4 graph plus the no-split planner control. Default-off.
     SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16 = EnvBool(False)
+    # Producer-only experiment on the retained FA2 tile-16 kernel: replace its
+    # single K/V landing pair with a two-stage descriptor-TMA ring. Requires the
+    # force-tile-16/no-split controls and their exact Q4/GQA2 contract.
+    SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA = EnvBool(False)
     # Exact Qwen3-0.6B draft-extend attention experiment: replace FA2s
     # graph-selected Q-tile-128 kernel with the in-tree Q4/GQA2 N=8
     # tensor-core specialization. The path is BF16/NHD/page-size-1/SM120/TP1

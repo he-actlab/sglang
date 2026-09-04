@@ -692,6 +692,14 @@ class WidthAwarePrefillWrapper(BatchPrefillWithPagedKVCacheWrapper):
                 p["paged_kv_last_page_len"].to("cpu"),
                 p["page_size"],
             )
+        tile16_tma_module = getattr(
+            self, "_sglang_draft_extend_tile16_tma_module", None
+        )
+        if tile16_tma_module is not None:
+            if not getattr(self, "_sglang_draft_extend_force_q_tile_16", False):
+                raise RuntimeError("tile16 TMA module requires the forced tile16 plan")
+            self._cached_module = tile16_tma_module
+
         fast_prefill_plan(
             self,
             p["qo_indptr"],
@@ -837,6 +845,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.enable_spec_pdmux = model_runner.server_args.enable_spec_pdmux
         self.use_draft_extend_short_q_attention = False
         self.draft_extend_force_q_tile_16 = False
+        self.draft_extend_tile16_tma_module = None
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -1079,6 +1088,91 @@ class FlashInferAttnBackend(AttentionBackend):
             logger.info(
                 "FlashInfer draft-extend Q-tile-16 control armed: fixed Q4/GQA2, "
                 "no split-KV, graph-stable 32-CTA schedule"
+            )
+
+        if (
+            envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
+            and model_runner.is_draft_worker
+        ):
+            if not self.draft_extend_force_q_tile_16:
+                raise ValueError(
+                    "tile16 TMA requires "
+                    "SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16=1"
+                )
+            if envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get():
+                raise ValueError(
+                    "tile16 TMA and the exact-N8 replacement are mutually exclusive"
+                )
+            config = model_runner.model_config
+            pool = self.token_to_kv_pool
+            errors = []
+            if model_runner.device != "cuda":
+                errors.append(f"device={model_runner.device}")
+            elif torch.cuda.get_device_capability(model_runner.gpu_id) != (12, 0):
+                errors.append(
+                    "compute capability="
+                    f"{torch.cuda.get_device_capability(model_runner.gpu_id)}"
+                )
+            if get_parallel().attn_tp_size != 1:
+                errors.append(f"attention TP={get_parallel().attn_tp_size}")
+            if (
+                config.get_total_num_attention_heads(),
+                config.get_total_num_kv_heads(),
+                config.head_dim,
+            ) != (16, 8, 128):
+                errors.append(
+                    "attention shape="
+                    f"{(config.get_total_num_attention_heads(), config.get_total_num_kv_heads(), config.head_dim)}"
+                )
+            if model_runner.kv_cache_dtype != torch.bfloat16:
+                errors.append(f"KV dtype={model_runner.kv_cache_dtype}")
+            if getattr(model_runner, "dtype", None) != torch.bfloat16:
+                errors.append(f"model dtype={getattr(model_runner, 'dtype', None)}")
+            if getattr(config, "quantization", None) is not None:
+                errors.append(f"quantization={config.quantization}")
+            if self.prefill_backend != "fa2" or self.dispatch_reason is not None:
+                errors.append(
+                    f"prefill backend/dispatch={self.prefill_backend}/{self.dispatch_reason}"
+                )
+            if getattr(pool, "page_size", None) != 1:
+                errors.append(f"KV page size={getattr(pool, 'page_size', None)}")
+            if getattr(pool, "kv_cache_layout", None) != "nhd":
+                errors.append(
+                    f"KV cache layout={getattr(pool, 'kv_cache_layout', None)}"
+                )
+            if (
+                getattr(pool, "head_num", None),
+                getattr(pool, "head_dim", None),
+                getattr(pool, "v_head_dim", None),
+            ) != (8, 128, 128):
+                errors.append(
+                    "KV pool shape="
+                    f"{(getattr(pool, 'head_num', None), getattr(pool, 'head_dim', None), getattr(pool, 'v_head_dim', None))}"
+                )
+            frozen_spec = (
+                model_runner.server_args.speculative_num_steps,
+                model_runner.server_args.speculative_eagle_topk,
+                model_runner.server_args.speculative_num_draft_tokens,
+            )
+            if frozen_spec != (3, 1, 4):
+                errors.append(f"speculative knobs={frozen_spec}")
+            if errors:
+                raise ValueError(
+                    "draft-extend tile16 TMA left its exact experimental contract: "
+                    + "; ".join(errors)
+                )
+
+            from sglang.srt.layers.attention.flashinfer_tile16_tma import (
+                get_tile16_tma_prefill_module,
+            )
+
+            with torch.cuda.device(model_runner.gpu_id):
+                self.draft_extend_tile16_tma_module = (
+                    get_tile16_tma_prefill_module()
+                )
+            logger.info(
+                "FlashInfer draft-extend tile16 two-stage TMA ring armed: "
+                "fixed Q4/GQA2, BF16 NHD page-size-1, no split-KV"
             )
 
         if (
@@ -1779,6 +1873,13 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 if draft_extend and self.draft_extend_force_q_tile_16:
                     wrapper._sglang_draft_extend_force_q_tile_16 = True
+                if (
+                    draft_extend
+                    and self.draft_extend_tile16_tma_module is not None
+                ):
+                    wrapper._sglang_draft_extend_tile16_tma_module = (
+                        self.draft_extend_tile16_tma_module
+                    )
             wrappers.append(wrapper)
         return wrappers
 
