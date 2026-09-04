@@ -1145,7 +1145,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 errors.append(
                     f"prefill backend/dispatch={self.prefill_backend}/{self.dispatch_reason}"
                 )
-            if getattr(pool, "page_size", None) != 1:
+            if getattr(pool, "page_size", None) != 64:
                 errors.append(f"KV page size={getattr(pool, 'page_size', None)}")
             if getattr(pool, "kv_cache_layout", None) != "nhd":
                 errors.append(
@@ -1182,8 +1182,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     get_tile16_tma_prefill_module()
                 )
             logger.info(
-                "FlashInfer draft-extend tile16 two-stage TMA ring armed: "
-                "fixed Q4/GQA2, BF16 NHD page-size-1, no split-KV"
+                "FlashInfer draft-extend tile16 two-stage page-box TMA ring armed: "
+                "fixed Q4/GQA2, BF16 NHD page-size-64, no split-KV"
             )
 
         if (

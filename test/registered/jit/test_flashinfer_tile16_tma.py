@@ -21,7 +21,7 @@ register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-
     "requires an SM120 GPU",
 )
 class TestFlashInferTile16Tma(unittest.TestCase):
-    def test_ragged_permuted_pages_match_stock_tile16(self):
+    def test_page64_ragged_permuted_pages_match_stock_tile16(self):
         torch.manual_seed(20260904)
         device = torch.device("cuda")
         kv_lens = torch.tensor(
@@ -34,7 +34,11 @@ class TestFlashInferTile16Tma(unittest.TestCase):
         num_qo_heads = 16
         num_kv_heads = 8
         head_dim = 128
-        total_kv = int(kv_lens.sum().item())
+        page_size = 64
+        pages_per_request = torch.div(
+            kv_lens + page_size - 1, page_size, rounding_mode="floor"
+        )
+        total_pages = int(pages_per_request.sum().item())
         total_q = batch_size * query_length
 
         qo_indptr = torch.arange(
@@ -47,11 +51,9 @@ class TestFlashInferTile16Tma(unittest.TestCase):
         kv_indptr = torch.zeros(
             batch_size + 1, dtype=torch.int32, device=device
         )
-        kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
-        kv_indices = torch.randperm(total_kv, device=device).to(torch.int32)
-        last_page_len = torch.ones(
-            batch_size, dtype=torch.int32, device=device
-        )
+        kv_indptr[1:] = torch.cumsum(pages_per_request, dim=0)
+        kv_indices = torch.randperm(total_pages, device=device).to(torch.int32)
+        last_page_len = (kv_lens - 1) % page_size + 1
         query = torch.randn(
             total_q,
             num_qo_heads,
@@ -60,8 +62,8 @@ class TestFlashInferTile16Tma(unittest.TestCase):
             device=device,
         )
         key = torch.randn(
-            total_kv,
-            1,
+            total_pages,
+            page_size,
             num_kv_heads,
             head_dim,
             dtype=torch.bfloat16,
@@ -99,7 +101,7 @@ class TestFlashInferTile16Tma(unittest.TestCase):
                     batch_size + 1, dtype=torch.int32, device=device
                 ),
                 paged_kv_indices_buf=torch.zeros(
-                    total_kv, dtype=torch.int32, device=device
+                    total_pages, dtype=torch.int32, device=device
                 ),
                 paged_kv_last_page_len_buf=torch.ones(
                     batch_size, dtype=torch.int32, device=device
@@ -120,7 +122,7 @@ class TestFlashInferTile16Tma(unittest.TestCase):
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
-                1,
+                page_size,
                 causal=True,
                 q_data_type=torch.bfloat16,
                 kv_data_type=torch.bfloat16,

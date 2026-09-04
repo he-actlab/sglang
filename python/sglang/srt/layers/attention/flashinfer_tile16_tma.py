@@ -4,9 +4,8 @@ This module deliberately keeps FlashInfer's tile16 attention math and launch
 geometry intact.  It patches only the paged K/V producer in the pinned
 FlashInfer 0.6.12 JIT source:
 
-* ordinary 2-D TMA copies load each paged K/V row through a tensor map;
-* a register-only in-place shared-memory permutation restores FlashInfer's
-  existing 128-byte-swizzled MMA layout;
+* one 5-D TMA box per physical 64-token K/V page lands directly in
+  FlashInfer's 128-byte-swizzled MMA layout;
 * a two-stage K/V ring keeps the next complete tile in flight while FlashInfer's
   unchanged consumer computes on the current tile. The extra landing space
   intentionally trades tile16's second resident CTA for producer depth.
@@ -28,7 +27,7 @@ import torch
 _UPSTREAM_PREFILL_SHA256 = (
     "ed83f5964cf1d815f80393248360ae525bdf64fb53bc1bfaf58bf03d42b9b464"
 )
-_MODULE_NAME = "sglang_fa2_tile16_tma_ring2_sm120a_bf16_h128"
+_MODULE_NAME = "sglang_fa2_tile16_tma_ring2_page64_sm120a_bf16_h128"
 
 
 def _replace_once(source: str, old: str, new: str, label: str) -> str:
@@ -53,38 +52,85 @@ inline constexpr bool use_tile16_tma_rows_v =
 
 __device__ __forceinline__ void tile16_tma_wait(uint64_t* barrier, uint32_t phase) {
   while (!cuda::ptx::mbarrier_try_wait_parity(
-      cuda::ptx::sem_relaxed, cuda::ptx::scope_cta, barrier, phase)) {
+      cuda::ptx::sem_acquire, cuda::ptx::scope_cta, barrier, phase)) {
   }
 }
 
-template <typename KTraits>
-__device__ __forceinline__ void tile16_tma_swizzle_kv(
-    typename KTraits::DTypeKV* smem_ptr, const uint32_t warp_idx,
-    const uint32_t lane_idx) {
-  // TMA lands a row-major 64x128 BF16 tile. FlashInfer's retained consumer
-  // addresses 16-byte vectors as j ^ (row % 8), repeated across both 128-byte
-  // halves. Swap each vector pair exactly once in place.
-  using Vec = uint4;
-  constexpr uint32_t kVectorsPerRow =
-      KTraits::HEAD_DIM_QK * sizeof(typename KTraits::DTypeKV) / sizeof(Vec);
-  constexpr uint32_t kThreads = KTraits::NUM_THREADS;
-  static_assert(kVectorsPerRow == 16);
-  Vec* vectors = reinterpret_cast<Vec*>(smem_ptr);
-  const uint32_t tid = warp_idx * WARP_SIZE + lane_idx;
-#pragma unroll
-  for (uint32_t linear = tid;
-       linear < KTraits::CTA_TILE_KV * kVectorsPerRow; linear += kThreads) {
-    const uint32_t row = linear / kVectorsPerRow;
-    const uint32_t column = linear % kVectorsPerRow;
-    const uint32_t peer = column ^ (row % 8);
-    if (column < peer) {
-      const uint32_t row_base = row * kVectorsPerRow;
-      Vec tmp = vectors[row_base + column];
-      vectors[row_base + column] = vectors[row_base + peer];
-      vectors[row_base + peer] = tmp;
-    }
+// SWIZZLE_128B operates on 128-byte rows. A 256-byte FlashInfer KV row
+// is two hardware swizzle rows. Keep offsets logical and map each 16-byte
+// vector only when issuing ldmatrix/stmatrix; no post-copy data shuffle remains.
+struct tile16_tma_smem_t {
+  using Vec = b128_t;
+  Vec* base;
+
+  template <typename T>
+  __device__ __forceinline__ tile16_tma_smem_t(T* ptr)
+      : base(reinterpret_cast<Vec*>(ptr)) {}
+
+  __device__ __forceinline__ static uint32_t physical_offset(
+      const uint32_t logical) {
+    constexpr uint32_t kVectorsPerHead = 16;
+    constexpr uint32_t kVectorsPerSwizzleRow = 8;
+    const uint32_t row = logical / kVectorsPerHead;
+    const uint32_t column = logical % kVectorsPerHead;
+    const uint32_t half = column / kVectorsPerSwizzleRow;
+    const uint32_t column_in_half = column % kVectorsPerSwizzleRow;
+    const uint32_t tma_row = 2 * row + half;
+    return row * kVectorsPerHead + half * kVectorsPerSwizzleRow +
+           (column_in_half ^ (tma_row % kVectorsPerSwizzleRow));
   }
-}
+
+  template <uint32_t stride>
+  __device__ __forceinline__ static uint32_t get_permuted_offset(
+      const uint32_t row, const uint32_t column) {
+    static_assert(stride == 16);
+    return row * stride + column;
+  }
+
+  template <uint32_t step_size>
+  __device__ __forceinline__ static uint32_t advance_offset_by_column(
+      const uint32_t offset, const uint32_t) {
+    return offset + step_size;
+  }
+
+  template <uint32_t step_size, uint32_t row_stride>
+  __device__ __forceinline__ static uint32_t advance_offset_by_row(
+      const uint32_t offset) {
+    static_assert(row_stride == 16);
+    return offset + step_size * row_stride;
+  }
+
+  __device__ __forceinline__ void ldmatrix_m8n8x4(
+      const uint32_t offset, uint32_t* registers) {
+    mma::ldmatrix_m8n8x4(registers, base + physical_offset(offset));
+  }
+  __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(
+      const uint32_t offset, uint32_t* registers) {
+    mma::ldmatrix_m8n8x4_left_half(registers, base + physical_offset(offset));
+  }
+  __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(
+      const uint32_t offset, uint32_t* registers) {
+    mma::ldmatrix_m8n8x4_right_half(registers, base + physical_offset(offset));
+  }
+  __device__ __forceinline__ void ldmatrix_m8n8x4_trans(
+      const uint32_t offset, uint32_t* registers) {
+    mma::ldmatrix_m8n8x4_trans(registers, base + physical_offset(offset));
+  }
+  __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(
+      const uint32_t offset, uint32_t* registers) {
+    mma::ldmatrix_m8n8x4_trans_left_half(
+        registers, base + physical_offset(offset));
+  }
+  __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(
+      const uint32_t offset, uint32_t* registers) {
+    mma::ldmatrix_m8n8x4_trans_right_half(
+        registers, base + physical_offset(offset));
+  }
+  __device__ __forceinline__ void stmatrix_m8n8x4(
+      const uint32_t offset, uint32_t* registers) {
+    mma::stmatrix_m8n8x4(registers, base + physical_offset(offset));
+  }
+};
 
 template <typename KTraits, typename PagedKV>
 __device__ __forceinline__ void page_produce_kv_tma_stage(
@@ -92,8 +138,8 @@ __device__ __forceinline__ void page_produce_kv_tma_stage(
     const CUtensorMap* k_tensor_map, const CUtensorMap* v_tensor_map,
     const PagedKV& paged_kv, const uint32_t packed_page_iter_base,
     const uint32_t kv_idx_base, const uint32_t kv_len,
-    const uint32_t kv_head_idx, const uint32_t tma_kv_rows,
-    const uint32_t stage, const uint32_t warp_idx, const uint32_t lane_idx) {
+    const uint32_t kv_head_idx, const uint32_t stage,
+    const uint32_t warp_idx, const uint32_t lane_idx) {
   static_assert(use_tile16_tma_rows_v<KTraits>);
   constexpr uint32_t kTileElements =
       KTraits::CTA_TILE_KV * KTraits::HEAD_DIM_QK;
@@ -113,32 +159,24 @@ __device__ __forceinline__ void page_produce_kv_tma_stage(
   }
   __syncthreads();
 
-  // One lane issues one 256-byte row copy: lanes [0,64) feed K and [64,128)
-  // feed V. The data movement itself is performed by TMA and completes on the
-  // stage barrier.
-  if (tid < 2 * KTraits::CTA_TILE_KV) {
-    const bool produce_v = tid >= KTraits::CTA_TILE_KV;
-    const uint32_t tile_row = tid % KTraits::CTA_TILE_KV;
-    int32_t coords[2] = {0, static_cast<int32_t>(tma_kv_rows)};
-    if (kv_idx_base + tile_row < kv_len) {
-      uint32_t page_iter, entry_idx;
-      paged_kv.page_size.divmod(
-          packed_page_iter_base + kv_idx_base + tile_row, page_iter, entry_idx);
-      const auto last_indptr = paged_kv.indptr[paged_kv.batch_size];
-      if (page_iter < last_indptr) {
-        const auto page_idx = __ldg(paged_kv.indices + page_iter);
-        coords[1] = static_cast<int32_t>(
-            (static_cast<uint64_t>(page_idx) * paged_kv.page_size + entry_idx) *
-                paged_kv.num_heads +
-            kv_head_idx);
-      }
-    }
-    auto* dst_base = produce_v ? smem_storage->v_smem : smem_storage->k_smem;
-    const CUtensorMap* tensor_map = produce_v ? v_tensor_map : k_tensor_map;
+  // page_size=CTA_TILE_KV=64 makes every stage exactly one physical page.
+  // One elected thread submits one 16-KiB swizzled box for K and one for V;
+  // both copies retire their combined byte count on the stage barrier.
+  if (tid == 0) {
+    uint32_t page_iter, entry_idx;
+    paged_kv.page_size.divmod(
+        packed_page_iter_base + kv_idx_base, page_iter, entry_idx);
+    const auto page_idx = __ldg(paged_kv.indices + page_iter);
+    int32_t coords[5] = {0, 0, static_cast<int32_t>(kv_head_idx), 0,
+                         static_cast<int32_t>(page_idx)};
     cuda::ptx::cp_async_bulk_tensor(
         cuda::ptx::space_shared, cuda::ptx::space_global,
-        dst_base + stage * kTileElements + tile_row * KTraits::HEAD_DIM_QK,
-        tensor_map, coords, barrier);
+        smem_storage->k_smem + stage * kTileElements,
+        k_tensor_map, coords, barrier);
+    cuda::ptx::cp_async_bulk_tensor(
+        cuda::ptx::space_shared, cuda::ptx::space_global,
+        smem_storage->v_smem + stage * kTileElements,
+        v_tensor_map, coords, barrier);
   }
 }
 """
@@ -214,6 +252,38 @@ __device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStorage*
         helper_anchor,
         _TMA_HELPERS + "\n" + helper_anchor,
         "paged producer",
+    )
+    source = _replace_once(
+        source,
+        """template <typename KTraits>
+__device__ __forceinline__ void k_smem_inplace_apply_rotary(
+    const uint32_t kv_idx_base, smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r,""",
+        """template <typename KTraits, typename KVSmem>
+__device__ __forceinline__ void k_smem_inplace_apply_rotary(
+    const uint32_t kv_idx_base, KVSmem* k_smem, uint32_t* k_smem_offset_r,""",
+        "TMA KV rotary wrapper",
+    )
+    source = _replace_once(
+        source,
+        """template <typename KTraits>
+__device__ __forceinline__ void compute_qk(
+    smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
+    smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r, uint8_t* k_sf_smem,""",
+        """template <typename KTraits, typename KVSmem>
+__device__ __forceinline__ void compute_qk(
+    smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
+    KVSmem* k_smem, uint32_t* k_smem_offset_r, uint8_t* k_sf_smem,""",
+        "TMA QK wrapper",
+    )
+    source = _replace_once(
+        source,
+        """template <typename KTraits>
+__device__ __forceinline__ void compute_sfm_v(
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r, uint8_t* v_sf_smem,""",
+        """template <typename KTraits, typename KVSmem>
+__device__ __forceinline__ void compute_sfm_v(
+    KVSmem* v_smem, uint32_t* v_smem_offset_r, uint8_t* v_sf_smem,""",
+        "TMA PV wrapper",
     )
 
     begin = source.index(
@@ -303,7 +373,9 @@ def _patch_paged_device(body: str) -> str:
       block.sync();
     }
 
-    smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
+    using kv_smem_t = std::conditional_t<
+        USE_TILE16_TMA, tile16_tma_smem_t, smem_t<SWIZZLE_MODE_KV>>;
+    kv_smem_t k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
 """,
         "barrier initialization",
     )
@@ -325,7 +397,7 @@ def _patch_paged_device(body: str) -> str:
           page_produce_kv_tma_stage<KTraits>(
               &smem_storage, &tile16_tma_k, &tile16_tma_v, paged_kv,
               tile16_tma_packed_page_iter_base, kv_idx_base, chunk_size,
-              kv_head_idx, params.tile16_tma_kv_rows, stage, warp_idx, lane_idx);
+              kv_head_idx, stage, warp_idx, lane_idx);
         }
       }
     } else {
@@ -364,10 +436,8 @@ def _patch_paged_device(body: str) -> str:
         constexpr uint32_t kTileElements = CTA_TILE_KV * HEAD_DIM_QK;
         auto* k_stage = smem_storage.k_smem + tile16_tma_stage * kTileElements;
         auto* v_stage = smem_storage.v_smem + tile16_tma_stage * kTileElements;
-        tile16_tma_swizzle_kv<KTraits>(k_stage, warp_idx, lane_idx);
-        tile16_tma_swizzle_kv<KTraits>(v_stage, warp_idx, lane_idx);
-        k_smem = smem_t<SWIZZLE_MODE_KV>(k_stage);
-        v_smem = smem_t<SWIZZLE_MODE_KV>(v_stage);
+        k_smem = kv_smem_t(k_stage);
+        v_smem = kv_smem_t(v_stage);
       } else {
         cp_async::wait_group<1>();
       }
@@ -417,8 +487,7 @@ def _patch_paged_device(body: str) -> str:
           page_produce_kv_tma_stage<KTraits>(
               &smem_storage, &tile16_tma_k, &tile16_tma_v, paged_kv,
               tile16_tma_packed_page_iter_base, next_kv_idx_base, chunk_size,
-              kv_head_idx, params.tile16_tma_kv_rows, tile16_tma_stage,
-              warp_idx, lane_idx);
+              kv_head_idx, tile16_tma_stage, warp_idx, lane_idx);
         }
       } else {
 """
@@ -459,7 +528,6 @@ def _patch_config(source: str) -> str:
 
   CUtensorMap tile16_tma_k;
   CUtensorMap tile16_tma_v;
-  uint32_t tile16_tma_kv_rows;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {""",
         "PagedParams descriptor fields",
@@ -486,25 +554,30 @@ def _patch_host_source(source: str) -> str:
         TVM_FFI_ICHECK_EQ(paged_k_cache.stride(2), HEAD_DIM_QK);
         TVM_FFI_ICHECK_EQ(paged_k_cache.stride(1), num_kv_heads * HEAD_DIM_QK);
         TVM_FFI_ICHECK_EQ(paged_k_cache.stride(0), page_size * num_kv_heads * HEAD_DIM_QK);
-        const uint64_t tile16_tma_global_dims[2] = {
-            HEAD_DIM_QK,
-            static_cast<uint64_t>(paged_k_cache.size(0)) * page_size * num_kv_heads};
-        const uint64_t tile16_tma_global_strides[1] = {HEAD_DIM_QK * sizeof(DTypeKV)};
-        const uint32_t tile16_tma_box_dims[2] = {HEAD_DIM_QK, 1};
-        const uint32_t tile16_tma_element_strides[2] = {1, 1};
+        TVM_FFI_ICHECK_EQ(page_size, 64);
+        const uint64_t tile16_tma_global_dims[5] = {
+            64, 2, static_cast<uint64_t>(num_kv_heads),
+            static_cast<uint64_t>(page_size),
+            static_cast<uint64_t>(paged_k_cache.size(0))};
+        const uint64_t tile16_tma_global_strides[4] = {
+            64 * sizeof(DTypeKV),
+            HEAD_DIM_QK * sizeof(DTypeKV),
+            num_kv_heads * HEAD_DIM_QK * sizeof(DTypeKV),
+            page_size * num_kv_heads * HEAD_DIM_QK * sizeof(DTypeKV)};
+        const uint32_t tile16_tma_box_dims[5] = {64, 2, 1, 64, 1};
+        const uint32_t tile16_tma_element_strides[5] = {1, 1, 1, 1, 1};
         auto encode_tile16_tma = [&](CUtensorMap* map, void* base) {
           CUresult result = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-              map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, base,
+              map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, base,
               tile16_tma_global_dims, tile16_tma_global_strides,
               tile16_tma_box_dims, tile16_tma_element_strides,
-              CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+              CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
               CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
           TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
               << "cuTensorMapEncodeTiled failed for tile16 TMA row feed: " << result;
         };
         encode_tile16_tma(&params.tile16_tma_k, paged_k_cache.data_ptr());
         encode_tile16_tma(&params.tile16_tma_v, paged_v_cache.data_ptr());
-        params.tile16_tma_kv_rows = tile16_tma_global_dims[1];
         params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());"""
     return _replace_once(source, anchor, replacement, "host descriptor construction")
 
