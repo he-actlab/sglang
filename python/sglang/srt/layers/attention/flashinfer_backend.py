@@ -1103,9 +1103,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 raise ValueError(
                     "tile16 TMA and the exact-N8 replacement are mutually exclusive"
                 )
+            from sglang.srt.multiplex.pdmux_context import (
+                get_spec_sm_allocated_split,
+                spec_sm_partition_enabled,
+            )
+
             config = model_runner.model_config
             pool = self.token_to_kv_pool
             errors = []
+            allocated_split = get_spec_sm_allocated_split()
+            if (
+                not spec_sm_partition_enabled(model_runner.server_args)
+                or allocated_split != (136, 52)
+            ):
+                errors.append(f"allocated SM split={allocated_split}")
             if model_runner.device != "cuda":
                 errors.append(f"device={model_runner.device}")
             elif torch.cuda.get_device_capability(model_runner.gpu_id) != (12, 0):

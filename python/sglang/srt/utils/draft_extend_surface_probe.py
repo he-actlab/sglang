@@ -957,6 +957,9 @@ def _validate_stock_fullchip_runtime(
         "draft_extend_flashinfer_fixed_split_size": treatment_identity[3],
         "draft_extend_flashinfer_disable_split_kv": treatment_identity[4],
         "draft_extend_flashinfer_force_q_tile_16": treatment_identity[5],
+        "draft_extend_flashinfer_tile16_tma": bool(
+            envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
+        ),
         "draft_extend_short_q_attention": treatment_identity[6],
     }
     # Stock execution has no alternate partition stream. CUDA graph replay uses
@@ -1081,6 +1084,10 @@ def _validate_fixed52_runtime(
             "drafter TMA must remain off for the S2 denominator",
         ),
         (
+            not envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get(),
+            "tile16 TMA is on for the full-chip arm",
+        ),
+        (
             not flashinfer_hint
             or envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get(),
             "SM120 draft kernels are off",
@@ -1190,6 +1197,12 @@ def _validate_fixed52_runtime(
         ),
         "draft_extend_flashinfer_force_q_tile_16": bool(
             envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16.get()
+        ),
+        "draft_extend_flashinfer_tile16_tma": bool(
+            envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
+        ),
+        "draft_extend_short_q_attention": bool(
+            envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get()
         ),
     }
     return identity, get_spec_streams()[1]

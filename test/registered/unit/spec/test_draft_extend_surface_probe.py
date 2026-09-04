@@ -91,6 +91,8 @@ def _plan_identity():
         "draft_extend_flashinfer_fixed_split_size": 0,
         "draft_extend_flashinfer_disable_split_kv": False,
         "draft_extend_flashinfer_force_q_tile_16": False,
+        "draft_extend_flashinfer_tile16_tma": False,
+        "draft_extend_short_q_attention": False,
     }
 
 
