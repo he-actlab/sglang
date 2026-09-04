@@ -886,6 +886,10 @@ def _validate_stock_fullchip_runtime(
         ),
         (not envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get(), "drafter TMA is on"),
         (
+            not envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get(),
+            "tile16 TMA is on for the full-chip arm",
+        ),
+        (
             not envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get(),
             "SM120 draft kernels are on",
         ),
@@ -1082,10 +1086,6 @@ def _validate_fixed52_runtime(
         (
             not envs.SGLANG_ENABLE_QWEN3_DRAFTER_TMA.get(),
             "drafter TMA must remain off for the S2 denominator",
-        ),
-        (
-            not envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get(),
-            "tile16 TMA is on for the full-chip arm",
         ),
         (
             not flashinfer_hint
