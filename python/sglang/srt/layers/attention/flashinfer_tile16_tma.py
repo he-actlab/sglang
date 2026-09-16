@@ -23,7 +23,6 @@ from types import SimpleNamespace
 
 import torch
 
-
 _UPSTREAM_PREFILL_SHA256 = (
     "ed83f5964cf1d815f80393248360ae525bdf64fb53bc1bfaf58bf03d42b9b464"
 )
@@ -182,7 +181,7 @@ __device__ __forceinline__ void page_produce_kv_tma_stage(
 """
 
 
-def _patch_prefill_header(source: str) -> str:
+def _prepare_prefill_header(source: str) -> str:
     digest = hashlib.sha256(source.encode()).hexdigest()
     if digest != _UPSTREAM_PREFILL_SHA256:
         raise RuntimeError(
@@ -197,27 +196,33 @@ def _patch_prefill_header(source: str) -> str:
         "CUDA include",
     )
     for relative, installed in (
-        ('#include "../cp_async.cuh"', '#include <flashinfer/cp_async.cuh>'),
-        ('#include "../fastdiv.cuh"', '#include <flashinfer/fastdiv.cuh>'),
-        ('#include "../fp16.h"', '#include <flashinfer/fp16.h>'),
+        ('#include "../cp_async.cuh"', "#include <flashinfer/cp_async.cuh>"),
+        ('#include "../fastdiv.cuh"', "#include <flashinfer/fastdiv.cuh>"),
+        ('#include "../fp16.h"', "#include <flashinfer/fp16.h>"),
         (
             '#include "../frag_layout_swizzle.cuh"',
-            '#include <flashinfer/frag_layout_swizzle.cuh>',
+            "#include <flashinfer/frag_layout_swizzle.cuh>",
         ),
-        ('#include "../math.cuh"', '#include <flashinfer/math.cuh>'),
-        ('#include "../mma.cuh"', '#include <flashinfer/mma.cuh>'),
-        ('#include "../page.cuh"', '#include <flashinfer/page.cuh>'),
+        ('#include "../math.cuh"', "#include <flashinfer/math.cuh>"),
+        ('#include "../mma.cuh"', "#include <flashinfer/mma.cuh>"),
+        ('#include "../page.cuh"', "#include <flashinfer/page.cuh>"),
         (
             '#include "../permuted_smem.cuh"',
-            '#include <flashinfer/permuted_smem.cuh>',
+            "#include <flashinfer/permuted_smem.cuh>",
         ),
-        ('#include "../pos_enc.cuh"', '#include <flashinfer/pos_enc.cuh>'),
-        ('#include "../utils.cuh"', '#include <flashinfer/utils.cuh>'),
-        ('#include "cascade.cuh"', '#include <flashinfer/attention/cascade.cuh>'),
-        ('#include "mask.cuh"', '#include <flashinfer/attention/mask.cuh>'),
-        ('#include "variants.cuh"', '#include <flashinfer/attention/variants.cuh>'),
+        ('#include "../pos_enc.cuh"', "#include <flashinfer/pos_enc.cuh>"),
+        ('#include "../utils.cuh"', "#include <flashinfer/utils.cuh>"),
+        ('#include "cascade.cuh"', "#include <flashinfer/attention/cascade.cuh>"),
+        ('#include "mask.cuh"', "#include <flashinfer/attention/mask.cuh>"),
+        ('#include "variants.cuh"', "#include <flashinfer/attention/variants.cuh>"),
     ):
         source = _replace_once(source, relative, installed, relative)
+
+    return source
+
+
+def _patch_prefill_header(source: str) -> str:
+    source = _prepare_prefill_header(source)
 
     storage_anchor = """  alignas(16) std::conditional_t<is_fp4_type_v<DTypeKV>,
                                  uint8_t[CTA_TILE_KV * HEAD_DIM_VO / NVFP4_SF_VEC_SIZE],
@@ -384,9 +389,13 @@ def _patch_paged_device(body: str) -> str:
         "#pragma unroll\n    for (uint32_t i = 0;",
         body.index("packed_page_iter_base"),
     )
-    first_calls_end_marker = "    cp_async::commit_group();\n\n    uint32_t num_iterations_prefix;"
+    first_calls_end_marker = (
+        "    cp_async::commit_group();\n\n    uint32_t num_iterations_prefix;"
+    )
     first_calls_end = body.index(first_calls_end_marker, first_offsets_start)
-    stock_initial = body[first_offsets_start:first_calls_end] + "    cp_async::commit_group();\n"
+    stock_initial = (
+        body[first_offsets_start:first_calls_end] + "    cp_async::commit_group();\n"
+    )
     tma_initial = """const uint32_t tile16_tma_packed_page_iter_base =
         packed_page_iter_base;
     if constexpr (USE_TILE16_TMA) {
@@ -409,7 +418,8 @@ def _patch_paged_device(body: str) -> str:
     )
 
     loop_offsets_start = body.index(
-        "#pragma unroll\n      for (uint32_t i = 0;", body.index("for (uint32_t iter = 0;")
+        "#pragma unroll\n      for (uint32_t i = 0;",
+        body.index("for (uint32_t iter = 0;"),
     )
     loop_wait = body.index("      cp_async::wait_group<1>();", loop_offsets_start)
     stock_offsets = body[loop_offsets_start:loop_wait]
@@ -462,9 +472,7 @@ def _patch_paged_device(body: str) -> str:
         body,
         k_load,
         """      if constexpr (!USE_TILE16_TMA) {
-"""
-        + k_load.replace("      ", "        ")
-        + "\n      }",
+""" + k_load.replace("      ", "        ") + "\n      }",
         "stock next K and V wait",
     )
 
@@ -490,9 +498,7 @@ def _patch_paged_device(body: str) -> str:
               kv_head_idx, tile16_tma_stage, warp_idx, lane_idx);
         }
       } else {
-"""
-        + v_load.replace("      ", "        ")
-        + "\n      }",
+""" + v_load.replace("      ", "        ") + "\n      }",
         "next V",
     )
     body = _replace_once(
@@ -582,9 +588,202 @@ def _patch_host_source(source: str) -> str:
     return _replace_once(source, anchor, replacement, "host descriptor construction")
 
 
-@functools.cache
-def get_tile16_tma_prefill_module():
-    """Build and wrap the exact pinned FlashInfer FA2 module with TMA K/V feed."""
+def _patch_diagnostic_header(source: str, transport: str) -> str:
+    """Add uniform runtime ablations to one binary per transport.
+
+    Mode 2 initializes a finite, nonuniform K/V tile directly in shared memory
+    and repeats the original consumer at the original logical positions. Its
+    output is diagnostic, not attention. Mode 1 observes both halves of every
+    transported tile through a small checksum instead of running the consumer.
+    """
+    source = (
+        _patch_prefill_header(source)
+        if transport == "tma"
+        else _prepare_prefill_header(source)
+    )
+    begin = source.index(
+        "__device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice("
+    )
+    end = source.index(
+        "template <typename KTraits, typename Params>\n__global__", begin
+    )
+    body = source[begin:end]
+    body = _replace_once(
+        body,
+        "    [[maybe_unused]] constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;\n",
+        "    [[maybe_unused]] constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;\n"
+        "    const uint32_t diagnostic_mode = params.diagnostic_mode;\n"
+        "    float diagnostic_checksum = 0.f;\n",
+        "diagnostic mode",
+    )
+
+    if transport == "tma":
+        body = _replace_once(
+            body,
+            "        if (kv_idx_base < chunk_size) {",
+            "        if (diagnostic_mode != 2 && kv_idx_base < chunk_size) {",
+            "diagnostic TMA bootstrap",
+        )
+        body = _replace_once(
+            body,
+            "      const uint32_t tile16_tma_stage = iter % kTile16TmaStages;",
+            "      const uint32_t tile16_tma_stage =\n"
+            "          diagnostic_mode == 2 ? 0 : iter % kTile16TmaStages;",
+            "diagnostic TMA retained stage",
+        )
+        wait = """        tile16_tma_wait(
+            &smem_storage.tile16_tma_barriers[tile16_tma_stage],
+            (iter / kTile16TmaStages) & 1);"""
+        body = _replace_once(
+            body,
+            wait,
+            "        if (diagnostic_mode != 2) {\n" + wait + "\n        }",
+            "diagnostic TMA bootstrap wait",
+        )
+        body = _replace_once(
+            body,
+            "        if (next_kv_idx_base < chunk_size) {",
+            "        if (diagnostic_mode != 2 && next_kv_idx_base < chunk_size) {",
+            "diagnostic TMA refill",
+        )
+        stage_offset = "tile16_tma_stage * CTA_TILE_KV * HEAD_DIM_QK + "
+    else:
+        initial_begin = body.index(
+            "#pragma unroll\n    for (uint32_t i = 0;",
+            body.index("packed_page_iter_base"),
+        )
+        initial_end_marker = (
+            "    cp_async::commit_group();\n\n    uint32_t num_iterations_prefix;"
+        )
+        initial_end = body.index(initial_end_marker, initial_begin) + len(
+            "    cp_async::commit_group();\n"
+        )
+        initial = body[initial_begin:initial_end]
+        body = _replace_once(
+            body,
+            initial,
+            "    if (diagnostic_mode != 2) {\n" + initial + "    }\n",
+            "diagnostic initial page lookup and copy",
+        )
+        loop_begin = body.index("    for (uint32_t iter = 0;")
+        prefix, loop = body[:loop_begin], body[loop_begin:]
+        offsets_begin = loop.index("#pragma unroll\n      for (uint32_t i = 0;")
+        offsets_end = loop.index("      cp_async::wait_group<1>();", offsets_begin)
+        offsets = loop[offsets_begin:offsets_end]
+        loop = _replace_once(
+            loop,
+            offsets,
+            "      if (diagnostic_mode != 2) {\n" + offsets + "      }\n",
+            "diagnostic recurring page lookup",
+        )
+        for operand in ("false", "true"):
+            load_begin = loop.index(f"      page_produce_kv<{operand}, KTraits>")
+            commit = "      cp_async::commit_group();"
+            load_end = loop.index(commit, load_begin) + len(commit)
+            load = loop[load_begin:load_end]
+            loop = _replace_once(
+                loop,
+                load,
+                "      if (diagnostic_mode != 2) {\n" + load + "\n      }",
+                f"diagnostic recurring copy ({operand})",
+            )
+        if loop.count("      cp_async::wait_group<1>();") != 2:
+            raise RuntimeError("tile16 diagnostic expected two cp.async waits")
+        # Consumer-only mode retains the real Q load, but has no K/V groups
+        # behind it. wait_group<1> would leave that Q load outstanding.
+        loop = loop.replace(
+            "      cp_async::wait_group<1>();",
+            "      if (diagnostic_mode == 2) cp_async::wait_group<0>();\n"
+            "      else cp_async::wait_group<1>();",
+        )
+        body = prefix + loop
+        stage_offset = ""
+
+    shared_init = """    if (diagnostic_mode == 2) {
+      // One-time setup is part of the diagnostic latency. The real Q and the
+      // workload's masks/tripcounts remain; global K/V payload is never read.
+      const uint32_t thread = warp_idx * WARP_SIZE + lane_idx;
+      for (uint32_t i = thread; i < CTA_TILE_KV * HEAD_DIM_QK;
+           i += KTraits::NUM_THREADS) {
+        const int k_pattern = int((i * 17 + (i >> 7) * 13 + 3) & 63) - 31;
+        const int v_pattern = int((i * 11 + (i >> 7) * 7 + 5) & 63) - 31;
+        smem_storage.k_smem[i] = static_cast<DTypeKV>(float(k_pattern) * 0.03125f);
+        smem_storage.v_smem[i] = static_cast<DTypeKV>(float(v_pattern) * 0.03125f);
+      }
+      block.sync();
+    }
+
+"""
+    body = _replace_once(
+        body,
+        "    uint32_t num_iterations_prefix;",
+        shared_init + "    uint32_t num_iterations_prefix;",
+        "diagnostic shared K/V initialization",
+    )
+
+    qk_begin = body.index("      // compute attention score\n")
+    qk_end_marker = "      update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);\n"
+    qk_end = body.index(qk_end_marker, qk_begin) + len(qk_end_marker)
+    qk = body[qk_begin:qk_end]
+    body = _replace_once(
+        body,
+        qk,
+        "      if (diagnostic_mode != 1) {\n" + qk + "      } else {\n"
+        "        diagnostic_checksum += static_cast<float>(\n"
+        "            reinterpret_cast<const volatile uint16_t*>(smem_storage.k_smem)[\n"
+        f"                {stage_offset}warp_idx * WARP_SIZE + lane_idx]);\n"
+        "      }\n",
+        "diagnostic QK and softmax",
+    )
+    pv_begin = body.index("      // compute sfm*v\n")
+    pv_end = body.index("\n\n      block.sync();", pv_begin)
+    pv = body[pv_begin:pv_end]
+    body = _replace_once(
+        body,
+        pv,
+        "      if (diagnostic_mode != 1) {\n" + pv + "\n      } else {\n"
+        "        diagnostic_checksum += static_cast<float>(\n"
+        "            reinterpret_cast<const volatile uint16_t*>(smem_storage.v_smem)[\n"
+        f"                {stage_offset}warp_idx * WARP_SIZE + lane_idx]);\n"
+        "      }",
+        "diagnostic PV",
+    )
+    sink = """    if (diagnostic_mode == 1) {
+      // Observe every stage without another kernel, global scratch allocation,
+      // or a full shared-memory reduction. This is deliberately not attention.
+      const uint32_t thread = warp_idx * WARP_SIZE + lane_idx;
+      for (uint32_t qi = 0; qi < qo_len; ++qi) {
+        for (uint32_t h = 0; h < uint32_t(group_size); ++h) {
+          for (uint32_t di = thread; di < HEAD_DIM_VO; di += KTraits::NUM_THREADS) {
+            o_ptr_base[qi * o_stride_n + h * o_stride_h + di] =
+                static_cast<DTypeO>(diagnostic_checksum);
+          }
+        }
+      }
+      if (lse != nullptr && thread < qo_len * uint32_t(group_size)) {
+        uint32_t qi, h;
+        group_size.divmod(thread, qi, h);
+        lse[(o_indptr[request_idx] + qi) * num_qo_heads +
+            kv_head_idx * uint32_t(group_size) + h] = diagnostic_checksum;
+      }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      asm volatile("griddepcontrol.launch_dependents;");
+#endif
+      return;
+    }
+
+"""
+    body = _replace_once(
+        body,
+        "    finalize_m<KTraits>(variant, m);",
+        sink + "    finalize_m<KTraits>(variant, m);",
+        "diagnostic transport epilogue",
+    )
+    return source[:begin] + body + source[end:]
+
+
+def _build_tile16_prefill_module(module_name: str, *, transport: str, diagnostic: bool):
+    """Share the pinned generator and stock ABI across production and diagnostics."""
     from flashinfer.jit import env as jit_env
     from flashinfer.jit.attention import gen_customize_batch_prefill_module
     from flashinfer.jit.utils import write_if_different
@@ -592,7 +791,7 @@ def get_tile16_tma_prefill_module():
 
     spec = gen_customize_batch_prefill_module(
         "fa2",
-        _MODULE_NAME,
+        module_name,
         torch.bfloat16,
         torch.bfloat16,
         torch.bfloat16,
@@ -625,24 +824,32 @@ def get_tile16_tma_prefill_module():
             "rope_rcp_scale",
             "rope_rcp_theta",
             "token_pos_in_items_len",
-        ],
-        ["double", "double", "double", "double", "int64_t"],
+        ]
+        + (["diagnostic_mode"] if diagnostic else []),
+        ["double", "double", "double", "double", "int64_t"]
+        + (["int64_t"] if diagnostic else []),
         "DefaultAttention<use_custom_mask, false, false, false>",
         "#include<flashinfer/attention/variants.cuh>",
     )
     # Keep this experimental module specific to the measured SM120 target.
     spec.extra_cuda_cflags.insert(0, "-gencode=arch=compute_120a,code=sm_120a")
-    gen_dir = jit_env.FLASHINFER_GEN_SRC_DIR / _MODULE_NAME
+    gen_dir = jit_env.FLASHINFER_GEN_SRC_DIR / module_name
     upstream = (
         jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer" / "attention" / "prefill.cuh"
     ).read_text()
     custom_header = gen_dir / "batch_prefill_tile16_tma.cuh"
-    write_if_different(custom_header, _patch_prefill_header(upstream))
+    patched_header = (
+        _patch_diagnostic_header(upstream, transport)
+        if diagnostic
+        else _patch_prefill_header(upstream)
+    )
+    write_if_different(custom_header, patched_header)
 
-    config = gen_dir / "batch_prefill_config.inc"
-    write_if_different(config, _patch_config(config.read_text()))
-    host = gen_dir / "batch_prefill.cu"
-    write_if_different(host, _patch_host_source(host.read_text()))
+    if transport == "tma":
+        config = gen_dir / "batch_prefill_config.inc"
+        write_if_different(config, _patch_config(config.read_text()))
+        host = gen_dir / "batch_prefill.cu"
+        write_if_different(host, _patch_host_source(host.read_text()))
     for path in gen_dir.glob("batch_prefill_paged_kernel_mask_*.cu"):
         write_if_different(
             path,
@@ -654,7 +861,14 @@ def get_tile16_tma_prefill_module():
             ),
         )
     raw_module = spec.build_and_load()
-    module = get_batch_prefill_jit_module(_MODULE_NAME, raw_module)
+    module = get_batch_prefill_jit_module(module_name, raw_module)
+    diagnostic_mode = 0
+
+    def set_diagnostic_mode(mode: int) -> None:
+        nonlocal diagnostic_mode
+        if type(mode) is not int or mode not in (0, 1, 2):
+            raise ValueError("tile16 diagnostic mode must be 0, 1, or 2")
+        diagnostic_mode = mode
 
     def paged_run_stock_abi(*args):
         """Accept the stock wrapper ABI and forward the FA2 subset.
@@ -670,6 +884,14 @@ def get_tile16_tma_prefill_module():
             raise RuntimeError(
                 f"tile16 TMA expected the pinned 46-argument stock ABI, got {len(args)}"
             )
+        if diagnostic:
+            plan = args[2]
+            if int(plan[3]) != 16 or bool(plan[14]):
+                raise ValueError("tile16 diagnostics require Q tile 16 and no split-KV")
+            if int(args[12]) != 1 or int(args[13]) != 0 or int(args[14]) != -1:
+                raise ValueError(
+                    "tile16 diagnostics require causal NHD attention without a window"
+                )
         stock = args[16:]
         fa2_extra = (
             stock[0],  # maybe_custom_mask
@@ -686,13 +908,47 @@ def get_tile16_tma_prefill_module():
             1.0 / stock[12],  # rope_rcp_theta
             stock[13],  # token_pos_in_items_len
         )
+        if diagnostic:
+            fa2_extra += (diagnostic_mode,)
         return module.paged_run(*(args[:16] + fa2_extra))
 
-    return SimpleNamespace(
+    result = SimpleNamespace(
         plan=module.plan,
         ragged_run=module.ragged_run,
         paged_run=paged_run_stock_abi,
     )
+    if diagnostic:
+        result.set_diagnostic_mode = set_diagnostic_mode
+        result.get_diagnostic_mode = lambda: diagnostic_mode
+        result.module_name = module_name
+        result.transport = transport
+    return result
 
 
-__all__ = ["get_tile16_tma_prefill_module"]
+@functools.cache
+def get_tile16_tma_prefill_module():
+    """Build and wrap the exact pinned FlashInfer FA2 module with TMA K/V feed."""
+    return _build_tile16_prefill_module(_MODULE_NAME, transport="tma", diagnostic=False)
+
+
+@functools.cache
+def get_tile16_diagnostic_prefill_module(transport: str = "cpasync"):
+    """Build diagnostic full/transport/consumer modes in the same CUDA binary.
+
+    ``set_diagnostic_mode(0|1|2)`` changes the scalar argument for subsequent
+    launches and captures. An already captured CUDA graph retains its captured
+    mode. Modes 1 and 2 do not compute attention and must never serve requests.
+    Consumer-only mode includes one-time shared-memory K/V initialization and
+    repeats that tile at the workload's original logical positions. It reads
+    the real Q but no global K/V payload; initialization is part of its timing.
+    The caller must verify mode-0 latency/resources against the original binary.
+    """
+    if transport not in ("cpasync", "tma"):
+        raise ValueError("tile16 diagnostic transport must be 'cpasync' or 'tma'")
+    module_name = f"sglang_fa2_tile16_diagnostic_{transport}_v1_sm120a_bf16_h128"
+    return _build_tile16_prefill_module(
+        module_name, transport=transport, diagnostic=True
+    )
+
+
+__all__ = ["get_tile16_tma_prefill_module", "get_tile16_diagnostic_prefill_module"]

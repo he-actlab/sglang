@@ -55,6 +55,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.draft_extend_surface_probe import (
     draft_extend_attention_scope,
+    draft_extend_attention_snapshot,
 )
 
 if TYPE_CHECKING:
@@ -2014,6 +2015,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 if forward_batch.forward_mode.is_draft_extend_v2():
                     kv_cache = _reshape_kv_cache_for_flashinfer_pages(
                         kv_cache, self.token_to_kv_pool.page_size
+                    )
+                    draft_extend_attention_snapshot(
+                        q_view,
+                        kv_cache,
+                        prefill_wrapper_paged,
+                        layer,
+                        self.token_to_kv_pool.page_size,
                     )
                 if (
                     self.use_draft_extend_short_q_attention

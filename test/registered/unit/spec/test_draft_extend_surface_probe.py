@@ -21,6 +21,7 @@ from sglang.srt.utils.draft_extend_surface_probe import (
     SURFACE_ORDER,
     create_surface_probe,
     draft_extend_attention_scope,
+    draft_extend_attention_snapshot,
     draft_extend_lm_head_scope,
     draft_extend_projection_scope,
 )
@@ -150,6 +151,7 @@ def _config(
     ncu_replay_index=2,
     require_plan_metadata=False,
     config_identity=None,
+    attention_snapshot_path=None,
 ):
     return DraftExtendSurfaceProbeConfig(
         mode=mode,
@@ -169,6 +171,8 @@ def _config(
             else {"arm": "unit", "width": 52}
         ),
         require_prefill_plan_metadata=require_plan_metadata,
+        attention_snapshot_path=attention_snapshot_path,
+        attention_snapshot_fork_sha="a" * 40 if attention_snapshot_path else "",
     )
 
 
@@ -880,6 +884,90 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             args.random_seed = 1
             with self.assertRaisesRegex(RuntimeError, "server random seed"):
                 probe_module._validate_fixed52_runtime(runner, [32], 4)
+
+
+class AttentionSnapshotTests(CustomTestCase):
+    def _capture(self, path):
+        probe = DraftExtendSurfaceProbe(
+            _config(
+                mode="off",
+                surfaces=(),
+                ncu_replay_index=21,
+                attention_snapshot_path=str(path),
+            ),
+            event_factory=_FakeEventFactory(),
+        )
+        q = torch.ones((128, 16, 128), dtype=torch.bfloat16)
+        key = torch.randn((12, 64, 8, 128), dtype=torch.bfloat16)
+        value = torch.randn_like(key)
+        wrapper = SimpleNamespace(
+            _qo_indptr_buf=torch.arange(33, dtype=torch.int32) * 4,
+            _paged_kv_indptr_buf=torch.arange(33, dtype=torch.int32) * 2,
+            _paged_kv_indices_buf=torch.tensor([8, 3] * 32, dtype=torch.int32),
+            _paged_kv_last_page_len_buf=torch.full((32,), 17, dtype=torch.int32),
+        )
+        layer = SimpleNamespace(layer_id=0, scaling=128**-0.5)
+        with probe.capture_scope(128):
+            draft_extend_attention_snapshot(q, (key, value), wrapper, layer, 64)
+        return probe, q, key, value, wrapper
+
+    def test_snapshot_freezes_q_and_reads_live_sparse_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            probe, q, key, value, wrapper = self._capture(Path(directory) / "input.pt")
+            q.fill_(2)
+            # Metadata is read at the selected replay, not frozen at capture.
+            wrapper._paged_kv_indices_buf[0] = 5
+            wrapper._paged_kv_last_page_len_buf[0] = 63
+            snapshot = probe._build_attention_snapshot(21)
+            tensors = snapshot["tensors"]
+            metadata = snapshot["metadata"]
+            self.assertEqual(tensors["physical_page_ids"].tolist(), [3, 5, 8])
+            self.assertEqual(tensors["kv_indices"][0].item(), 5)
+            torch.testing.assert_close(tensors["q"], torch.ones_like(q))
+            torch.testing.assert_close(tensors["k_pages"], key[[3, 5, 8]])
+            torch.testing.assert_close(tensors["v_pages"], value[[3, 5, 8]])
+            self.assertEqual(metadata["key_pool_shape"], [12, 64, 8, 128])
+            self.assertEqual(metadata["logical_workload"]["kv_lens_tokens"][0], 127)
+            self.assertFalse(metadata["timing_valid"])
+            repeated = probe._build_attention_snapshot(21)
+            self.assertEqual(
+                metadata["contents_sha256"], repeated["metadata"]["contents_sha256"]
+            )
+            key[5, 0, 0, 0] = key[5, 0, 0, 0] + 10
+            changed = probe._build_attention_snapshot(21)
+            self.assertNotEqual(
+                metadata["contents_sha256"], changed["metadata"]["contents_sha256"]
+            )
+
+    def test_snapshot_is_saved_once_after_the_selected_successful_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.pt"
+            probe, _, _, _, _ = self._capture(path)
+            with patch.object(probe_module.torch.cuda, "synchronize") as synchronize:
+                # Padded small batches must not consume the replay ordinal.
+                self.assertIsNone(probe.before_replay(raw_bs=16, padded_bs=32))
+                for replay in range(1, 23):
+                    token = probe.before_replay(raw_bs=32, padded_bs=32)
+                    probe.after_replay(token, raw_bs=32, padded_bs=32, succeeded=True)
+                    self.assertEqual(path.exists(), replay >= 21)
+                synchronize.assert_called_once_with(0)
+            saved = torch.load(path, weights_only=True)
+            self.assertEqual(saved["metadata"]["replay_index"], 21)
+            self.assertEqual(saved["metadata"]["source"]["fork_sha"], "a" * 40)
+            self.assertEqual(saved["kind"], "draft_extend_attention_snapshot")
+            with self.assertRaisesRegex(ValueError, "new file"):
+                self._capture(path)
+
+    def test_snapshot_rejects_invalid_live_page_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            probe, _, _, _, wrapper = self._capture(Path(directory) / "input.pt")
+            wrapper._paged_kv_indices_buf[0] = 12
+            with self.assertRaisesRegex(RuntimeError, "out-of-bounds"):
+                probe._build_attention_snapshot(21)
+
+    def test_snapshot_off_does_not_touch_attention_arguments(self):
+        # No tensor clone, shape inspection, or page read on the normal path.
+        draft_extend_attention_snapshot(None, None, None, None, None)
 
 
 if __name__ == "__main__":

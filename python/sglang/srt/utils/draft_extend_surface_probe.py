@@ -14,6 +14,8 @@ import contextvars
 import hashlib
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -96,6 +98,8 @@ class DraftExtendSurfaceProbeConfig:
     device_index: int
     config_identity: Dict[str, Any]
     require_prefill_plan_metadata: bool = False
+    attention_snapshot_path: Optional[str] = None
+    attention_snapshot_fork_sha: str = ""
 
 
 @dataclass(frozen=True)
@@ -181,6 +185,8 @@ class _CaptureScope:
             raise RuntimeError("nested draft-extend surface probe capture")
         probe._call_counts = {surface: 0 for surface in probe.config.surfaces}
         probe._captured_calls = []
+        if probe.config.attention_snapshot_path:
+            probe._attention_snapshot_source = None
         self._context_token = _ACTIVE_PROBE.set(probe)
         return self
 
@@ -188,6 +194,11 @@ class _CaptureScope:
         probe = self._probe
         _ACTIVE_PROBE.reset(self._context_token)
         if exc_type is None:
+            if (
+                probe.config.attention_snapshot_path
+                and probe._attention_snapshot_source is None
+            ):
+                raise RuntimeError("attention snapshot did not capture layer 0")
             mismatches = {
                 surface: (probe._call_counts[surface], EXPECTED_CALLS[surface])
                 for surface in probe.config.surfaces
@@ -219,6 +230,14 @@ class DraftExtendSurfaceProbe:
         self._call_counts = {surface: 0 for surface in config.surfaces}
         self._cache_scrub = None
         self._cache_scrub_bytes = 0
+        self._attention_snapshot_source = None
+        self._attention_snapshot_written = False
+        if config.attention_snapshot_path:
+            snapshot_path = Path(config.attention_snapshot_path)
+            if snapshot_path.exists() or not snapshot_path.parent.is_dir():
+                raise ValueError(
+                    "attention snapshot requires a new file in an existing directory"
+                )
 
         self._capture_prefill_plan_metadata = {}
         self._wrote_replay_prefill_plan_metadata = False
@@ -504,9 +523,153 @@ class DraftExtendSurfaceProbe:
         stream.synchronize()
 
     def capture_scope(self, num_tokens: int):
-        if num_tokens != TARGET_M or not self.config.surfaces:
+        if num_tokens != TARGET_M or not (
+            self.config.surfaces or self.config.attention_snapshot_path
+        ):
             return contextlib.nullcontext()
         return _CaptureScope(self)
+
+    def capture_attention_snapshot(self, q, kv_cache, wrapper, layer, page_size):
+        """Capture one Q copy; read its replayed values only after graph completion.
+
+        Keeping a view of Q is insufficient: later graph nodes may reuse or
+        modify its backing storage. This dedicated clone executes on every
+        replay of the diagnostic graph, so that run has no timing authority.
+        """
+        if not self.config.attention_snapshot_path or int(layer.layer_id) != 0:
+            return
+        if self._attention_snapshot_source is not None:
+            raise RuntimeError("attention snapshot captured layer 0 more than once")
+        if tuple(q.shape) != (TARGET_M, 16, 128) or q.dtype != torch.bfloat16:
+            raise RuntimeError("attention snapshot requires BF16 Q[128,16,128]")
+        if page_size != 64 or len(kv_cache) != 2:
+            raise RuntimeError("attention snapshot requires page64 NHD K/V")
+        for cache in kv_cache:
+            if (
+                cache.ndim != 4
+                or tuple(cache.shape[1:]) != (64, 8, 128)
+                or cache.dtype != torch.bfloat16
+                or not cache.is_contiguous()
+            ):
+                raise RuntimeError("attention snapshot requires contiguous BF16 NHD pages")
+        self._attention_snapshot_source = {
+            "q": q.detach().clone(),
+            "q_stride": list(q.stride()),
+            "kv_cache": kv_cache,
+            "wrapper": wrapper,
+            "sm_scale": float(layer.scaling),
+        }
+
+    def _build_attention_snapshot(self, replay_index):
+        """Build a CPU-only artifact after the selected graph has completed.
+
+        Copy only referenced pages. Original physical IDs are retained so a
+        standalone consumer can restore the layout rather than silently
+        substituting a compact, more contiguous allocation.
+        """
+        source = self._attention_snapshot_source
+        if source is None:
+            raise RuntimeError("selected replay has no captured attention source")
+        wrapper = source["wrapper"]
+        qo_indptr = wrapper._qo_indptr_buf.detach().cpu().clone()
+        kv_indptr = wrapper._paged_kv_indptr_buf.detach().cpu().clone()
+        last_page_len = wrapper._paged_kv_last_page_len_buf.detach().cpu().clone()
+        expected_qo = torch.arange(TARGET_BS + 1, dtype=torch.int32) * 4
+        if qo_indptr.dtype != torch.int32 or not torch.equal(qo_indptr, expected_qo):
+            raise RuntimeError("snapshot live Q metadata differs from c32/Q4")
+        if (
+            kv_indptr.shape != (TARGET_BS + 1,)
+            or last_page_len.shape != (TARGET_BS,)
+            or kv_indptr.dtype != torch.int32
+            or last_page_len.dtype != torch.int32
+            or int(kv_indptr[0]) != 0
+            or bool(torch.any(kv_indptr[1:] <= kv_indptr[:-1]))
+            or bool(torch.any((last_page_len < 1) | (last_page_len > 64)))
+        ):
+            raise RuntimeError("snapshot live page metadata is invalid")
+        used_indices = int(kv_indptr[-1])
+        kv_indices = (
+            wrapper._paged_kv_indices_buf[:used_indices].detach().cpu().clone()
+        )
+        if kv_indices.dtype != torch.int32 or kv_indices.numel() != used_indices:
+            raise RuntimeError("snapshot page-index buffer is invalid")
+        physical_page_ids = torch.unique(kv_indices.to(torch.int64), sorted=True)
+        k_cache, v_cache = source["kv_cache"]
+        if k_cache.shape != v_cache.shape or (
+            int(physical_page_ids[0]) < 0
+            or int(physical_page_ids[-1]) >= k_cache.shape[0]
+        ):
+            raise RuntimeError("snapshot contains an out-of-bounds physical page")
+        device_ids = physical_page_ids.to(k_cache.device)
+        tensors = {
+            "q": source["q"].detach().cpu().contiguous(),
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_last_page_len": last_page_len,
+            "physical_page_ids": physical_page_ids,
+            "k_pages": k_cache.index_select(0, device_ids).detach().cpu(),
+            "v_pages": v_cache.index_select(0, device_ids).detach().cpu(),
+        }
+        lengths = ((kv_indptr[1:] - kv_indptr[:-1] - 1) * 64 + last_page_len)
+        logical_workload = {
+            "batch_size": TARGET_BS,
+            "query_tokens_per_request": 4,
+            "num_query_heads": 16,
+            "num_kv_heads": 8,
+            "head_dim": 128,
+            "page_size": 64,
+            "qo_indptr": qo_indptr.tolist(),
+            "kv_lens_tokens": lengths.tolist(),
+            "causal": True,
+        }
+        def canonical(value):
+            return json.dumps(
+                value, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+
+        tensor_sha256 = {
+            name: hashlib.sha256(
+                tensor.contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+            for name, tensor in tensors.items()
+        }
+        return {
+            "schema_version": 1,
+            "kind": "draft_extend_attention_snapshot",
+            "metadata": {
+                "source": {
+                    "fork_sha": self.config.attention_snapshot_fork_sha,
+                    "configuration_id": self._config_id,
+                    "configuration": self.config.config_identity,
+                    "gpu_uuid": self.config.config_identity.get("gpu_uuid"),
+                },
+                "replay_index": replay_index,
+                "raw_batch_size": TARGET_BS,
+                "padded_batch_size": TARGET_BS,
+                "layer_index": 0,
+                "page_size": 64,
+                "kv_layout": "NHD",
+                "causal": True,
+                "sm_scale": source["sm_scale"],
+                "query_shape": list(source["q"].shape),
+                "query_stride": source["q_stride"],
+                "query_dtype": str(source["q"].dtype),
+                "key_pool_shape": list(k_cache.shape),
+                "value_pool_shape": list(v_cache.shape),
+                "key_pool_stride": list(k_cache.stride()),
+                "value_pool_stride": list(v_cache.stride()),
+                "logical_workload": logical_workload,
+                "logical_workload_sha256": hashlib.sha256(
+                    canonical(logical_workload)
+                ).hexdigest(),
+                "tensor_sha256": tensor_sha256,
+                "contents_sha256": hashlib.sha256(canonical(tensor_sha256)).hexdigest(),
+                "timing_valid": False,
+                "qualification": "Q clone executes in every snapshot graph replay; snapshot run timings are invalid",
+            },
+            "tensors": tensors,
+        }
 
     def surface_scope(self, surface: str, exact_shape: Sequence[int]):
         if _ACTIVE_PROBE.get() is not self or surface not in self.config.surfaces:
@@ -642,6 +805,22 @@ class DraftExtendSurfaceProbe:
         if not succeeded:
             return
         if (
+            self.config.attention_snapshot_path
+            and not self._attention_snapshot_written
+            and token.replay_index == self.config.ncu_replay_index
+        ):
+            torch.cuda.synchronize(self.config.device_index)
+            snapshot = self._build_attention_snapshot(token.replay_index)
+            with Path(self.config.attention_snapshot_path).open("xb") as output:
+                torch.save(snapshot, output)
+            self._attention_snapshot_written = True
+            logger.warning(
+                "Saved replay-%d layer-0 page64 attention snapshot to %s; "
+                "this diagnostic run has no timing authority",
+                token.replay_index,
+                self.config.attention_snapshot_path,
+            )
+        if (
             self.config.require_prefill_plan_metadata
             and not self._wrote_replay_prefill_plan_metadata
         ):
@@ -764,6 +943,14 @@ def draft_extend_attention_scope(q, layer):
         int(layer.head_dim),
     )
     return probe.surface_scope("attention", shape)
+
+
+def draft_extend_attention_snapshot(q, kv_cache, wrapper, layer, page_size):
+    if torch.compiler.is_compiling():
+        return
+    probe = _ACTIVE_PROBE.get()
+    if probe is not None:
+        probe.capture_attention_snapshot(q, kv_cache, wrapper, layer, page_size)
 
 
 def draft_extend_lm_head_scope(hidden_states, lm_head):
@@ -1217,11 +1404,16 @@ def create_surface_probe(
     require_plan_metadata = bool(
         envs.SGLANG_DRAFT_EXTEND_FLASHINFER_PLAN_OVERRIDE.get()
     )
+    snapshot_path = os.environ.get("SGLANG_DRAFT_EXTEND_ATTENTION_SNAPSHOT_PATH", "")
+    snapshot_fork_sha = os.environ.get(
+        "SGLANG_DRAFT_EXTEND_ATTENTION_SNAPSHOT_FORK_SHA", ""
+    )
     if (
         mode == "off"
         and not ncu_range
         and not preallocate
         and not require_plan_metadata
+        and not snapshot_path
     ):
         return None
     if mode not in ("off", "capture-only", "measure"):
@@ -1234,6 +1426,22 @@ def create_surface_probe(
             "NCU collection requires surface probe mode=off so the profiled "
             "graph has no diagnostic event nodes"
         )
+    if snapshot_path:
+        args = model_runner.server_args
+        if (
+            mode != "off"
+            or ncu_range
+            or not getattr(args, "enable_spec_sm_partition", False)
+            or getattr(args, "enable_spec_pdmux", False)
+            or getattr(args, "page_size", None) != 64
+            or not envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16.get()
+            or envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
+            or not re.fullmatch(r"[0-9a-f]{40}", snapshot_fork_sha)
+        ):
+            raise ValueError(
+                "attention snapshot requires one-slot page64 stock tile16, "
+                "probe mode=off, NCU off and the full source fork SHA"
+            )
 
     selected = envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_SURFACE.get().strip().lower()
     if selected == "all":
@@ -1274,6 +1482,8 @@ def create_surface_probe(
             "NCU replay index must be positive and range name must be nonempty "
             "without '/'"
         )
+    if snapshot_path and ncu_replay_index != 21:
+        raise ValueError("attention snapshot requires the declared live replay 21")
 
     identity, small_stream = _validate_fixed52_runtime(
         model_runner, capture_bs, num_tokens_per_bs
@@ -1293,6 +1503,14 @@ def create_surface_probe(
             "ncu_include_expression": f"{ncu_range_name}/",
         }
     )
+    if snapshot_path:
+        identity["attention_snapshot"] = {
+            "layer_index": 0,
+            "replay_index": 21,
+            "page_size": 64,
+            "query_capture": "clone_inside_graph",
+            "timing_valid": False,
+        }
     config = DraftExtendSurfaceProbeConfig(
         mode=mode,
         surfaces=surfaces,
@@ -1311,6 +1529,8 @@ def create_surface_probe(
         device_index=int(model_runner.gpu_id),
         config_identity=identity,
         require_prefill_plan_metadata=require_plan_metadata,
+        attention_snapshot_path=snapshot_path or None,
+        attention_snapshot_fork_sha=snapshot_fork_sha,
     )
     probe = DraftExtendSurfaceProbe(config, small_stream=small_stream)
     logger.warning(
