@@ -804,6 +804,10 @@ class Envs:
     # single K/V landing pair with a two-stage descriptor-TMA ring. Requires the
     # force-tile-16/no-split controls and their exact Q4/GQA2 contract.
     SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA = EnvBool(False)
+    # Opt-in tile16 producer/consumer candidates. Empty retains the incumbent;
+    # cpasync and tma use the combined pipeline/merge specialization. The old
+    # two-stage TMA switch above remains a separate, mutually exclusive control.
+    SGLANG_DRAFT_EXTEND_FLASHINFER_TILE16_PIPELINE = EnvStr("")
     # Exact Qwen3-0.6B draft-extend attention experiment: replace FA2s
     # graph-selected Q-tile-128 kernel with the in-tree Q4/GQA2 N=8
     # tensor-core specialization. The path is BF16/NHD/page-size-1/SM120/TP1

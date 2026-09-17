@@ -221,6 +221,40 @@ def _prepare_prefill_header(source: str) -> str:
     return source
 
 
+def _patch_early_k_prefill_header(source: str) -> str:
+    """Start the next cp.async K tile after its last QK reader, before softmax.
+
+    Keep the existing CTA release barrier and commit order. The later
+    wait_group<1> still waits for V(iter), leaving K(iter+1) in flight.
+    This changes scheduling, not the number of buffers or the math.
+    """
+    begin = source.index(
+        "__device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice("
+    )
+    end = source.index(
+        "template <typename KTraits, typename Params>\n__global__", begin
+    )
+    body = source[begin:end]
+    loop_begin = body.index("    for (uint32_t iter = 0;")
+    prefix, loop = body[:loop_begin], body[loop_begin:]
+    start = loop.index("      block.sync();\n      page_produce_kv<false, KTraits>")
+    stop = loop.index("      cp_async::commit_group();", start) + len(
+        "      cp_async::commit_group();\n"
+    )
+    producer = loop[start:stop]
+    loop = _replace_once(loop, producer, "", "late cp.async K producer")
+    loop = _replace_once(
+        loop,
+        "      uint32_t kv_idx_base =\n",
+        "      // QK has consumed K(iter). Release it before the next copy;\n"
+        "      // logits/masking/softmax now overlap K(iter+1).\n"
+        + producer
+        + "      uint32_t kv_idx_base =\n",
+        "early cp.async K producer",
+    )
+    return source[:begin] + prefix + loop + source[end:]
+
+
 def _patch_prefill_header(source: str) -> str:
     source = _prepare_prefill_header(source)
 
@@ -782,7 +816,13 @@ def _patch_diagnostic_header(source: str, transport: str) -> str:
     return source[:begin] + body + source[end:]
 
 
-def _build_tile16_prefill_module(module_name: str, *, transport: str, diagnostic: bool):
+def _build_tile16_prefill_module(
+    module_name: str,
+    *,
+    transport: str,
+    diagnostic: bool,
+    optimizations: tuple[bool, bool, bool] | None = None,
+):
     """Share the pinned generator and stock ABI across production and diagnostics."""
     from flashinfer.jit import env as jit_env
     from flashinfer.jit.attention import gen_customize_batch_prefill_module
@@ -838,18 +878,43 @@ def _build_tile16_prefill_module(module_name: str, *, transport: str, diagnostic
         jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer" / "attention" / "prefill.cuh"
     ).read_text()
     custom_header = gen_dir / "batch_prefill_tile16_tma.cuh"
-    patched_header = (
-        _patch_diagnostic_header(upstream, transport)
-        if diagnostic
-        else _patch_prefill_header(upstream)
-    )
+    if optimizations is not None:
+        if diagnostic:
+            raise ValueError("optimized attention cannot use diagnostic ablations")
+        early_k, fragment_pipeline, cooperative_merge = optimizations
+        patched_header = _prepare_prefill_header(upstream)
+        if transport == "tma":
+            from .flashinfer_tile16_tma_pipeline import patch_prefill_header
+
+            patched_header = patch_prefill_header(patched_header)
+        elif early_k:
+            patched_header = _patch_early_k_prefill_header(patched_header)
+        if fragment_pipeline or cooperative_merge:
+            from .flashinfer_tile16_consumer import patch_consumer_header
+
+            patched_header = patch_consumer_header(
+                patched_header,
+                fragment_pipeline=fragment_pipeline,
+                cooperative_merge=cooperative_merge,
+            )
+    else:
+        patched_header = (
+            _patch_diagnostic_header(upstream, transport)
+            if diagnostic
+            else _patch_prefill_header(upstream)
+        )
     write_if_different(custom_header, patched_header)
 
     if transport == "tma":
         config = gen_dir / "batch_prefill_config.inc"
         write_if_different(config, _patch_config(config.read_text()))
         host = gen_dir / "batch_prefill.cu"
-        write_if_different(host, _patch_host_source(host.read_text()))
+        if optimizations is not None:
+            from .flashinfer_tile16_tma_pipeline import patch_host_source
+
+            write_if_different(host, patch_host_source(host.read_text()))
+        else:
+            write_if_different(host, _patch_host_source(host.read_text()))
     for path in gen_dir.glob("batch_prefill_paged_kernel_mask_*.cu"):
         write_if_different(
             path,
@@ -884,13 +949,13 @@ def _build_tile16_prefill_module(module_name: str, *, transport: str, diagnostic
             raise RuntimeError(
                 f"tile16 TMA expected the pinned 46-argument stock ABI, got {len(args)}"
             )
-        if diagnostic:
+        if diagnostic or optimizations is not None:
             plan = args[2]
             if int(plan[3]) != 16 or bool(plan[14]):
-                raise ValueError("tile16 diagnostics require Q tile 16 and no split-KV")
+                raise ValueError("tile16 experiments require Q tile 16 and no split-KV")
             if int(args[12]) != 1 or int(args[13]) != 0 or int(args[14]) != -1:
                 raise ValueError(
-                    "tile16 diagnostics require causal NHD attention without a window"
+                    "tile16 experiments require causal NHD attention without a window"
                 )
         stock = args[16:]
         fa2_extra = (
@@ -922,6 +987,20 @@ def _build_tile16_prefill_module(module_name: str, *, transport: str, diagnostic
         result.get_diagnostic_mode = lambda: diagnostic_mode
         result.module_name = module_name
         result.transport = transport
+    if optimizations is not None:
+        result.module_name = module_name
+        result.transport = transport
+        result.optimization_config = {
+            "transport": transport,
+            **dict(
+                zip(
+                    ("early_k", "fragment_pipeline", "cooperative_merge"), optimizations
+                )
+            ),
+        }
+        result.prefill_header_sha256 = hashlib.sha256(
+            patched_header.encode()
+        ).hexdigest()
     return result
 
 
@@ -929,6 +1008,35 @@ def _build_tile16_prefill_module(module_name: str, *, transport: str, diagnostic
 def get_tile16_tma_prefill_module():
     """Build and wrap the exact pinned FlashInfer FA2 module with TMA K/V feed."""
     return _build_tile16_prefill_module(_MODULE_NAME, transport="tma", diagnostic=False)
+
+
+@functools.lru_cache(maxsize=None, typed=True)
+def get_tile16_optimized_prefill_module(
+    transport: str = "cpasync",
+    *,
+    early_k: bool = False,
+    fragment_pipeline: bool = False,
+    cooperative_merge: bool = False,
+):
+    """Build an opt-in exact-shape candidate through the retained FA2 wrapper.
+
+    TMA selects the three-slot independent K/V schedule; the original two-stage
+    implementation remains available through get_tile16_tma_prefill_module.
+    Flags are independent for controlled mechanism comparisons, not a
+    replacement for the default-off backend configuration/shape gate.
+    """
+    if transport not in ("cpasync", "tma"):
+        raise ValueError("tile16 optimized transport must be 'cpasync' or 'tma'")
+    flags = (early_k, fragment_pipeline, cooperative_merge)
+    if any(type(value) is not bool for value in flags):
+        raise ValueError("tile16 optimization flags must be bools")
+    if transport == "tma" and early_k:
+        raise ValueError("early_k only applies to the cp.async producer")
+    suffix = "".join(str(int(value)) for value in flags)
+    module_name = f"sglang_fa2_tile16_pipeline_{transport}_{suffix}_v1_sm120a_bf16_h128"
+    return _build_tile16_prefill_module(
+        module_name, transport=transport, diagnostic=False, optimizations=flags
+    )
 
 
 @functools.cache

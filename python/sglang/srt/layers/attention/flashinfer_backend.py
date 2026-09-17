@@ -84,6 +84,29 @@ def _flashinfer_width_planning_enabled(width_mode: int, server_args) -> bool:
     return width_mode > 0 and spec_sm_partition_enabled(server_args)
 
 
+def resolve_draft_extend_tile16_pipeline(
+    *,
+    requested: str,
+    is_draft_worker: bool,
+    legacy_tma: bool,
+    disable_cuda_graph: bool,
+) -> str:
+    """Resolve the graph-only candidate without arming the target worker."""
+    if not is_draft_worker:
+        return ""
+    if requested not in ("", "cpasync", "tma") or (requested and legacy_tma):
+        raise ValueError(
+            "tile16 pipeline must be empty, cpasync, or tma, and cannot be "
+            "combined with the legacy tile16 TMA switch"
+        )
+    if requested and disable_cuda_graph:
+        raise ValueError(
+            "the optimized tile16 pipeline requires draft-extend CUDA graphs; "
+            "disable_cuda_graph must be false"
+        )
+    return requested
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
@@ -876,6 +899,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.use_draft_extend_short_q_attention = False
         self.draft_extend_force_q_tile_16 = False
         self.draft_extend_tile16_tma_module = None
+        self.draft_extend_tile16_pipeline = ""
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -1120,18 +1144,23 @@ class FlashInferAttnBackend(AttentionBackend):
                 "no split-KV, graph-stable 32-CTA schedule"
             )
 
-        if (
-            envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
-            and model_runner.is_draft_worker
-        ):
+        tile16_legacy_tma = envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
+        tile16_pipeline = resolve_draft_extend_tile16_pipeline(
+            requested=envs.SGLANG_DRAFT_EXTEND_FLASHINFER_TILE16_PIPELINE.get(),
+            is_draft_worker=model_runner.is_draft_worker,
+            legacy_tma=tile16_legacy_tma,
+            disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
+        )
+        self.draft_extend_tile16_pipeline = tile16_pipeline
+        if (tile16_legacy_tma or tile16_pipeline) and model_runner.is_draft_worker:
             if not self.draft_extend_force_q_tile_16:
                 raise ValueError(
-                    "tile16 TMA requires "
+                    "tile16 experimental pipelines require "
                     "SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16=1"
                 )
             if envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get():
                 raise ValueError(
-                    "tile16 TMA and the exact-N8 replacement are mutually exclusive"
+                    "tile16 pipelines and the exact-N8 replacement are mutually exclusive"
                 )
             from sglang.srt.multiplex.pdmux_context import (
                 get_spec_sm_allocated_split,
@@ -1199,22 +1228,42 @@ class FlashInferAttnBackend(AttentionBackend):
                 errors.append(f"speculative knobs={frozen_spec}")
             if errors:
                 raise ValueError(
-                    "draft-extend tile16 TMA left its exact experimental contract: "
+                    "draft-extend tile16 pipeline left its exact experimental contract: "
                     + "; ".join(errors)
                 )
 
             from sglang.srt.layers.attention.flashinfer_tile16_tma import (
+                get_tile16_optimized_prefill_module,
                 get_tile16_tma_prefill_module,
             )
 
             with torch.cuda.device(model_runner.gpu_id):
-                self.draft_extend_tile16_tma_module = (
-                    get_tile16_tma_prefill_module()
+                if tile16_pipeline:
+                    self.draft_extend_tile16_tma_module = (
+                        get_tile16_optimized_prefill_module(
+                            tile16_pipeline,
+                            early_k=tile16_pipeline == "cpasync",
+                            fragment_pipeline=True,
+                            cooperative_merge=True,
+                        )
+                    )
+                else:
+                    self.draft_extend_tile16_tma_module = (
+                        get_tile16_tma_prefill_module()
+                    )
+            if tile16_pipeline:
+                logger.info(
+                    "FlashInfer draft-extend tile16 optimized pipeline armed: "
+                    "transport=%s, fixed Q4/GQA2, BF16 NHD page-size-64, no split-KV; "
+                    "module=%s",
+                    tile16_pipeline,
+                    self.draft_extend_tile16_tma_module.module_name,
                 )
-            logger.info(
-                "FlashInfer draft-extend tile16 two-stage page-box TMA ring armed: "
-                "fixed Q4/GQA2, BF16 NHD page-size-64, no split-KV"
-            )
+            else:
+                logger.info(
+                    "FlashInfer draft-extend tile16 two-stage page-box TMA ring armed: "
+                    "fixed Q4/GQA2, BF16 NHD page-size-64, no split-KV"
+                )
 
         if (
             envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get()
@@ -1700,6 +1749,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if (
+            self.draft_extend_tile16_pipeline
+            and forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # The candidate is bound only to captured draft-extend wrappers.
+            # Reject capacity misses or other eager fallbacks instead of
+            # silently reporting an armed experiment while running stock FA2.
+            raise RuntimeError(
+                "the optimized tile16 pipeline requires captured draft-extend "
+                "CUDA-graph execution; eager draft-extend fallback is unsupported"
+            )
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None

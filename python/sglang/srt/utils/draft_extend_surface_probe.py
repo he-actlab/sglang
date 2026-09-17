@@ -1077,6 +1077,10 @@ def _validate_stock_fullchip_runtime(
             "tile16 TMA is on for the full-chip arm",
         ),
         (
+            not envs.SGLANG_DRAFT_EXTEND_FLASHINFER_TILE16_PIPELINE.get(),
+            "optimized tile16 pipeline is on for the full-chip arm",
+        ),
+        (
             not envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get(),
             "SM120 draft kernels are on",
         ),
@@ -1150,6 +1154,9 @@ def _validate_stock_fullchip_runtime(
         "draft_extend_flashinfer_force_q_tile_16": treatment_identity[5],
         "draft_extend_flashinfer_tile16_tma": bool(
             envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
+        ),
+        "draft_extend_flashinfer_tile16_pipeline": (
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_TILE16_PIPELINE.get()
         ),
         "draft_extend_short_q_attention": treatment_identity[6],
     }
@@ -1388,6 +1395,9 @@ def _validate_fixed52_runtime(
         "draft_extend_flashinfer_tile16_tma": bool(
             envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
         ),
+        "draft_extend_flashinfer_tile16_pipeline": (
+            envs.SGLANG_DRAFT_EXTEND_FLASHINFER_TILE16_PIPELINE.get()
+        ),
         "draft_extend_short_q_attention": bool(
             envs.SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION.get()
         ),
@@ -1436,6 +1446,7 @@ def create_surface_probe(
             or getattr(args, "page_size", None) != 64
             or not envs.SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16.get()
             or envs.SGLANG_ENABLE_DRAFT_EXTEND_FLASHINFER_TILE16_TMA.get()
+            or envs.SGLANG_DRAFT_EXTEND_FLASHINFER_TILE16_PIPELINE.get()
             or not re.fullmatch(r"[0-9a-f]{40}", snapshot_fork_sha)
         ):
             raise ValueError(
