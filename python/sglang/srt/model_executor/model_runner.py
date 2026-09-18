@@ -956,7 +956,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return True
 
     def _maybe_enable_qwen3_drafter_sm120_kernel_optimized(self) -> bool:
-        """Enable the frozen three-kernel sequential Blackwell portfolio."""
+        """Enable the frozen three-kernel Blackwell portfolio on the draft stream."""
         from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 
         if (
@@ -978,12 +978,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         capability = torch.cuda.get_device_capability(self.gpu_id)
         if capability != (12, 0):
             return fallback(f"compute capability={capability}")
-        if (
-            not spec_sm_partition_enabled(self.server_args)
-            or not getattr(self.server_args, "enable_spec_sm_partition", False)
-            or getattr(self.server_args, "enable_spec_pdmux", False)
+        from sglang.srt.speculative.spec_utils import spec_pdmux_concurrent_enabled
+
+        sequential = (
+            getattr(self.server_args, "enable_spec_sm_partition", False)
+            and not self.server_args.enable_spec_pdmux
+        )
+        # Two-slot ping-pong still has one FIFO draft stream. Its M32/M128
+        # calls share draft-local workspaces, never verifier workspaces; wider
+        # operators rejoin SMALL before the next draft operation can use them.
+        two_slot_overlap = (
+            not getattr(self.server_args, "enable_spec_sm_partition", False)
+            and spec_pdmux_concurrent_enabled(self.server_args)
+            and self.server_args.spec_pdmux_slots == 2
+            and not self.server_args.disable_overlap_schedule
+        )
+        if not spec_sm_partition_enabled(self.server_args) or not (
+            sequential or two_slot_overlap
         ):
-            return fallback("requires sequential --enable-spec-sm-partition only")
+            return fallback("requires sequential partition or two-slot overlap")
         if not self.spec_algorithm.is_standalone():
             return fallback(
                 f"speculative algorithm={self.server_args.speculative_algorithm}"
@@ -1060,12 +1073,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         capability = torch.cuda.get_device_capability(self.gpu_id)
         if capability != (12, 0):
             return fallback(f"compute capability={capability}")
-        if (
-            not spec_sm_partition_enabled(self.server_args)
-            or not getattr(self.server_args, "enable_spec_sm_partition", False)
-            or getattr(self.server_args, "enable_spec_pdmux", False)
+        from sglang.srt.speculative.spec_utils import spec_pdmux_concurrent_enabled
+
+        sequential = (
+            getattr(self.server_args, "enable_spec_sm_partition", False)
+            and not self.server_args.enable_spec_pdmux
+        )
+        # Two-slot ping-pong still has one FIFO draft stream. Its M32/M128
+        # calls share draft-local workspaces, never verifier workspaces; wider
+        # operators rejoin SMALL before the next draft operation can use them.
+        two_slot_overlap = (
+            not getattr(self.server_args, "enable_spec_sm_partition", False)
+            and spec_pdmux_concurrent_enabled(self.server_args)
+            and self.server_args.spec_pdmux_slots == 2
+            and not self.server_args.disable_overlap_schedule
+        )
+        if not spec_sm_partition_enabled(self.server_args) or not (
+            sequential or two_slot_overlap
         ):
-            return fallback("requires sequential --enable-spec-sm-partition only")
+            return fallback("requires sequential partition or two-slot overlap")
         if not self.spec_algorithm.is_standalone():
             return fallback(
                 f"speculative algorithm={self.server_args.speculative_algorithm}"

@@ -14,6 +14,49 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class FullDeviceOperatorRegionCudaTests(CustomTestCase):
+    def test_two_draft_graphs_reuse_workspace_with_verifier_in_flight(self):
+        # Both request slots use one SMALL FIFO; the verifier has its own
+        # stream/storage. Each wider region must rejoin before workspace reuse.
+        source = torch.cuda.Stream()
+        large = torch.cuda.Stream()
+        full = torch.cuda.Stream()
+        qkv = torch.cuda.Stream()
+        workspace = torch.empty((128, 128), device="cuda")
+        inputs = [torch.full_like(workspace, n) for n in (1, 2)]
+        outputs = [torch.empty_like(workspace) for _ in inputs]
+        verifier = torch.ones_like(workspace)
+        torch.cuda.synchronize()
+        graphs = []
+        with (
+            patch.object(pdmux_context, "SPEC_STREAM_PAIR", (large, source)),
+            patch.object(pdmux_context, "SPEC_PREFILL_STREAM", full),
+            patch.object(pdmux_context, "SPEC_QKV128_STREAM", qkv),
+        ):
+            for inp, out in zip(inputs, outputs):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=source):
+                    workspace.copy_(inp)
+                    with pdmux_context.spec_pdmux_qkv128_operator_region(
+                        True, source_partition="small"
+                    ):
+                        workspace.add_(1)
+                    with pdmux_context.spec_pdmux_full_device_operator_region(
+                        True, source_partition="small"
+                    ):
+                        workspace.mul_(3)
+                    out.copy_(workspace)
+                graphs.append(graph)
+        for _ in range(20):
+            with torch.cuda.stream(large):
+                verifier.add_(1)
+            with torch.cuda.stream(source):
+                for graph in graphs:
+                    graph.replay()
+        torch.cuda.synchronize()
+        for inp, out in zip(inputs, outputs):
+            torch.testing.assert_close(out, (inp + 1) * 3, rtol=0, atol=0)
+        torch.testing.assert_close(verifier, torch.full_like(verifier, 21))
+
     def test_multistream_graph_is_correct_and_restores_outer_hint(self):
         device = torch.device("cuda")
         source = torch.cuda.Stream(device=device)

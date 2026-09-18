@@ -121,6 +121,9 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
         runner.server_args = SimpleNamespace(
             enable_spec_pdmux=False,
             enable_spec_sm_partition=True,
+            spec_pdmux_slots=2,
+            speculative_adaptive=False,
+            disable_overlap_schedule=False,
             speculative_algorithm="STANDALONE",
             speculative_num_steps=3,
             speculative_eagle_topk=1,
@@ -195,7 +198,7 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
             )
         runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_not_called()
 
-    def test_pdmux_and_wrong_spec_knobs_are_rejected(self):
+    def test_conflicting_placement_and_wrong_spec_knobs_are_rejected(self):
         for mutation in (
             {"enable_spec_pdmux": True},
             {"speculative_num_steps": 4},
@@ -208,6 +211,53 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
                     runner._maybe_enable_qwen3_drafter_sm120_kernel_optimized()
                 )
             runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_not_called()
+
+    def test_two_slot_overlap_enables_both_exact_portfolios(self):
+        runner = self._runner()
+        runner.server_args.enable_spec_sm_partition = False
+        runner.server_args.enable_spec_pdmux = True
+        with (
+            self._exact_context(),
+            envs.SGLANG_SPEC_PDMUX_SERIALIZE.override(False),
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
+        ):
+            self.assertTrue(runner._maybe_enable_qwen3_drafter_sm120_kernel_optimized())
+            self.assertTrue(runner._maybe_enable_qwen3_draft_extend_gemm_integration())
+        runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_called_once_with(0)
+        runner.model.enable_qwen3_draft_extend_gemm_integration.assert_called_once_with(0)
+
+    def test_unsupported_overlap_modes_do_not_arm_either_portfolio(self):
+        for mutation in (
+            {"spec_pdmux_slots": 3},
+            {"speculative_adaptive": True},
+            {"disable_overlap_schedule": True},
+        ):
+            runner = self._runner()
+            runner.server_args.enable_spec_sm_partition = False
+            runner.server_args.enable_spec_pdmux = True
+            for name, value in mutation.items():
+                setattr(runner.server_args, name, value)
+            with (
+                self._exact_context(),
+                envs.SGLANG_SPEC_PDMUX_SERIALIZE.override(False),
+                envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
+            ):
+                self.assertFalse(runner._maybe_enable_qwen3_drafter_sm120_kernel_optimized())
+                self.assertFalse(runner._maybe_enable_qwen3_draft_extend_gemm_integration())
+            runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_not_called()
+            runner.model.enable_qwen3_draft_extend_gemm_integration.assert_not_called()
+
+    def test_legacy_serialized_pdmux_does_not_arm_portfolios(self):
+        runner = self._runner()
+        runner.server_args.enable_spec_sm_partition = False
+        runner.server_args.enable_spec_pdmux = True
+        with (
+            self._exact_context(),
+            envs.SGLANG_SPEC_PDMUX_SERIALIZE.override(True),
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
+        ):
+            self.assertFalse(runner._maybe_enable_qwen3_drafter_sm120_kernel_optimized())
+            self.assertFalse(runner._maybe_enable_qwen3_draft_extend_gemm_integration())
 
     def test_draft_extend_gemm_switch_is_default_off(self):
         self.assertIs(
