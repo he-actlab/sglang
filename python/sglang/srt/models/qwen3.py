@@ -343,6 +343,7 @@ class _Qwen3DrafterExtendGemmIntegrationDispatch:
         device_index: int,
         representative_layer: "Qwen3DecoderLayer",
         next_norm: RMSNorm,
+        m: int = 128,
     ) -> None:
         from sglang.jit_kernel.drafter_sm120_bf16_down128 import (
             WORKSPACE_BYTES as DOWN_WORKSPACE_BYTES,
@@ -356,6 +357,10 @@ class _Qwen3DrafterExtendGemmIntegrationDispatch:
         )
         from sglang.jit_kernel.norm import fused_add_rmsnorm
 
+        if m not in (128, 160):
+            raise ValueError(f"unsupported draft-extend M={m}")
+        self._OUT_SHAPE = (m, 2048, 1024)
+        self._DOWN_SHAPE = (m, 3072, 1024)
         self._workspace = torch.empty(
             max(OUT_WORKSPACE_BYTES, DOWN_WORKSPACE_BYTES),
             dtype=torch.uint8,
@@ -704,6 +709,7 @@ class _Qwen3PortableCublasLtDispatch:
         worker: str,
         realized_sm_target: int,
         planning_context: str,
+        projection_m: int = 128,
     ) -> None:
         from sglang.jit_kernel.cublaslt_autotune import (
             autotune_projection_portfolio,
@@ -716,15 +722,18 @@ class _Qwen3PortableCublasLtDispatch:
         self._workspace = allocate_workspace(device_index)
         if self._workspace.data_ptr() % 256:
             raise RuntimeError("portable cuBLASLt workspace must be 256-byte aligned")
+        if projection_m not in (128, 160):
+            raise ValueError(f"unsupported projection M={projection_m}")
         tuned = autotune_projection_portfolio(
             device_index=device_index,
             representative_linears=representative_linears,
-            shape_mkns=shape_mkns,
+            shape_mkns=tuple((projection_m if m == 128 else m, k, n) for m, k, n in shape_mkns),
             worker=worker,
             realized_sm_target=realized_sm_target,
             planning_context=planning_context,
             workspace=self._workspace,
             logger=logger,
+            **({"correctness_only": True} if projection_m == 160 else {}),
         )
         self._algorithms = dict(tuned.algorithms)
         self._decisions = dict(tuned.decisions)
@@ -845,7 +854,10 @@ def _use_full_device_draft_extend_gate_up(
         return False
     if not activation.is_cuda or activation.dtype != torch.bfloat16:
         return False
-    if tuple(activation.shape) != _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_INPUT_SHAPE:
+    if tuple(activation.shape) != _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_INPUT_SHAPE and not (
+        envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
+        and tuple(activation.shape) == (160, 1024)
+    ):
         return False
     if not _Qwen3DrafterSM120KernelDispatch.supports_linear(linear):
         return False
@@ -854,7 +866,8 @@ def _use_full_device_draft_extend_gate_up(
     if eligible and not _logged_full_device_draft_extend_gate_up:
         logger.info(
             "Qwen3 drafter full-device draft-extend gate-up armed: exact "
-            "DRAFT_EXTEND_V2 M=128 K=1024 N=6144 BF16 TP1 path"
+            "DRAFT_EXTEND_V2 M=%d K=1024 N=6144 BF16 TP1 path",
+            activation.shape[0],
         )
         _logged_full_device_draft_extend_gate_up = True
     return eligible
@@ -879,7 +892,10 @@ def _use_dedicated_draft_extend_qkv128(
         return False
     if not activation.is_cuda or activation.dtype != torch.bfloat16:
         return False
-    if tuple(activation.shape) != _DEDICATED_DRAFT_EXTEND_QKV128_INPUT_SHAPE:
+    if tuple(activation.shape) != _DEDICATED_DRAFT_EXTEND_QKV128_INPUT_SHAPE and not (
+        envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
+        and tuple(activation.shape) == (160, 1024)
+    ):
         return False
     if not _Qwen3DrafterSM120KernelDispatch.supports_linear(linear):
         return False
@@ -887,7 +903,8 @@ def _use_dedicated_draft_extend_qkv128(
     if eligible and not _logged_dedicated_draft_extend_qkv128:
         logger.info(
             "Qwen3 drafter dedicated qkv128 stream armed: exact "
-            "DRAFT_EXTEND_V2 M=128 K=1024 N=4096 BF16 TP1 path"
+            "DRAFT_EXTEND_V2 M=%d K=1024 N=4096 BF16 TP1 path",
+            activation.shape[0],
         )
         _logged_dedicated_draft_extend_qkv128 = True
     return eligible
@@ -1531,7 +1548,7 @@ class Qwen3Model(Qwen2Model):
         use_draft_path = draft_dispatch is not None and token_count == 32
         use_extend_path = (
             extend_dispatch is not None
-            and token_count == 128
+            and token_count == extend_dispatch._OUT_SHAPE[0]
             and forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
         )
         if not use_draft_path and not use_extend_path:
@@ -1723,8 +1740,10 @@ class Qwen3Model(Qwen2Model):
         self._drafter_sm120_kernel_dispatch = dispatch
         return True
 
-    def enable_qwen3_draft_extend_gemm_integration(self, device_index: int) -> bool:
-        """Install the exact five-GEMM M=128 evaluation path."""
+    def enable_qwen3_draft_extend_gemm_integration(
+        self, device_index: int, m: int = 128
+    ) -> bool:
+        """Install the exact five-GEMM M128/K3 or M160/K4 evaluation path."""
 
         layers = self._eligible_qwen3_drafter_layers(
             device_index,
@@ -1757,6 +1776,7 @@ class Qwen3Model(Qwen2Model):
             device_index,
             layers[0],
             next_norms[0],
+            m=m,
         )
         self._drafter_extend_gemm_integration_dispatch = dispatch
         return True
@@ -1780,6 +1800,7 @@ class Qwen3Model(Qwen2Model):
         device_index: int,
         realized_sm_target: int,
         planning_context: str,
+        projection_m: int = 128,
     ) -> bool:
         """Install portable per-GPU tactics for the exact drafter model."""
 
@@ -1804,6 +1825,7 @@ class Qwen3Model(Qwen2Model):
             worker="drafter",
             realized_sm_target=realized_sm_target,
             planning_context=planning_context,
+            projection_m=projection_m,
         )
         self._install_drafter_projection_dispatch(layers, dispatch)
         return True
@@ -1813,6 +1835,7 @@ class Qwen3Model(Qwen2Model):
         device_index: int,
         realized_sm_target: int,
         planning_context: str,
+        projection_m: int = 128,
     ) -> bool:
         """Install portable per-GPU tactics for the exact Qwen3-8B verifier."""
 
@@ -1837,6 +1860,7 @@ class Qwen3Model(Qwen2Model):
             worker="verifier",
             realized_sm_target=realized_sm_target,
             planning_context=planning_context,
+            projection_m=projection_m,
         )
         self._install_drafter_projection_dispatch(layers, dispatch)
         return True
@@ -1901,8 +1925,10 @@ class Qwen3ForCausalLM(nn.Module):
     def enable_qwen3_drafter_sm120_kernel_optimized(self, device_index: int) -> bool:
         return self.model.enable_qwen3_drafter_sm120_kernel_optimized(device_index)
 
-    def enable_qwen3_draft_extend_gemm_integration(self, device_index: int) -> bool:
-        return self.model.enable_qwen3_draft_extend_gemm_integration(device_index)
+    def enable_qwen3_draft_extend_gemm_integration(
+        self, device_index: int, m: int = 128
+    ) -> bool:
+        return self.model.enable_qwen3_draft_extend_gemm_integration(device_index, m=m)
 
     def enable_qwen3_drafter_tma(self, device_index: int) -> bool:
         return self.model.enable_qwen3_drafter_tma(device_index)
@@ -1912,9 +1938,10 @@ class Qwen3ForCausalLM(nn.Module):
         device_index: int,
         realized_sm_target: int,
         planning_context: str,
+        projection_m: int = 128,
     ) -> bool:
         return self.model.enable_qwen3_drafter_cublaslt_portfolio(
-            device_index, realized_sm_target, planning_context
+            device_index, realized_sm_target, planning_context, projection_m=projection_m
         )
 
     def enable_qwen3_verifier_cublaslt_portfolio(
@@ -1922,9 +1949,10 @@ class Qwen3ForCausalLM(nn.Module):
         device_index: int,
         realized_sm_target: int,
         planning_context: str,
+        projection_m: int = 128,
     ) -> bool:
         return self.model.enable_qwen3_verifier_cublaslt_portfolio(
-            device_index, realized_sm_target, planning_context
+            device_index, realized_sm_target, planning_context, projection_m=projection_m
         )
 
     def get_input_embeddings(self) -> nn.Embedding:

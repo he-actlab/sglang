@@ -56,7 +56,11 @@ VERIFIER_CUBLASLT_MKNS = (
     (128, 12288, 4096),
 )
 
-SUPPORTED_CUBLASLT_MKNS = DRAFTER_CUBLASLT_MKNS + VERIFIER_CUBLASLT_MKNS
+SUPPORTED_CUBLASLT_MKNS = DRAFTER_CUBLASLT_MKNS + VERIFIER_CUBLASLT_MKNS + tuple(
+    (160, k, n)
+    for m, k, n in DRAFTER_CUBLASLT_MKNS + VERIFIER_CUBLASLT_MKNS
+    if m == 128
+)
 
 DEFAULT_WORKSPACE_BYTES = 32 * 1024 * 1024
 MAX_ALGORITHMS = 100
@@ -137,6 +141,7 @@ def _jit_cublaslt_drafter_gemm_module():
         "cublaslt_drafter_gemm",
         cuda_files=["gemm/cublaslt_drafter_gemm.cuh"],
         cuda_wrappers=[
+            ("restore_algorithm", "cublaslt_drafter_gemm::restore_algorithm"),
             ("query_algorithms", "cublaslt_drafter_gemm::query_algorithms"),
             (
                 "query_algorithms_by_id",
@@ -672,6 +677,32 @@ def discover_algorithms(
             )
         )
     return candidates
+
+
+def restore_algorithm(activation, weight, *, tactic, sm_count_target, workspace):
+    """Reconstruct exactly one public tactic at a new shape; no heuristic or timing."""
+    _require_originating_process()
+    m, k, n = _validate_problem(activation, weight, workspace)
+    fields = ("algorithm_id", "tile_id", "split_k", "reduction_scheme", "cta_swizzle",
+              "custom_option", "stages_id", "inner_shape_id", "cluster_shape_id")
+    config = torch.tensor([int(tactic[f]) for f in fields], dtype=torch.int64, device="cpu")
+    buffer = torch.empty(_ALGORITHM_BYTES, dtype=torch.uint8, device="cpu")
+    metadata = torch.empty(_METADATA_FIELDS, dtype=torch.int64, device="cpu")
+    waves = torch.empty(1, dtype=torch.float32, device="cpu")
+    with torch.cuda.device(activation.device):
+        _jit_cublaslt_drafter_gemm_module().restore_algorithm(
+            activation, weight, workspace, config, buffer, metadata, waves, sm_count_target
+        )
+    candidate = _heuristic_candidate(
+        m=m, k=k, n=n, sm_count_target=sm_count_target, device_index=_device_index(activation),
+        compute_capability=torch.cuda.get_device_capability(activation.device),
+        activation_alignment=_alignment_class(activation), weight_alignment=_alignment_class(weight),
+        workspace_alignment=_alignment_class(workspace), metadata=metadata.tolist(),
+        waves_count=float(waves[0]), buffer=buffer, discovery_source="retained-config",
+    )
+    if any(int(getattr(candidate, f)) != int(tactic[f]) for f in fields):
+        raise RuntimeError("restored cuBLASLt tactic readback differs from retained config")
+    return candidate
 
 
 def discover_algorithms_by_id(
@@ -1624,6 +1655,7 @@ __all__ = [
     "enumerate_custom_find_v1",
     "library_versions",
     "matmul",
+    "restore_algorithm",
     "select_drafter_portfolio_algorithm",
     "select_verifier_portfolio_algorithm",
 ]

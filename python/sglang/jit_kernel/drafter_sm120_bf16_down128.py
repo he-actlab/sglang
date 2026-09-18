@@ -44,18 +44,20 @@ def _arch_env():
 
 
 @cache_once
-def _jit_drafter_sm120_bf16_down128_module() -> Module:
+def _jit_drafter_sm120_bf16_down128_module(m: int = M) -> Module:
+    if m not in (128, 160):
+        raise ValueError(f"unsupported draft-extend M={m}")
     wrappers = []
     for config in CONFIGS:
         base = f"drafter_sm120_bf16_down128_splitk3_{config}"
         wrappers.extend(((base,) * 2, (f"{base}_fused_rmsnorm",) * 2))
     with _arch_env():
         return load_jit(
-            "drafter_sm120_bf16_down128",
+            f"drafter_sm120_bf16_down128_m{m}",
             cuda_files=["gemm/drafter_sm120_bf16_down128.cuh"],
             cuda_wrappers=wrappers,
             extra_dependencies=["cutlass"],
-            extra_cuda_cflags=_cuda_flags(),
+            extra_cuda_cflags=_cuda_flags() + [f"-DSGLANG_DRAFTER_EXTEND_M={m}"],
         )
 
 
@@ -101,23 +103,27 @@ def _validate(
             "SM120 BF16 down128 requires compute capability "
             f"12.0, got {capability[0]}.{capability[1]}."
         )
+    m = int(activation.shape[0])
+    if m not in (128, 160):
+        raise ValueError(f"unsupported draft-extend M={m}")
     tensors = [
-        (activation, "activation", (M, K), torch.bfloat16),
+        (activation, "activation", (m, K), torch.bfloat16),
         (weight, "weight", (N, K), torch.bfloat16),
-        (output, "output", (M, N), torch.bfloat16),
+        (output, "output", (m, N), torch.bfloat16),
     ]
     if residual is not None and norm_weight is not None:
         tensors.extend(
             (
-                (residual, "residual", (M, N), torch.bfloat16),
+                (residual, "residual", (m, N), torch.bfloat16),
                 (norm_weight, "norm_weight", (N,), torch.bfloat16),
             )
         )
     for tensor, name, shape, dtype in tensors:
         _validate_tensor(tensor, name=name, shape=shape, dtype=dtype, device=device)
-    if workspace.ndim != 1 or workspace.numel() < WORKSPACE_BYTES:
+    workspace_bytes = 3 * m * N * 4
+    if workspace.ndim != 1 or workspace.numel() < workspace_bytes:
         raise ValueError(
-            f"workspace must contain at least {WORKSPACE_BYTES} bytes, "
+            f"workspace must contain at least {workspace_bytes} bytes, "
             f"got shape {tuple(workspace.shape)}"
         )
     if workspace.dtype != torch.uint8:
@@ -140,7 +146,7 @@ def drafter_sm120_bf16_down128_splitk3(
     """Run one down128 split-K3 producer and its packed BF16 reducer."""
 
     _validate(config, output, None, None, activation, weight, workspace)
-    module = _jit_drafter_sm120_bf16_down128_module()
+    module = _jit_drafter_sm120_bf16_down128_module(int(activation.shape[0]))
     getattr(module, f"drafter_sm120_bf16_down128_splitk3_{config}")(
         output, activation, weight, workspace
     )
@@ -162,7 +168,7 @@ def drafter_sm120_bf16_down128_splitk3_fused_rmsnorm(
     if epsilon <= 0:
         raise ValueError(f"epsilon must be positive, got {epsilon}")
     _validate(config, output, residual, norm_weight, activation, weight, workspace)
-    module = _jit_drafter_sm120_bf16_down128_module()
+    module = _jit_drafter_sm120_bf16_down128_module(int(activation.shape[0]))
     getattr(
         module,
         f"drafter_sm120_bf16_down128_splitk3_{config}_fused_rmsnorm",

@@ -85,6 +85,14 @@ class FullDeviceLmHeadPolicyTests(CustomTestCase):
         with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
             self.assertTrue(self._eligible(enabled=False))
 
+    def test_k4_shape_requires_integrated_flag(self):
+        hidden = _FakeCudaTensor((160, 1024))
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(False):
+            self.assertFalse(self._eligible(hidden_states=hidden))
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
+            self.assertTrue(self._eligible(enabled=False, hidden_states=hidden))
+            self.assertFalse(self._eligible(hidden_states=_FakeCudaTensor((192, 1024))))
+
     def test_other_forward_mode_is_ineligible(self):
         metadata = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
         self.assertFalse(self._eligible(metadata=metadata))
@@ -187,6 +195,14 @@ class FullDeviceGateUpPolicyTests(CustomTestCase):
         with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
             self.assertTrue(self._eligible(enabled=False))
 
+    def test_k4_shape_requires_integrated_flag(self):
+        activation = _FakeCudaTensor((160, 1024))
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(False):
+            self.assertFalse(self._eligible(activation=activation))
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
+            self.assertTrue(self._eligible(enabled=False, activation=activation))
+            self.assertFalse(self._eligible(activation=_FakeCudaTensor((192, 1024))))
+
     def test_other_forward_mode_is_ineligible(self):
         self.assertFalse(
             self._eligible(
@@ -250,6 +266,14 @@ class DedicatedQkv128PolicyTests(CustomTestCase):
     def test_composite_gemm_switch_enables_policy(self):
         with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
             self.assertTrue(self._eligible(enabled=False))
+
+    def test_k4_shape_requires_integrated_flag(self):
+        activation = _FakeCudaTensor((160, 1024))
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(False):
+            self.assertFalse(self._eligible(activation=activation))
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
+            self.assertTrue(self._eligible(enabled=False, activation=activation))
+            self.assertFalse(self._eligible(activation=_FakeCudaTensor((192, 1024))))
 
     def test_other_forward_mode_is_ineligible(self):
         self.assertFalse(

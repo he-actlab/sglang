@@ -3,6 +3,7 @@
 import copy
 import os
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -129,6 +130,58 @@ class CublasLtAutotuneStableReplayTests(CustomTestCase):
             select_cached_candidate([], cached)
         with self.assertRaisesRegex(RuntimeError, "exactly once"):
             select_cached_candidate([selected, _candidate()], cached)
+
+
+class K4RetainedDecisionTests(CustomTestCase):
+    def test_reference_key_changes_only_m_and_explicit_device_uuid(self):
+        key = _key()
+        key["shape_mkn"] = [160, 1024, 4096]
+        original = copy.deepcopy(key)
+        with patch.dict(os.environ, {"SGLANG_CUBLASLT_REFERENCE_GPU_UUID": "GPU-reference"}), \
+                patch.object(cublaslt_autotune, "_read_cache", return_value={"selection": "production"}) as read, \
+                patch.object(cublaslt_autotune, "restore_algorithm") as restore, \
+                patch.object(cublaslt_autotune, "_elapsed_ms", side_effect=AssertionError("timing forbidden")):
+            candidate, decision = cublaslt_autotune._restore_shape_without_timing(
+                cache_key=key, activation=None, weight=None, realized_sm_target=52,
+                workspace=None, stream=None,
+            )
+        expected = copy.deepcopy(original)
+        expected["shape_mkn"][0] = 128
+        expected["gpu"]["uuid"] = "GPU-reference"
+        self.assertEqual(read.call_args.args[1], expected)
+        self.assertEqual(key, original)
+        self.assertIsNone(candidate)
+        self.assertEqual(decision["cache_state"], "correctness-only-port")
+        restore.assert_not_called()
+
+    def test_missing_reference_fails_without_retuning(self):
+        with patch.object(cublaslt_autotune, "_read_cache", return_value=None), \
+                patch.object(cublaslt_autotune, "_autotune_shape") as tune:
+            with self.assertRaisesRegex(RuntimeError, "requires retained K3 cache"):
+                cublaslt_autotune._restore_shape_without_timing(
+                    cache_key=_key(), activation=None, weight=None,
+                    realized_sm_target=52, workspace=None, stream=None,
+                )
+        tune.assert_not_called()
+
+    def test_restored_candidate_must_pass_correctness(self):
+        selected = _candidate()
+        cached = {"selection": "cublaslt", "sm_count_target": 0,
+                  "tactic": stable_tactic(selected)}
+        with patch.object(cublaslt_autotune, "_read_cache", return_value=cached), \
+                patch.object(cublaslt_autotune, "restore_algorithm", return_value=selected) as restore, \
+                patch.object(cublaslt_autotune, "cublas_sm_count_target", return_value=nullcontext()), \
+                patch.object(cublaslt_autotune.torch.cuda, "stream", return_value=nullcontext()), \
+                patch.object(cublaslt_autotune.F, "linear"), \
+                patch.object(cublaslt_autotune, "_synchronize"), \
+                patch.object(cublaslt_autotune, "_correctness_passes", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "retained tactic failed correctness"):
+                cublaslt_autotune._restore_shape_without_timing(
+                    cache_key=_key(), activation=None, weight=None,
+                    realized_sm_target=52, workspace=None, stream=None,
+                )
+        self.assertEqual(restore.call_args.kwargs["tactic"], cached["tactic"])
+        self.assertEqual(restore.call_args.kwargs["sm_count_target"], 0)
 
 
 if __name__ == "__main__":

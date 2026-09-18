@@ -74,6 +74,17 @@ class TestFlashInferTile16Optimized(unittest.TestCase):
     def test_cpasync_combined(self):
         self._check(early_k=True, fragment_pipeline=True, cooperative_merge=True)
 
+    def test_k4_cpasync_combined(self):
+        self.query_length = 5
+        self.setUp()
+        self._check(early_k=True, fragment_pipeline=True, cooperative_merge=True)
+
+    def test_k4_cpasync_poisoned_tails(self):
+        self.query_length = 5
+        self.setUp()
+        self._zero_logits_and_poison_tails()
+        self._check(early_k=True, fragment_pipeline=True, cooperative_merge=True)
+
     def test_tma_transport(self):
         self._check("tma")
 

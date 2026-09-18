@@ -207,11 +207,11 @@ inline bool is_supported_shape(int64_t m, int64_t k, int64_t n) {
   // plus the tied-embedding LM head at draft-extend M=128 (vocab 151936).
   const bool drafter = (m == 32 && k == 1024 && (n == 4096 || n == 6144)) ||
                        (m == 32 && n == 1024 && (k == 2048 || k == 3072)) ||
-                       (m == 128 && k == 1024 && (n == 4096 || n == 6144)) ||
-                       (m == 128 && n == 1024 && (k == 2048 || k == 3072)) || (m == 128 && k == 1024 && n == 151936);
+                       ((m == 128 || m == 160) && k == 1024 && (n == 4096 || n == 6144)) ||
+                       ((m == 128 || m == 160) && n == 1024 && (k == 2048 || k == 3072)) || ((m == 128 || m == 160) && k == 1024 && n == 151936);
   // Qwen3-8B verifier projections at verify M=128 (TODO-45).
   const bool verifier =
-      (m == 128 && k == 4096 && (n == 6144 || n == 4096 || n == 24576)) || (m == 128 && k == 12288 && n == 4096);
+      ((m == 128 || m == 160) && k == 4096 && (n == 6144 || n == 4096 || n == 24576)) || ((m == 128 || m == 160) && k == 12288 && n == 4096);
   return drafter || verifier;
 }
 
@@ -522,6 +522,58 @@ inline int64_t query_algorithms(
     ++successful_algorithms;
   }
   return successful_algorithms;
+}
+
+// Restore one explicitly retained public configuration. This is not a search:
+// AlgoCheck validates the new shape and the Python caller checks numerics.
+inline void restore_algorithm(
+    tvm::ffi::TensorView activation, tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView workspace, tvm::ffi::TensorView config,
+    tvm::ffi::TensorView algorithm_buffer, tvm::ffi::TensorView metadata_buffer,
+    tvm::ffi::TensorView waves_buffer, int64_t sm_count_target) {
+  using namespace host;
+  const auto p = detail::validate_problem(activation, weight, workspace);
+  RuntimeCheck(sm_count_target >= 0 && sm_count_target <= INT32_MAX, "Invalid SM target");
+  TensorMatcher({9}).with_dtype<int64_t>().with_device<kDLCPU>().verify(config);
+  TensorMatcher({detail::kAlgorithmBytes}).with_dtype<uint8_t>().with_device<kDLCPU>().verify(algorithm_buffer);
+  TensorMatcher({detail::kMetadataFields}).with_dtype<int64_t>().with_device<kDLCPU>().verify(metadata_buffer);
+  TensorMatcher({1}).with_dtype<float>().with_device<kDLCPU>().verify(waves_buffer);
+  const auto stream = LaunchKernel::resolve_device(p.device);
+  cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+  detail::check_cuda(cudaStreamIsCapturing(stream, &capture), "cudaStreamIsCapturing");
+  RuntimeCheck(capture == cudaStreamCaptureStatusNone, "tactic restore forbidden during capture");
+  const auto* c = static_cast<const int64_t*>(config.data_ptr());
+  for (int i = 0; i < 9; ++i) RuntimeCheck(c[i] >= 0 && c[i] <= INT32_MAX, "Invalid tactic field");
+  auto handle = detail::create_or_get_handle(p.device.device_id);
+  detail::GemmDescriptors d(p.m, p.n, p.k, static_cast<int32_t>(sm_count_target));
+  cublasLtMatmulAlgo_t algorithm{};
+  detail::check_cublas(cublasLtMatmulAlgoInit(handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
+      CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, int(c[0]), &algorithm), "restore AlgoInit");
+  RuntimeCheck(
+      detail::set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_TILE_ID, uint32_t(c[1])) &&
+      detail::set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, int32_t(c[2])) &&
+      detail::set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, uint32_t(c[3])) &&
+      detail::set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, uint32_t(c[4])) &&
+      detail::set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, uint32_t(c[5])) &&
+      detail::set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_STAGES_ID, uint32_t(c[6])) &&
+      detail::set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, uint16_t(c[8])),
+      "retained tactic configuration rejected");
+  RuntimeCheck(detail::get_algorithm_attribute<uint16_t>(algorithm, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID) == c[7],
+      "retained tactic inner shape differs from AlgoInit");
+  detail::CustomFindCapabilities caps{};
+  RuntimeCheck(detail::get_custom_find_capabilities(algorithm, &caps), "retained tactic capabilities unavailable");
+  RuntimeCheck(detail::pointer_alignment(weight.data_ptr()) >= caps.min_alignment_a &&
+      detail::pointer_alignment(activation.data_ptr()) >= caps.min_alignment_b &&
+      256 >= caps.min_alignment_c && 256 >= caps.min_alignment_d, "retained tactic alignment mismatch");
+  cublasLtMatmulHeuristicResult_t result{};
+  detail::check_cublas(cublasLtMatmulAlgoCheck(handle, d.operation, d.weight, d.activation,
+      d.output, d.output, &algorithm, &result), "restore AlgoCheck");
+  RuntimeCheck(result.state == CUBLAS_STATUS_SUCCESS, "retained tactic invalid for new shape");
+  RuntimeCheck(result.workspaceSize <= uint64_t(workspace.size(0)), "retained tactic workspace exceeds cap");
+  result.algo = algorithm;
+  std::memcpy(algorithm_buffer.data_ptr(), &algorithm, detail::kAlgorithmBytes);
+  detail::write_metadata(static_cast<int64_t*>(metadata_buffer.data_ptr()), -1, result);
+  static_cast<float*>(waves_buffer.data_ptr())[0] = result.wavesCount;
 }
 
 inline int64_t query_algorithms_by_id(

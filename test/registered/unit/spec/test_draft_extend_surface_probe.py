@@ -912,6 +912,14 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
                 with self.assertRaises(RuntimeError):
                     probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
                 setattr(args, name, previous)
+            args.speculative_num_steps = 4
+            args.speculative_num_draft_tokens = 5
+            identity, stream = probe_module._validate_fixed52_runtime(runner, [32, 64], 5)
+            self.assertEqual(identity["speculative_num_draft_tokens"], 5)
+            with self.assertRaises(RuntimeError):
+                probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
+            args.speculative_num_steps = 3
+            args.speculative_num_draft_tokens = 4
             with envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("measure"):
                 with self.assertRaisesRegex(RuntimeError, "plan metadata only"):
                     probe_module._validate_fixed52_runtime(runner, [32, 64], 4)

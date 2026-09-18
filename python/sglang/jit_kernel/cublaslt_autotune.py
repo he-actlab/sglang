@@ -26,6 +26,7 @@ from sglang.jit_kernel.cublaslt_drafter_gemm import (
     discover_algorithms,
     library_versions,
     matmul,
+    restore_algorithm,
 )
 from sglang.srt.multiplex.pdmux_context import cublas_sm_count_target
 
@@ -517,6 +518,51 @@ def _autotune_shape(
         }
 
 
+def _restore_shape_without_timing(
+    *, cache_key, activation, weight, realized_sm_target, workspace, stream
+):
+    """Port the retained K3 decision; never retune or silently select a fallback.
+
+    M160 changes workspace size, but not the selected algorithm/tile/stages/
+    split-K/SM target. Missing or inapplicable reference choices fail closed.
+    The reference cache is read-only and must match the GPU/library contract.
+    """
+    source_key = dict(cache_key)
+    reference_uuid = os.environ.get("SGLANG_CUBLASLT_REFERENCE_GPU_UUID")
+    if reference_uuid:
+        # Explicit cross-device correctness port; every other hardware/library
+        # field remains bound. Never reuse the archived performance verdict.
+        source_key["gpu"] = {**cache_key["gpu"], "uuid": reference_uuid}
+    m, k, n = cache_key["shape_mkn"]
+    source_key["shape_mkn"] = [128 if m == 160 else m, k, n]
+    path = _cache_path(source_key)
+    cached = _read_cache(path, source_key)
+    if cached is None:
+        raise RuntimeError(f"K4 correctness port requires retained K3 cache: {path}")
+    decision = {
+        "selection": cached["selection"],
+        "cache_state": "correctness-only-port",
+        "cache_path": str(path),
+        "source_shape_mkn": source_key["shape_mkn"],
+    }
+    if cached["selection"] == "production":
+        return None, decision
+    target = int(cached["sm_count_target"])
+    candidate = restore_algorithm(
+        activation, weight, tactic=cached["tactic"],
+        sm_count_target=target, workspace=workspace,
+    )
+    with cublas_sm_count_target(realized_sm_target), torch.cuda.stream(stream):
+        reference = F.linear(activation, weight)
+    _synchronize(stream)
+    if not _correctness_passes(
+        activation=activation, weight=weight, reference=reference,
+        candidate=candidate, workspace=workspace, stream=stream,
+    ):
+        raise RuntimeError(f"K4 retained tactic failed correctness for {(m, k, n)}")
+    return candidate, {**decision, "sm_count_target": target, "tactic": stable_tactic(candidate)}
+
+
 def autotune_projection_portfolio(
     *,
     device_index: int,
@@ -527,6 +573,7 @@ def autotune_projection_portfolio(
     planning_context: str,
     workspace: torch.Tensor,
     logger: logging.Logger,
+    correctness_only: bool = False,
 ) -> AutotunePortfolio:
     """Tune all exact projection shapes on the worker's live green stream."""
 
@@ -568,14 +615,15 @@ def autotune_projection_portfolio(
             sm_count_targets=(0, realized_sm_target),
             workspace_bytes=workspace.numel(),
         )
-        algorithm, decision = _autotune_shape(
+        select = _restore_shape_without_timing if correctness_only else _autotune_shape
+        algorithm, decision = select(
             cache_key=cache_key,
             activation=activation,
             weight=weight,
             realized_sm_target=realized_sm_target,
             workspace=workspace,
             stream=torch.cuda.current_stream(device_index),
-            logger=logger,
+            **({} if correctness_only else {"logger": logger}),
         )
         decisions[shape_mkn] = decision
         if algorithm is not None:

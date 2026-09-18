@@ -24,9 +24,10 @@ register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-
 class TestFlashInferTile16Diagnostics(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(20260916)
+        query_length = getattr(self, "query_length", 4)
         self.device = torch.device("cuda")
         self.kv_lens = torch.tensor(
-            [4, 15, 63, 64, 65, 127, 128, 129, 257, 384],
+            [query_length, 15, 63, 64, 65, 127, 128, 129, 257, 384],
             dtype=torch.int32,
             device=self.device,
         )
@@ -35,7 +36,7 @@ class TestFlashInferTile16Diagnostics(unittest.TestCase):
         page_counts = torch.div(self.kv_lens + 63, 64, rounding_mode="floor")
         self.num_pages = int(page_counts.sum().item())
         self.qo_indptr = torch.arange(
-            0, self.batch * 4 + 1, 4, dtype=torch.int32, device=self.device
+            0, self.batch * query_length + 1, query_length, dtype=torch.int32, device=self.device
         )
         self.kv_indptr = torch.zeros(
             self.batch + 1, dtype=torch.int32, device=self.device
@@ -46,7 +47,7 @@ class TestFlashInferTile16Diagnostics(unittest.TestCase):
         )
         self.last_page_len = (self.kv_lens - 1) % 64 + 1
         self.query = torch.randn(
-            self.batch * 4, 16, 128, dtype=torch.bfloat16, device=self.device
+            self.batch * query_length, 16, 128, dtype=torch.bfloat16, device=self.device
         )
         self.key = torch.randn(
             self.num_pages, 64, 8, 128, dtype=torch.bfloat16, device=self.device

@@ -31,7 +31,11 @@ using ElementOutput = cutlass::bfloat16_t;
 using ElementAccumulator = float;
 using ElementCompute = float;
 
-static constexpr int kM = 128;
+#ifndef SGLANG_DRAFTER_EXTEND_M
+#define SGLANG_DRAFTER_EXTEND_M 128
+#endif
+static constexpr int kM = SGLANG_DRAFTER_EXTEND_M;
+static_assert(kM == 128 || kM == 160);
 static constexpr int kN = 1024;
 static constexpr int kK = 2048;
 static constexpr size_t kAlignmentBytes = 16;

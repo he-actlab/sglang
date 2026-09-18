@@ -226,6 +226,23 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
         runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_called_once_with(0)
         runner.model.enable_qwen3_draft_extend_gemm_integration.assert_called_once_with(0)
 
+    def test_k4_keeps_m32_and_uses_m160_extend(self):
+        runner = self._runner()
+        runner.server_args.enable_spec_sm_partition = False
+        runner.server_args.enable_spec_pdmux = True
+        runner.server_args.spec_pdmux_slots = 2
+        runner.server_args.disable_overlap_schedule = False
+        runner.server_args.speculative_num_steps = 4
+        runner.server_args.speculative_num_draft_tokens = 5
+        with (
+            self._exact_context(),
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
+        ):
+            self.assertTrue(runner._maybe_enable_qwen3_drafter_sm120_kernel_optimized())
+            self.assertTrue(runner._maybe_enable_qwen3_draft_extend_gemm_integration())
+        runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_called_once_with(0)
+        runner.model.enable_qwen3_draft_extend_gemm_integration.assert_called_once_with(0, m=160)
+
     def test_unsupported_overlap_modes_do_not_arm_either_portfolio(self):
         for mutation in (
             {"spec_pdmux_slots": 3},

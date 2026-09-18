@@ -118,7 +118,10 @@ def _use_full_device_draft_extend_lm_head(
         return False
     if not hidden_states.is_cuda or hidden_states.dtype != torch.bfloat16:
         return False
-    if tuple(hidden_states.shape) != _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_INPUT_SHAPE:
+    if tuple(hidden_states.shape) != _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_INPUT_SHAPE and not (
+        envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
+        and tuple(hidden_states.shape) == (160, 1024)
+    ):
         return False
     if hasattr(lm_head, "set_lora") or hasattr(lm_head, "apply_lora"):
         return False
@@ -136,7 +139,8 @@ def _use_full_device_draft_extend_lm_head(
     if eligible and not _logged_full_device_draft_extend_lm_head:
         logger.info(
             "Qwen3 drafter full-device draft-extend LM head armed: exact "
-            "DRAFT_EXTEND_V2 M=128 K=1024 N=151936 BF16 TP1 path"
+            "DRAFT_EXTEND_V2 M=%d K=1024 N=151936 BF16 TP1 path",
+            hidden_states.shape[0],
         )
         _logged_full_device_draft_extend_lm_head = True
     return eligible

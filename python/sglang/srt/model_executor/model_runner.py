@@ -940,6 +940,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.gpu_id,
                 allocated_split[0],
                 f"smhint-{hint_mode}",
+                **({"projection_m": 160} if (
+                    self.server_args.speculative_num_steps,
+                    self.server_args.speculative_eagle_topk,
+                    self.server_args.speculative_num_draft_tokens,
+                ) == (4, 1, 5) else {}),
             )
         if not enabled:
             return fallback(
@@ -1006,8 +1011,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.speculative_eagle_topk,
             self.server_args.speculative_num_draft_tokens,
         )
-        if frozen_spec != (3, 1, 4):
-            return fallback(f"speculative knobs={frozen_spec}, expected (3, 1, 4)")
+        if frozen_spec not in ((3, 1, 4), (4, 1, 5)):
+            return fallback(f"speculative knobs={frozen_spec}, expected K3 or K4/topk1")
         if self.tp_size != 1 or self.pp_size != 1:
             return fallback(f"tp_size={self.tp_size}, pp_size={self.pp_size}")
         if self.dtype != torch.bfloat16 or self.model_config.quantization is not None:
@@ -1101,8 +1106,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.speculative_eagle_topk,
             self.server_args.speculative_num_draft_tokens,
         )
-        if frozen_spec != (3, 1, 4):
-            return fallback(f"speculative knobs={frozen_spec}, expected (3, 1, 4)")
+        if frozen_spec not in ((3, 1, 4), (4, 1, 5)):
+            return fallback(f"speculative knobs={frozen_spec}, expected K3 or K4/topk1")
         if self.tp_size != 1 or self.pp_size != 1:
             return fallback(f"tp_size={self.tp_size}, pp_size={self.pp_size}")
         if self.dtype != torch.bfloat16 or self.model_config.quantization is not None:
@@ -1134,7 +1139,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         small_stream = get_spec_streams()[1]
         with torch.cuda.stream(small_stream):
-            enabled = enable(self.gpu_id)
+            enabled = enable(
+                self.gpu_id,
+                **({"m": 160} if self.server_args.speculative_num_steps == 4 else {}),
+            )
         if not enabled:
             return fallback(
                 "model, norms, or communicator are not the exact unquantized "
@@ -1143,7 +1151,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             "Qwen3 draft-extend five-GEMM integration enabled: qkv128 dedicated "
             "stream, fused out128/down128 boundaries, full-device gate-up128, "
-            "and full-device LM head."
+            "and full-device LM head. Active M=%d.",
+            32 * self.server_args.speculative_num_draft_tokens,
         )
         return True
 
@@ -1275,6 +1284,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.gpu_id,
                 allocated_split[1],
                 f"smhint-{hint_mode}",
+                **({"projection_m": 160} if (
+                    self.server_args.speculative_num_steps,
+                    self.server_args.speculative_eagle_topk,
+                    self.server_args.speculative_num_draft_tokens,
+                ) == (4, 1, 5) else {}),
             )
         if not enabled:
             return fallback(

@@ -223,6 +223,12 @@ class DraftExtendSurfaceProbe:
         small_stream: Optional[Any] = None,
     ) -> None:
         self.config = config
+        self._query_tokens = int(config.config_identity.get("speculative_num_draft_tokens", 4))
+        self._target_m = TARGET_BS * self._query_tokens
+        if self._query_tokens not in (4, 5):
+            raise ValueError("plan metadata requires Q4 or Q5")
+        if self._query_tokens == 5 and (config.mode != "off" or config.ncu_range or config.attention_snapshot_path):
+            raise ValueError("K4 permits plan metadata only, not surface/NCU diagnostics")
         self._event_factory = event_factory or torch.cuda.Event
         self._small_stream = small_stream
         self._target_replay_count = 0
@@ -378,10 +384,10 @@ class DraftExtendSurfaceProbe:
                 f"manifest-bound request: expected={expected_controls} got={controls}"
             )
 
-        if int(plan_info["total_num_rows"]) != TARGET_M:
+        if int(plan_info["total_num_rows"]) != self._target_m:
             raise RuntimeError(
                 "draft-extend S2 FlashInfer total_num_rows changed: "
-                f"expected {TARGET_M}, got {plan_info['total_num_rows']}"
+                f"expected {self._target_m}, got {plan_info['total_num_rows']}"
             )
         force_q_tile_16 = bool(identity["draft_extend_flashinfer_force_q_tile_16"])
         expected_q_tile = 16 if force_q_tile_16 else 128
@@ -454,11 +460,11 @@ class DraftExtendSurfaceProbe:
         num_tokens: int,
         metadata: Any,
     ) -> None:
-        if not self.config.require_prefill_plan_metadata or num_tokens != TARGET_M:
+        if not self.config.require_prefill_plan_metadata or num_tokens != self._target_m:
             return
         if batch_size != TARGET_BS:
             raise RuntimeError(
-                f"M={TARGET_M} planner capture expected bs={TARGET_BS}, got {batch_size}"
+                f"M={self._target_m} planner capture expected bs={TARGET_BS}, got {batch_size}"
             )
         normalized = self._normalize_prefill_plan_metadata(metadata)
         previous = self._capture_prefill_plan_metadata.get(batch_size)
@@ -489,11 +495,11 @@ class DraftExtendSurfaceProbe:
         num_tokens: int,
         error: Exception,
     ) -> None:
-        if not self.config.require_prefill_plan_metadata or num_tokens != TARGET_M:
+        if not self.config.require_prefill_plan_metadata or num_tokens != self._target_m:
             return
         if batch_size != TARGET_BS:
             raise RuntimeError(
-                f"M={TARGET_M} planner rejection expected bs={TARGET_BS}, got {batch_size}"
+                f"M={self._target_m} planner rejection expected bs={TARGET_BS}, got {batch_size}"
             ) from error
         if stage not in ("capture", "replay"):
             raise ValueError(f"invalid planner rejection stage {stage!r}") from error
@@ -514,7 +520,7 @@ class DraftExtendSurfaceProbe:
     def prime_for_capture(self, stream, num_tokens: int) -> None:
         """Materialize every external event before the inner graph capture."""
 
-        if num_tokens != TARGET_M or not self.config.surfaces:
+        if num_tokens != self._target_m or not self.config.surfaces:
             return
         for surface in self.config.surfaces:
             for events in self._event_pairs[surface]:
@@ -523,7 +529,7 @@ class DraftExtendSurfaceProbe:
         stream.synchronize()
 
     def capture_scope(self, num_tokens: int):
-        if num_tokens != TARGET_M or not (
+        if num_tokens != self._target_m or not (
             self.config.surfaces or self.config.attention_snapshot_path
         ):
             return contextlib.nullcontext()
@@ -540,7 +546,7 @@ class DraftExtendSurfaceProbe:
             return
         if self._attention_snapshot_source is not None:
             raise RuntimeError("attention snapshot captured layer 0 more than once")
-        if tuple(q.shape) != (TARGET_M, 16, 128) or q.dtype != torch.bfloat16:
+        if tuple(q.shape) != (self._target_m, 16, 128) or q.dtype != torch.bfloat16:
             raise RuntimeError("attention snapshot requires BF16 Q[128,16,128]")
         if page_size != 64 or len(kv_cache) != 2:
             raise RuntimeError("attention snapshot requires page64 NHD K/V")
@@ -574,7 +580,7 @@ class DraftExtendSurfaceProbe:
         qo_indptr = wrapper._qo_indptr_buf.detach().cpu().clone()
         kv_indptr = wrapper._paged_kv_indptr_buf.detach().cpu().clone()
         last_page_len = wrapper._paged_kv_last_page_len_buf.detach().cpu().clone()
-        expected_qo = torch.arange(TARGET_BS + 1, dtype=torch.int32) * 4
+        expected_qo = torch.arange(TARGET_BS + 1, dtype=torch.int32) * self._query_tokens
         if qo_indptr.dtype != torch.int32 or not torch.equal(qo_indptr, expected_qo):
             raise RuntimeError("snapshot live Q metadata differs from c32/Q4")
         if (
@@ -748,7 +754,7 @@ class DraftExtendSurfaceProbe:
                 self.record_prefill_plan_rejection(
                     stage="replay",
                     batch_size=padded_bs,
-                    num_tokens=TARGET_M,
+                    num_tokens=self._target_m,
                     error=error,
                 )
                 raise
@@ -833,7 +839,7 @@ class DraftExtendSurfaceProbe:
                     "replay_index": token.replay_index,
                     "raw_batch_size": raw_bs,
                     "padded_batch_size": padded_bs,
-                    "padded_num_tokens": TARGET_M,
+                    "padded_num_tokens": self._target_m,
                     "capture_prefill_plan_metadata": (
                         token.capture_prefill_plan_metadata
                     ),
@@ -894,7 +900,7 @@ class DraftExtendSurfaceProbe:
                 if self.config.require_prefill_plan_metadata
                 else None
             ),
-            "padded_num_tokens": TARGET_M,
+            "padded_num_tokens": self._target_m,
             "calls": calls,
         }
         self._write_record(record)
@@ -1201,7 +1207,15 @@ def _validate_fixed52_runtime(
     properties = torch.cuda.get_device_properties(model_runner.gpu_id)
     prefill_backend, decode_backend = args.get_attention_backends()
 
+    target_m = TARGET_BS * num_tokens_per_bs
     checks = [
+        (
+            int(args.speculative_num_steps) != 4 or (retained_hint
+                and envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.get() == "off"
+                and not envs.SGLANG_DRAFT_EXTEND_NCU_RANGE.get()
+                and not os.environ.get("SGLANG_DRAFT_EXTEND_ATTENTION_SNAPSHOT_PATH")),
+            "K4 permits retained plan metadata only",
+        ),
         (
             not concurrent_hint or (
                 envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.get() == "off"
@@ -1260,18 +1274,18 @@ def _validate_fixed52_runtime(
         ),
         (not bool(args.disable_radix_cache), "radix cache is disabled"),
         (
-            int(args.speculative_num_steps) == 3,
+            int(args.speculative_num_steps) in (3, 4),
             f"speculative_num_steps={args.speculative_num_steps}",
         ),
         (int(args.speculative_eagle_topk) == 1, f"topk={args.speculative_eagle_topk}"),
         (
-            int(args.speculative_num_draft_tokens) == 4,
+            int(args.speculative_num_draft_tokens) == int(args.speculative_num_steps) + 1,
             f"num_draft_tokens={args.speculative_num_draft_tokens}",
         ),
-        (num_tokens_per_bs == 4, f"num_tokens_per_bs={num_tokens_per_bs}"),
+        (num_tokens_per_bs == int(args.speculative_num_draft_tokens), f"num_tokens_per_bs={num_tokens_per_bs}"),
         (
-            any(int(bs) * num_tokens_per_bs == TARGET_M for bs in capture_bs),
-            f"capture buckets={tuple(capture_bs)} do not contain padded M=128",
+            any(int(bs) * num_tokens_per_bs == target_m for bs in capture_bs),
+            f"capture buckets={tuple(capture_bs)} do not contain padded M={target_m}",
         ),
         (
             args.cuda_graph_config.decode.backend == Backend.FULL,

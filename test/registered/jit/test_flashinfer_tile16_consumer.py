@@ -237,7 +237,7 @@ class TestTile16ConsumerIndexing(unittest.TestCase):
         self.assertEqual(len(reads) * 4, 32768)
 
     def test_packed_owner_writeback_covers_real_rows_without_aliasing(self):
-        for qo_len in (1, 4, 7, 8):
+        for qo_len in (1, 4, 5, 7, 8):
             for group_size in (1, 2):
                 if qo_len * group_size > 16:
                     continue

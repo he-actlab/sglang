@@ -197,6 +197,9 @@ class ModelRunnerQwen3DrafterCublasLtRoleTests(CustomTestCase):
         runner.server_args = SimpleNamespace(
             enable_spec_pdmux=True,
             speculative_algorithm="STANDALONE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
         )
         runner.spec_algorithm = SimpleNamespace(is_standalone=lambda: True)
         runner.model = SimpleNamespace(
