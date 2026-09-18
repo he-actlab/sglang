@@ -1,4 +1,4 @@
-"""Restore retained K3 portfolio choices at M160 without timing candidates."""
+"""Restore retained K3 choices at M160/M192 without timing candidates."""
 
 import logging
 import os
@@ -25,19 +25,20 @@ register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-
     reason="requires SM120 and explicitly supplied retained K3 cache",
 )
 @pytest.mark.parametrize("worker", ["drafter", "verifier"])
-def test_retained_tactics_at_m160(worker, monkeypatch):
+@pytest.mark.parametrize("extend_m", [160, 192])
+def test_retained_tactics_at_ported_m(worker, extend_m, monkeypatch):
     from sglang.jit_kernel import cublaslt_autotune
     from sglang.srt.multiplex.pdmux_context import initialize_spec_stream_pair
 
     def no_timing(*args, **kwargs):
-        raise AssertionError("the K4 correctness port must not benchmark candidates")
+        raise AssertionError("the shape port must not benchmark candidates")
 
     monkeypatch.setattr(cublaslt_autotune, "_autotune_shape", no_timing)
     monkeypatch.setattr(cublaslt_autotune, "_elapsed_ms", no_timing)
     large, small = initialize_spec_stream_pair(0, 132, 56)
     stream, width = (small, 52) if worker == "drafter" else (large, 136)
     source_shapes = DRAFTER_CUBLASLT_MKNS if worker == "drafter" else VERIFIER_CUBLASLT_MKNS
-    shapes = tuple((160 if m == 128 else m, k, n) for m, k, n in source_shapes if n != 151936)
+    shapes = tuple((extend_m if m == 128 else m, k, n) for m, k, n in source_shapes if n != 151936)
     weights = {
         (n, k): torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.125
         for _, k, n in shapes

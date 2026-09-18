@@ -134,8 +134,13 @@ class CublasLtAutotuneStableReplayTests(CustomTestCase):
 
 class K4RetainedDecisionTests(CustomTestCase):
     def test_reference_key_changes_only_m_and_explicit_device_uuid(self):
+        for m in (160, 192):
+            with self.subTest(m=m):
+                self._check_reference_key(m)
+
+    def _check_reference_key(self, m):
         key = _key()
-        key["shape_mkn"] = [160, 1024, 4096]
+        key["shape_mkn"] = [m, 1024, 4096]
         original = copy.deepcopy(key)
         with patch.dict(os.environ, {"SGLANG_CUBLASLT_REFERENCE_GPU_UUID": "GPU-reference"}), \
                 patch.object(cublaslt_autotune, "_read_cache", return_value={"selection": "production"}) as read, \

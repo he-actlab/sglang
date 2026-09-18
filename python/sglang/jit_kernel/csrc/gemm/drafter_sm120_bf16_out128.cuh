@@ -35,7 +35,7 @@ using ElementCompute = float;
 #define SGLANG_DRAFTER_EXTEND_M 128
 #endif
 static constexpr int kM = SGLANG_DRAFTER_EXTEND_M;
-static_assert(kM == 128 || kM == 160);
+static_assert(kM == 128 || kM == 160 || kM == 192);
 static constexpr int kN = 1024;
 static constexpr int kK = 2048;
 static constexpr size_t kAlignmentBytes = 16;

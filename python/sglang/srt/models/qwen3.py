@@ -357,12 +357,12 @@ class _Qwen3DrafterExtendGemmIntegrationDispatch:
         )
         from sglang.jit_kernel.norm import fused_add_rmsnorm
 
-        if m not in (128, 160):
+        if m not in (128, 160, 192):
             raise ValueError(f"unsupported draft-extend M={m}")
         self._OUT_SHAPE = (m, 2048, 1024)
         self._DOWN_SHAPE = (m, 3072, 1024)
         self._workspace = torch.empty(
-            max(OUT_WORKSPACE_BYTES, DOWN_WORKSPACE_BYTES),
+            max(OUT_WORKSPACE_BYTES, DOWN_WORKSPACE_BYTES, 3 * m * 1024 * 4),
             dtype=torch.uint8,
             device=torch.device("cuda", device_index),
         )
@@ -722,7 +722,7 @@ class _Qwen3PortableCublasLtDispatch:
         self._workspace = allocate_workspace(device_index)
         if self._workspace.data_ptr() % 256:
             raise RuntimeError("portable cuBLASLt workspace must be 256-byte aligned")
-        if projection_m not in (128, 160):
+        if projection_m not in (128, 160, 192):
             raise ValueError(f"unsupported projection M={projection_m}")
         tuned = autotune_projection_portfolio(
             device_index=device_index,
@@ -733,7 +733,7 @@ class _Qwen3PortableCublasLtDispatch:
             planning_context=planning_context,
             workspace=self._workspace,
             logger=logger,
-            **({"correctness_only": True} if projection_m == 160 else {}),
+            **({"correctness_only": True} if projection_m in (160, 192) else {}),
         )
         self._algorithms = dict(tuned.algorithms)
         self._decisions = dict(tuned.decisions)
@@ -856,7 +856,7 @@ def _use_full_device_draft_extend_gate_up(
         return False
     if tuple(activation.shape) != _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_INPUT_SHAPE and not (
         envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
-        and tuple(activation.shape) == (160, 1024)
+        and tuple(activation.shape) in ((160, 1024), (192, 1024))
     ):
         return False
     if not _Qwen3DrafterSM120KernelDispatch.supports_linear(linear):
@@ -894,7 +894,7 @@ def _use_dedicated_draft_extend_qkv128(
         return False
     if tuple(activation.shape) != _DEDICATED_DRAFT_EXTEND_QKV128_INPUT_SHAPE and not (
         envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
-        and tuple(activation.shape) == (160, 1024)
+        and tuple(activation.shape) in ((160, 1024), (192, 1024))
     ):
         return False
     if not _Qwen3DrafterSM120KernelDispatch.supports_linear(linear):
@@ -1743,7 +1743,7 @@ class Qwen3Model(Qwen2Model):
     def enable_qwen3_draft_extend_gemm_integration(
         self, device_index: int, m: int = 128
     ) -> bool:
-        """Install the exact five-GEMM M128/K3 or M160/K4 evaluation path."""
+        """Install the exact five-GEMM evaluation path for K3 through K5."""
 
         layers = self._eligible_qwen3_drafter_layers(
             device_index,

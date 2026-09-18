@@ -57,7 +57,8 @@ VERIFIER_CUBLASLT_MKNS = (
 )
 
 SUPPORTED_CUBLASLT_MKNS = DRAFTER_CUBLASLT_MKNS + VERIFIER_CUBLASLT_MKNS + tuple(
-    (160, k, n)
+    (extend_m, k, n)
+    for extend_m in (160, 192)
     for m, k, n in DRAFTER_CUBLASLT_MKNS + VERIFIER_CUBLASLT_MKNS
     if m == 128
 )

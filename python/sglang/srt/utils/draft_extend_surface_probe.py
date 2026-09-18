@@ -225,10 +225,10 @@ class DraftExtendSurfaceProbe:
         self.config = config
         self._query_tokens = int(config.config_identity.get("speculative_num_draft_tokens", 4))
         self._target_m = TARGET_BS * self._query_tokens
-        if self._query_tokens not in (4, 5):
-            raise ValueError("plan metadata requires Q4 or Q5")
-        if self._query_tokens == 5 and (config.mode != "off" or config.ncu_range or config.attention_snapshot_path):
-            raise ValueError("K4 permits plan metadata only, not surface/NCU diagnostics")
+        if self._query_tokens not in (4, 5, 6):
+            raise ValueError("plan metadata requires Q4 through Q6")
+        if self._query_tokens in (5, 6) and (config.mode != "off" or config.ncu_range or config.attention_snapshot_path):
+            raise ValueError("K4/K5 permits plan metadata only, not surface/NCU diagnostics")
         self._event_factory = event_factory or torch.cuda.Event
         self._small_stream = small_stream
         self._target_replay_count = 0
@@ -1210,11 +1210,11 @@ def _validate_fixed52_runtime(
     target_m = TARGET_BS * num_tokens_per_bs
     checks = [
         (
-            int(args.speculative_num_steps) != 4 or (retained_hint
+            int(args.speculative_num_steps) not in (4, 5) or (retained_hint
                 and envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.get() == "off"
                 and not envs.SGLANG_DRAFT_EXTEND_NCU_RANGE.get()
                 and not os.environ.get("SGLANG_DRAFT_EXTEND_ATTENTION_SNAPSHOT_PATH")),
-            "K4 permits retained plan metadata only",
+            "K4/K5 permits retained plan metadata only",
         ),
         (
             not concurrent_hint or (
@@ -1274,7 +1274,7 @@ def _validate_fixed52_runtime(
         ),
         (not bool(args.disable_radix_cache), "radix cache is disabled"),
         (
-            int(args.speculative_num_steps) in (3, 4),
+            int(args.speculative_num_steps) in (3, 4, 5),
             f"speculative_num_steps={args.speculative_num_steps}",
         ),
         (int(args.speculative_eagle_topk) == 1, f"topk={args.speculative_eagle_topk}"),

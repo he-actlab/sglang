@@ -1,4 +1,4 @@
-"""K4 shape port: unchanged split-K3 schedules, green-stream graph correctness."""
+"""K4/K5 shape ports: fixed split-K3 schedules and green-stream graphs."""
 
 import pytest
 import torch
@@ -23,7 +23,7 @@ register_cuda_ci(est_time=600, stage="base-b-kernel-unit", runner_config="1-gpu-
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires SM120",
 )
-@pytest.mark.parametrize("m", [128, 160])
+@pytest.mark.parametrize("m", [128, 160, 192])
 @pytest.mark.parametrize("k", [2048, 3072])
 @pytest.mark.parametrize("seed", [20260902, 20260903])
 def test_fused_extend_keeps_schedule_and_graph_scratch(m, k, seed):
@@ -37,8 +37,9 @@ def test_fused_extend_keeps_schedule_and_graph_scratch(m, k, seed):
     torch.manual_seed(seed)
     weight = torch.randn((1024, k), device="cuda", dtype=torch.bfloat16) * 0.125
     norm = torch.ones(1024, device="cuda", dtype=torch.bfloat16)
-    storage = torch.full((WORKSPACE_BYTES + 256,), 0xA5, device="cuda", dtype=torch.uint8)
-    workspace = storage[:WORKSPACE_BYTES]
+    workspace_bytes = max(WORKSPACE_BYTES, 3 * m * 1024 * 4)
+    storage = torch.full((workspace_bytes + 256,), 0xA5, device="cuda", dtype=torch.uint8)
+    workspace = storage[:workspace_bytes]
     slots = []
     for _ in range(2):
         x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.125
@@ -98,4 +99,4 @@ def test_fused_extend_keeps_schedule_and_graph_scratch(m, k, seed):
             assert torch.equal(residual, ref_residual)
             torch.testing.assert_close(out, ref, rtol=0.02, atol=0.02)
     torch.cuda.synchronize()
-    assert torch.all(storage[WORKSPACE_BYTES:] == 0xA5)
+    assert torch.all(storage[workspace_bytes:] == 0xA5)

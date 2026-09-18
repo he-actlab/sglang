@@ -940,11 +940,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.gpu_id,
                 allocated_split[0],
                 f"smhint-{hint_mode}",
-                **({"projection_m": 160} if (
+                **({"projection_m": 32 * self.server_args.speculative_num_draft_tokens} if (
                     self.server_args.speculative_num_steps,
                     self.server_args.speculative_eagle_topk,
                     self.server_args.speculative_num_draft_tokens,
-                ) == (4, 1, 5) else {}),
+                ) in ((4, 1, 5), (5, 1, 6)) else {}),
             )
         if not enabled:
             return fallback(
@@ -1011,8 +1011,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.speculative_eagle_topk,
             self.server_args.speculative_num_draft_tokens,
         )
-        if frozen_spec not in ((3, 1, 4), (4, 1, 5)):
-            return fallback(f"speculative knobs={frozen_spec}, expected K3 or K4/topk1")
+        if frozen_spec not in ((3, 1, 4), (4, 1, 5), (5, 1, 6)):
+            return fallback(f"speculative knobs={frozen_spec}, expected K3 through K5/topk1")
         if self.tp_size != 1 or self.pp_size != 1:
             return fallback(f"tp_size={self.tp_size}, pp_size={self.pp_size}")
         if self.dtype != torch.bfloat16 or self.model_config.quantization is not None:
@@ -1106,8 +1106,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.speculative_eagle_topk,
             self.server_args.speculative_num_draft_tokens,
         )
-        if frozen_spec not in ((3, 1, 4), (4, 1, 5)):
-            return fallback(f"speculative knobs={frozen_spec}, expected K3 or K4/topk1")
+        if frozen_spec not in ((3, 1, 4), (4, 1, 5), (5, 1, 6)):
+            return fallback(f"speculative knobs={frozen_spec}, expected K3 through K5/topk1")
         if self.tp_size != 1 or self.pp_size != 1:
             return fallback(f"tp_size={self.tp_size}, pp_size={self.pp_size}")
         if self.dtype != torch.bfloat16 or self.model_config.quantization is not None:
@@ -1141,7 +1141,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         with torch.cuda.stream(small_stream):
             enabled = enable(
                 self.gpu_id,
-                **({"m": 160} if self.server_args.speculative_num_steps == 4 else {}),
+                **({"m": 32 * self.server_args.speculative_num_draft_tokens}
+                   if self.server_args.speculative_num_steps in (4, 5) else {}),
             )
         if not enabled:
             return fallback(
@@ -1284,11 +1285,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.gpu_id,
                 allocated_split[1],
                 f"smhint-{hint_mode}",
-                **({"projection_m": 160} if (
+                **({"projection_m": 32 * self.server_args.speculative_num_draft_tokens} if (
                     self.server_args.speculative_num_steps,
                     self.server_args.speculative_eagle_topk,
                     self.server_args.speculative_num_draft_tokens,
-                ) == (4, 1, 5) else {}),
+                ) in ((4, 1, 5), (5, 1, 6)) else {}),
             )
         if not enabled:
             return fallback(

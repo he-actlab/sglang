@@ -523,7 +523,7 @@ def _restore_shape_without_timing(
 ):
     """Port the retained K3 decision; never retune or silently select a fallback.
 
-    M160 changes workspace size, but not the selected algorithm/tile/stages/
+    Larger M changes workspace size, but not the selected algorithm/tile/stages/
     split-K/SM target. Missing or inapplicable reference choices fail closed.
     The reference cache is read-only and must match the GPU/library contract.
     """
@@ -534,11 +534,11 @@ def _restore_shape_without_timing(
         # field remains bound. Never reuse the archived performance verdict.
         source_key["gpu"] = {**cache_key["gpu"], "uuid": reference_uuid}
     m, k, n = cache_key["shape_mkn"]
-    source_key["shape_mkn"] = [128 if m == 160 else m, k, n]
+    source_key["shape_mkn"] = [128 if m in (160, 192) else m, k, n]
     path = _cache_path(source_key)
     cached = _read_cache(path, source_key)
     if cached is None:
-        raise RuntimeError(f"K4 correctness port requires retained K3 cache: {path}")
+        raise RuntimeError(f"K4/K5 shape port requires retained K3 cache: {path}")
     decision = {
         "selection": cached["selection"],
         "cache_state": "correctness-only-port",
@@ -559,7 +559,7 @@ def _restore_shape_without_timing(
         activation=activation, weight=weight, reference=reference,
         candidate=candidate, workspace=workspace, stream=stream,
     ):
-        raise RuntimeError(f"K4 retained tactic failed correctness for {(m, k, n)}")
+        raise RuntimeError(f"K4/K5 retained tactic failed correctness for {(m, k, n)}")
     return candidate, {**decision, "sm_count_target": target, "tactic": stable_tactic(candidate)}
 
 
