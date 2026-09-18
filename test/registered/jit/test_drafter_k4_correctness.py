@@ -65,6 +65,12 @@ def test_fused_extend_keeps_schedule_and_graph_scratch(m, k, seed):
 
     references = []
     graphs = []
+    if k == 2048:
+        x, residual, out = slots[0]
+        with pytest.raises(ValueError, match="workspace must contain at least"):
+            drafter_sm120_bf16_out128_splitk3_fused_rmsnorm(
+                out, residual, norm, x, weight, workspace[:3 * m * 1024 * 4 - 16], 1e-6
+            )
     for x, residual, out in slots:
         with torch.cuda.stream(stream):
             ref = torch.empty_like(out)

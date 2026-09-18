@@ -177,9 +177,12 @@ def drafter_sm120_bf16_out128_splitk3_fused_rmsnorm(
         (output, "output", (m, N), torch.bfloat16),
         (residual, "residual", (m, N), torch.bfloat16),
         (norm_weight, "norm_weight", (N,), torch.bfloat16),
-        (workspace, "workspace", (WORKSPACE_BYTES,), torch.uint8),
+        (workspace, "workspace", (workspace.numel(),), torch.uint8),
     ):
         _validate_tensor(tensor, name=name, shape=shape, dtype=dtype, device=device)
+    workspace_bytes = 3 * m * N * 4
+    if workspace.numel() < workspace_bytes:
+        raise ValueError(f"workspace must contain at least {workspace_bytes} bytes")
     module = _jit_drafter_sm120_bf16_out128_module(m)
     module.drafter_sm120_bf16_out128_splitk3_m64_n64_k32_s5_fused_rmsnorm(
         output,
