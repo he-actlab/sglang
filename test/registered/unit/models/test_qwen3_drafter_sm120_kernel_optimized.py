@@ -226,14 +226,19 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
         runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_called_once_with(0)
         runner.model.enable_qwen3_draft_extend_gemm_integration.assert_called_once_with(0)
 
-    def test_k4_keeps_m32_and_uses_m160_extend(self):
+    def test_larger_k_keeps_m32_and_ports_extend(self):
+        for steps in (4, 6):
+            with self.subTest(steps=steps):
+                self._check_ported_extend(steps)
+
+    def _check_ported_extend(self, steps):
         runner = self._runner()
         runner.server_args.enable_spec_sm_partition = False
         runner.server_args.enable_spec_pdmux = True
         runner.server_args.spec_pdmux_slots = 2
         runner.server_args.disable_overlap_schedule = False
-        runner.server_args.speculative_num_steps = 4
-        runner.server_args.speculative_num_draft_tokens = 5
+        runner.server_args.speculative_num_steps = steps
+        runner.server_args.speculative_num_draft_tokens = steps + 1
         with (
             self._exact_context(),
             envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
@@ -241,7 +246,7 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
             self.assertTrue(runner._maybe_enable_qwen3_drafter_sm120_kernel_optimized())
             self.assertTrue(runner._maybe_enable_qwen3_draft_extend_gemm_integration())
         runner.model.enable_qwen3_drafter_sm120_kernel_optimized.assert_called_once_with(0)
-        runner.model.enable_qwen3_draft_extend_gemm_integration.assert_called_once_with(0, m=160)
+        runner.model.enable_qwen3_draft_extend_gemm_integration.assert_called_once_with(0, m=32 * (steps + 1))
 
     def test_unsupported_overlap_modes_do_not_arm_either_portfolio(self):
         for mutation in (

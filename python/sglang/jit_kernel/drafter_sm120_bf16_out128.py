@@ -51,7 +51,7 @@ def _arch_env():
 
 @cache_once
 def _jit_drafter_sm120_bf16_out128_module(m: int = M) -> Module:
-    if m not in (128, 160):
+    if m not in (128, 160, 224):
         raise ValueError(f"unsupported draft-extend M={m}")
     wrappers = [(f"drafter_sm120_bf16_out128_{config}",) * 2 for config in CONFIGS]
     wrappers.append(
@@ -108,7 +108,7 @@ def drafter_sm120_bf16_out128(
         )
     device = activation.device
     m = int(activation.shape[0])
-    if m not in (128, 160):
+    if m not in (128, 160, 224):
         raise ValueError(f"unsupported draft-extend M={m}")
     _validate_tensor(
         activation,
@@ -163,7 +163,7 @@ def drafter_sm120_bf16_out128_splitk3_fused_rmsnorm(
         raise RuntimeError("SM120 BF16 out128 requires CUDA.")
     device = activation.device
     m = int(activation.shape[0])
-    if m not in (128, 160):
+    if m not in (128, 160, 224):
         raise ValueError(f"unsupported draft-extend M={m}")
     capability = torch.cuda.get_device_capability(device)
     if capability != (12, 0):

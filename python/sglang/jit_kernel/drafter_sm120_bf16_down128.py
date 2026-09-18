@@ -45,7 +45,7 @@ def _arch_env():
 
 @cache_once
 def _jit_drafter_sm120_bf16_down128_module(m: int = M) -> Module:
-    if m not in (128, 160):
+    if m not in (128, 160, 224):
         raise ValueError(f"unsupported draft-extend M={m}")
     wrappers = []
     for config in CONFIGS:
@@ -104,7 +104,7 @@ def _validate(
             f"12.0, got {capability[0]}.{capability[1]}."
         )
     m = int(activation.shape[0])
-    if m not in (128, 160):
+    if m not in (128, 160, 224):
         raise ValueError(f"unsupported draft-extend M={m}")
     tensors = [
         (activation, "activation", (m, K), torch.bfloat16),

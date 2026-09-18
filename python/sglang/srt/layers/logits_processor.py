@@ -120,7 +120,7 @@ def _use_full_device_draft_extend_lm_head(
         return False
     if tuple(hidden_states.shape) != _FULL_DEVICE_DRAFT_EXTEND_LM_HEAD_INPUT_SHAPE and not (
         envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
-        and tuple(hidden_states.shape) == (160, 1024)
+        and tuple(hidden_states.shape) in ((160, 1024), (224, 1024))
     ):
         return False
     if hasattr(lm_head, "set_lora") or hasattr(lm_head, "apply_lora"):

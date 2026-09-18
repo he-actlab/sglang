@@ -1132,12 +1132,12 @@ class FlashInferAttnBackend(AttentionBackend):
             spec = model_runner.server_args
             if (
                 not model_runner.is_draft_worker
-                or spec.speculative_num_draft_tokens not in (4, 5)
+                or spec.speculative_num_draft_tokens not in (4, 5, 7)
                 or model_runner.model_config.num_attention_heads
                 // model_runner.model_config.get_num_kv_heads(1)
                 != 2
             ):
-                raise ValueError("forced FA2 Q tile 16 is restricted to draft Q4/Q5 GQA2")
+                raise ValueError("forced FA2 Q tile 16 is restricted to draft Q4/Q5/Q7 GQA2")
             self.draft_extend_force_q_tile_16 = True
             logger.info(
                 "FlashInfer draft-extend Q-tile-16 control armed: fixed Q%d/GQA2, "
@@ -1225,10 +1225,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 model_runner.server_args.speculative_eagle_topk,
                 model_runner.server_args.speculative_num_draft_tokens,
             )
-            if frozen_spec not in ((3, 1, 4), (4, 1, 5)):
+            if frozen_spec not in ((3, 1, 4), (4, 1, 5), (6, 1, 7)):
                 errors.append(f"speculative knobs={frozen_spec}")
-            if frozen_spec == (4, 1, 5) and tile16_pipeline != "cpasync":
-                errors.append("K4 ports only the retained cpasync tile16 pipeline")
+            if frozen_spec in ((4, 1, 5), (6, 1, 7)) and tile16_pipeline != "cpasync":
+                errors.append("K4/K6 ports only the retained cpasync tile16 pipeline")
             if errors:
                 raise ValueError(
                     "draft-extend tile16 pipeline left its exact experimental contract: "

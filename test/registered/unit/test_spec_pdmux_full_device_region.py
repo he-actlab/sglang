@@ -91,6 +91,7 @@ class FullDeviceLmHeadPolicyTests(CustomTestCase):
             self.assertFalse(self._eligible(hidden_states=hidden))
         with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
             self.assertTrue(self._eligible(enabled=False, hidden_states=hidden))
+            self.assertTrue(self._eligible(hidden_states=_FakeCudaTensor((224, 1024))))
             self.assertFalse(self._eligible(hidden_states=_FakeCudaTensor((192, 1024))))
 
     def test_other_forward_mode_is_ineligible(self):
@@ -201,6 +202,7 @@ class FullDeviceGateUpPolicyTests(CustomTestCase):
             self.assertFalse(self._eligible(activation=activation))
         with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
             self.assertTrue(self._eligible(enabled=False, activation=activation))
+            self.assertTrue(self._eligible(activation=_FakeCudaTensor((224, 1024))))
             self.assertFalse(self._eligible(activation=_FakeCudaTensor((192, 1024))))
 
     def test_other_forward_mode_is_ineligible(self):
@@ -273,6 +275,7 @@ class DedicatedQkv128PolicyTests(CustomTestCase):
             self.assertFalse(self._eligible(activation=activation))
         with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
             self.assertTrue(self._eligible(enabled=False, activation=activation))
+            self.assertTrue(self._eligible(activation=_FakeCudaTensor((224, 1024))))
             self.assertFalse(self._eligible(activation=_FakeCudaTensor((192, 1024))))
 
     def test_other_forward_mode_is_ineligible(self):
