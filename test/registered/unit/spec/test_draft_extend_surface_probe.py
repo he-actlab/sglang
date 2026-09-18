@@ -885,6 +885,37 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "server random seed"):
                 probe_module._validate_fixed52_runtime(runner, [32], 4)
 
+            self._check_colocation_plan_metadata(args, runner)
+
+    def _check_colocation_plan_metadata(self, args, runner):
+        args.random_seed = 20260902
+        args.enable_spec_sm_partition = False
+        args.enable_spec_pdmux = True
+        args.speculative_adaptive = False
+        args.disable_overlap_schedule = False
+        args.max_running_requests = 64
+        args.cuda_graph_config.decode.max_bs = 64
+        with (
+            envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("off"),
+            envs.SGLANG_DRAFT_EXTEND_NCU_RANGE.override(False),
+            envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_CACHE_MODE.override("natural"),
+        ):
+            identity, stream = probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
+            self.assertEqual(identity["placement"], "colocated-flashinfer-hint")
+            self.assertFalse(identity["serialized"])
+            self.assertEqual(identity["slots"], 2)
+            self.assertEqual(identity["concurrency"], 64)
+            self.assertEqual(stream, "small-stream")
+            for name, value in (("spec_pdmux_slots", 3), ("speculative_adaptive", True), ("disable_overlap_schedule", True)):
+                previous = getattr(args, name)
+                setattr(args, name, value)
+                with self.assertRaises(RuntimeError):
+                    probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
+                setattr(args, name, previous)
+            with envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("measure"):
+                with self.assertRaisesRegex(RuntimeError, "plan metadata only"):
+                    probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
+
 
 class AttentionSnapshotTests(CustomTestCase):
     def _capture(self, path):

@@ -1178,6 +1178,15 @@ def _validate_fixed52_runtime(
             model_runner, capture_bs, num_tokens_per_bs
         )
     flashinfer_hint = enable_partition and not enable_pdmux
+    from sglang.srt.speculative.spec_utils import spec_pdmux_concurrent_enabled
+
+    concurrent_hint = (
+        not enable_partition
+        and spec_pdmux_concurrent_enabled(args)
+        and int(args.spec_pdmux_slots) == 2
+        and not getattr(args, "disable_overlap_schedule", False)
+    )
+    retained_hint = flashinfer_hint or concurrent_hint
 
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.multiplex.pdmux_context import (
@@ -1193,6 +1202,15 @@ def _validate_fixed52_runtime(
     prefill_backend, decode_backend = args.get_attention_backends()
 
     checks = [
+        (
+            not concurrent_hint or (
+                envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.get() == "off"
+                and not envs.SGLANG_DRAFT_EXTEND_NCU_RANGE.get()
+                and envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_CACHE_MODE.get() == "natural"
+                and not os.environ.get("SGLANG_DRAFT_EXTEND_ATTENTION_SNAPSHOT_PATH")
+            ),
+            "concurrent serving permits plan metadata only, not surface measurement or replay diagnostics",
+        ),
         (bool(model_runner.is_draft_worker), "runner is not the draft worker"),
         (str(model_runner.device).startswith("cuda"), f"device={model_runner.device}"),
         (
@@ -1212,7 +1230,7 @@ def _validate_fixed52_runtime(
             f"draft model path={args.speculative_draft_model_path}",
         ),
         (
-            args.random_seed == (20260902 if flashinfer_hint else 20260803),
+            args.random_seed == (20260902 if retained_hint else 20260803),
             f"server random seed={args.random_seed}",
         ),
         (model_runner.spec_algorithm.is_standalone(), "algorithm is not STANDALONE"),
@@ -1229,7 +1247,7 @@ def _validate_fixed52_runtime(
         (requested_split == (132, 56), f"requested split={requested_split}"),
         (allocated_split == (136, 52), f"allocated split={allocated_split}"),
         (
-            bool(envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()) == (not flashinfer_hint),
+            bool(envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()) == (not retained_hint),
             "serialization differs from selected arm",
         ),
         (
@@ -1282,28 +1300,28 @@ def _validate_fixed52_runtime(
             "drafter TMA must remain off for the S2 denominator",
         ),
         (
-            not flashinfer_hint
+            not retained_hint
             or envs.SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED.get(),
             "SM120 draft kernels are off",
         ),
         (
-            not flashinfer_hint
+            not retained_hint
             or envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get(),
             "draft-extend GEMM integration is off",
         ),
         (
-            not flashinfer_hint
+            not retained_hint
             or not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD.get(),
             "full-device LM head is on",
         ),
         (
-            not flashinfer_hint
+            not retained_hint
             or not envs.SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP.get(),
             "full-device gate-up is on",
         ),
         (
             envs.SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH.get()
-            == (1 if flashinfer_hint else 2),
+            == (1 if retained_hint else 2),
             "FlashInfer prefill width mode differs from selected arm",
         ),
         (
@@ -1334,7 +1352,7 @@ def _validate_fixed52_runtime(
         )
 
     identity = {
-        "placement": "flashinfer-hint" if flashinfer_hint else "fixed52",
+        "placement": "colocated-flashinfer-hint" if concurrent_hint else ("flashinfer-hint" if flashinfer_hint else "fixed52"),
         "model_architecture": hf_config.architectures[0],
         "model_path": str(args.speculative_draft_model_path),
         "target_model_path": str(args.model_path),
@@ -1347,7 +1365,7 @@ def _validate_fixed52_runtime(
         "compute_capability": [12, 0],
         "requested_sm_split": list(requested_split),
         "allocated_sm_split": list(allocated_split),
-        "serialized": not flashinfer_hint,
+        "serialized": not retained_hint,
         "slots": None if flashinfer_hint else int(args.spec_pdmux_slots),
         "concurrency": int(args.max_running_requests),
         "speculative_num_steps": int(args.speculative_num_steps),
