@@ -41,7 +41,7 @@ def test_exact_shape_eager_and_graph(config, seed):
         drafter_sm120_bf16_qkv224(config, out, a, w, workspace)
     stream.synchronize()
     torch.testing.assert_close(out.float(), reference, rtol=0.02, atol=0.02)
-    if config in ("tail_masked", "tail_branch", "topology_s3", "l1_a"):
+    if config in ("tail_masked", "tail_branch", "topology_s3", "l1_a", "exact_m112"):
         control = torch.empty_like(out)
         with torch.cuda.stream(stream):
             drafter_sm120_bf16_qkv224("topology_s4", control, a, w, workspace)
@@ -73,3 +73,19 @@ def test_contract_rejects_invalid_inputs(config):
     backing = torch.empty(M * K + 1, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="16-byte aligned"):
         drafter_sm120_bf16_qkv224(config, out, backing[1:].view(M, K), w, workspace)
+
+
+def test_exact_m112_copy_and_output_ownership():
+    for vectors in (112 * 32 // 8, 64 * 32 // 8):
+        owned = [v for thread in range(224) for v in range(thread, vectors, 224)]
+        assert sorted(owned) == list(range(vectors))
+    outputs = []
+    for thread in range(224):
+        warp, lane = divmod(thread, 32)
+        for n in range(8):
+            for row_delta in (0, 8):
+                for col_delta in (0, 1):
+                    outputs.append((warp * 16 + lane // 4 + row_delta,
+                                    n * 8 + (lane % 4) * 2 + col_delta))
+    assert len(outputs) == len(set(outputs)) == 112 * 64
+    assert set(outputs) == {(row, col) for row in range(112) for col in range(64)}

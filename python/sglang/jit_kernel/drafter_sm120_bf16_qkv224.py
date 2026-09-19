@@ -6,7 +6,7 @@ from sglang.jit_kernel.drafter_sm120_bf16_qkv32 import _arch_env, _cuda_flags
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 M, K, N = 224, 1024, 4096
-CONFIGS = ("topology", "reuse_m128", "exact_m32", "topology_s4", "k64_s3", "tail_masked", "tail_branch", "topology_s3", "l1_a")
+CONFIGS = ("topology", "reuse_m128", "exact_m32", "topology_s4", "k64_s3", "tail_masked", "tail_branch", "topology_s3", "l1_a", "exact_m112")
 
 
 @cache_once

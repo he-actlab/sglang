@@ -2,6 +2,7 @@
 #pragma once
 
 #include "drafter_sm120_bf16_qkv32.cuh"
+#include "drafter_sm120_bf16_qkv224_exact.cuh"
 
 namespace sglang::drafter_sm120_bf16_qkv224_detail {
 
