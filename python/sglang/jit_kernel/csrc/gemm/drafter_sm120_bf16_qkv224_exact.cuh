@@ -8,20 +8,24 @@ namespace sglang::drafter_sm120_bf16_qkv224_exact_detail {
 using Element = cutlass::bfloat16_t;
 using HostGemm = drafter_sm120_bf16_qkv32_detail::AmpereQkv32Gemm<4, 32, 64, 64, 32, 32>;
 // Only the warp primitive is reused: a seven-warp CTA needs its own copy map.
-using WarpSource = drafter_sm120_bf16_qkv32_detail::AmpereQkv32Gemm<4, 32, 64, 64, 16, 64>;
-using WarpMma = typename WarpSource::GemmKernel::Mma::Operator;
-using LayoutA = typename WarpMma::LayoutA;
-using LayoutB = typename WarpMma::LayoutB;
-constexpr int kTileM = 112, kTileN = 64, kTileK = 32, kStages = 3, kThreads = 224;
+template <int WarpsN>
+using WarpSource = drafter_sm120_bf16_qkv32_detail::AmpereQkv32Gemm<4, 32, 64, 64, 16, 64 / WarpsN>;
+template <int WarpsN>
+using WarpMmaFor = typename WarpSource<WarpsN>::GemmKernel::Mma::Operator;
+using LayoutA = typename WarpMmaFor<1>::LayoutA;
+using LayoutB = typename WarpMmaFor<1>::LayoutB;
+constexpr int kTileM = 112, kTileN = 64, kTileK = 32, kStages = 3;
 constexpr int kAElements = kTileM * kTileK, kBElements = kTileN * kTileK;
 constexpr int kSharedBytes = kStages * (kAElements + kBElements) * sizeof(Element);
-static_assert(kSharedBytes == 33792 && WarpMma::FragmentC::kElements == 32);
+static_assert(kSharedBytes == 33792);
 
+template <int WarpsN>
 CUTLASS_DEVICE void copy_stage(Element* shared_a, Element* shared_b,
                                Element const* a, Element const* b, int tile_k) {
+  constexpr int kThreads = 224 * WarpsN;
   LayoutA layout_a(kTileK);
   LayoutB layout_b(kTileK);
-  // 448 A vectors: exactly two per thread, no padding or duplicate ownership.
+  // 448 A vectors: exactly two/one per thread at 224/448 threads.
   CUTLASS_PRAGMA_UNROLL
   for (int v = int(threadIdx.x); v < kAElements / 8; v += kThreads) {
     int row = v / 4, col = (v % 4) * 8;
@@ -29,7 +33,7 @@ CUTLASS_DEVICE void copy_stage(Element* shared_a, Element* shared_b,
         shared_a + layout_a({row, col}),
         a + (int(blockIdx.x) * kTileM + row) * 1024 + tile_k * kTileK + col);
   }
-  // 256 B vectors: warp0 owns a second vector; the other six warps own one.
+  // 256 B vectors: no padding or duplicate ownership at either thread count.
   CUTLASS_PRAGMA_UNROLL
   for (int v = int(threadIdx.x); v < kBElements / 8; v += kThreads) {
     int col = v / 4, row = (v % 4) * 8;
@@ -39,8 +43,12 @@ CUTLASS_DEVICE void copy_stage(Element* shared_a, Element* shared_b,
   }
 }
 
-__global__ __launch_bounds__(kThreads) void qkv224_exact_m112_kernel(
+template <int WarpsN>
+__global__ __launch_bounds__(224 * WarpsN) void qkv224_exact_m112_kernel(
     Element* output, Element const* activation, Element const* weight) {
+  static_assert(WarpsN == 1 || WarpsN == 2);
+  using WarpMma = WarpMmaFor<WarpsN>;
+  static_assert(WarpMma::FragmentC::kElements == 32 / WarpsN);
   extern __shared__ __align__(16) unsigned char shared_storage[];
   auto* shared_a = reinterpret_cast<Element*>(shared_storage);
   auto* shared_b = shared_a + kStages * kAElements;
@@ -51,7 +59,7 @@ __global__ __launch_bounds__(kThreads) void qkv224_exact_m112_kernel(
 
   CUTLASS_PRAGMA_UNROLL
   for (int stage = 0; stage < kStages - 1; ++stage) {
-    copy_stage(shared_a + stage * kAElements, shared_b + stage * kBElements,
+    copy_stage<WarpsN>(shared_a + stage * kAElements, shared_b + stage * kBElements,
                activation, weight, stage);
     cutlass::arch::cp_async_fence();
   }
@@ -62,7 +70,7 @@ __global__ __launch_bounds__(kThreads) void qkv224_exact_m112_kernel(
     // Also ensures all consumers finished the previous use of write_slot.
     __syncthreads();
     if (tile_k + kStages - 1 < 1024 / kTileK) {
-      copy_stage(shared_a + write_slot * kAElements, shared_b + write_slot * kBElements,
+      copy_stage<WarpsN>(shared_a + write_slot * kAElements, shared_b + write_slot * kBElements,
                  activation, weight, tile_k + kStages - 1);
     }
     // Commit even an empty drain stage, so wait_group keeps the same meaning.
@@ -72,7 +80,8 @@ __global__ __launch_bounds__(kThreads) void qkv224_exact_m112_kernel(
         {shared_a + read_slot * kAElements, LayoutA(kTileK)}, lane);
     typename WarpMma::IteratorB iter_b(
         {shared_b + read_slot * kBElements, LayoutB(kTileK)}, lane);
-    iter_a.add_tile_offset({warp, 0});
+    iter_a.add_tile_offset({warp / WarpsN, 0});
+    iter_b.add_tile_offset({0, warp % WarpsN});
     typename WarpMma::FragmentA frag_a[2];
     typename WarpMma::FragmentB frag_b[2];
     typename WarpMma::TransformedFragmentA operand_a[2];
@@ -98,10 +107,11 @@ __global__ __launch_bounds__(kThreads) void qkv224_exact_m112_kernel(
 
   // m16n8k16 FP32 accumulator mapping, with one M instruction per warp.
   // Every row and column is valid for exact M224/N4096: no padded epilogue.
-  int row = int(blockIdx.x) * kTileM + warp * 16 + lane / 4;
+  int row = int(blockIdx.x) * kTileM + (warp / WarpsN) * 16 + lane / 4;
   CUTLASS_PRAGMA_UNROLL
-  for (int n = 0; n < 8; ++n) {
-    int col = int(blockIdx.y) * kTileN + n * 8 + (lane % 4) * 2;
+  for (int n = 0; n < 8 / WarpsN; ++n) {
+    int col = int(blockIdx.y) * kTileN + (warp % WarpsN) * (64 / WarpsN) +
+              n * 8 + (lane % 4) * 2;
     cutlass::Array<Element, 2> pair0, pair1;
     pair0[0] = Element(accum[n * 4]);
     pair0[1] = Element(accum[n * 4 + 1]);
@@ -114,6 +124,7 @@ __global__ __launch_bounds__(kThreads) void qkv224_exact_m112_kernel(
 
 // Adapter for the existing host contract: preserve tensor/device/stride and
 // alignment validation, current-stream resolution, and zero-workspace API.
+template <int WarpsN>
 struct ExactM112Gemm {
   using Arguments = typename HostGemm::Arguments;
   Arguments args;
@@ -126,7 +137,7 @@ struct ExactM112Gemm {
     return cutlass::Status::kSuccess;
   }
   cutlass::Status run(cudaStream_t stream) {
-    qkv224_exact_m112_kernel<<<dim3(2, 64), kThreads, kSharedBytes, stream>>>(
+    qkv224_exact_m112_kernel<WarpsN><<<dim3(2, 64), 224 * WarpsN, kSharedBytes, stream>>>(
         static_cast<Element*>(args.ptr_D), static_cast<Element const*>(args.ptr_A),
         static_cast<Element const*>(args.ptr_B));
     return cudaGetLastError() == cudaSuccess ? cutlass::Status::kSuccess
@@ -140,6 +151,14 @@ inline void drafter_sm120_bf16_qkv224_exact_m112(
     tvm::ffi::TensorView output, tvm::ffi::TensorView activation,
     tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {
   drafter_qkv32_ampere_schedule<4, 32, 64, 64, 32, 32, 224,
-      sglang::drafter_sm120_bf16_qkv224_exact_detail::ExactM112Gemm>(
+      sglang::drafter_sm120_bf16_qkv224_exact_detail::ExactM112Gemm<1>>(
+          output, activation, weight, workspace);
+}
+
+inline void drafter_sm120_bf16_qkv224_exact_m112_w14(
+    tvm::ffi::TensorView output, tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {
+  drafter_qkv32_ampere_schedule<4, 32, 64, 64, 32, 32, 224,
+      sglang::drafter_sm120_bf16_qkv224_exact_detail::ExactM112Gemm<2>>(
           output, activation, weight, workspace);
 }
