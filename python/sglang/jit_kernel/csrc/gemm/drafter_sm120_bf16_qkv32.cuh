@@ -183,7 +183,7 @@ using N32S3Family = KernelFamily<32, 3>;
 // co-resident per SM) on the classic sm80 cp.async multistage pipeline -
 // the shape-class of the full-chip 1073-GB/s winner (row 60), brought to
 // the partition on the modern s16816 path instead of the library's WMMA.
-template <int Stages, int TileK = 32>
+template <int Stages, int TileK = 32, int TileM = 32, int TileN = 32, int WarpM = 32, int WarpN = 32>
 using AmpereQkv32Gemm = cutlass::gemm::device::GemmUniversal<
     ElementA, cutlass::layout::RowMajor,
     ElementB, cutlass::layout::ColumnMajor,
@@ -191,8 +191,8 @@ using AmpereQkv32Gemm = cutlass::gemm::device::GemmUniversal<
     ElementAccumulator,
     cutlass::arch::OpClassTensorOp,
     cutlass::arch::Sm80,
-    cutlass::gemm::GemmShape<32, 32, TileK>,
-    cutlass::gemm::GemmShape<32, 32, TileK>,
+    cutlass::gemm::GemmShape<TileM, TileN, TileK>,
+    cutlass::gemm::GemmShape<WarpM, WarpN, TileK>,
     cutlass::gemm::GemmShape<16, 8, 16>,
     cutlass::epilogue::thread::LinearCombination<
         ElementD, 8, ElementAccumulator, ElementCompute>,
@@ -371,20 +371,29 @@ SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s6, 16, 6)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s8, 16, 8)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n32_s3, 32, 3)
 
-template <int Stages, int TileK = 32>
+template <int Stages, int TileK = 32, int TileM = 32, int TileN = 32,
+          int WarpM = 32, int WarpN = 32, int Rows = 32>
 inline void drafter_qkv32_ampere_schedule(tvm::ffi::TensorView output,
                                           tvm::ffi::TensorView activation,
                                           tvm::ffi::TensorView weight,
                                           tvm::ffi::TensorView workspace) {
   using namespace host;
   using namespace sglang::drafter_sm120_bf16_qkv32_detail;
-  using Gemm = AmpereQkv32Gemm<Stages, TileK>;
+  static_assert(Rows == 32 || Rows == 224);
+  constexpr int kM = Rows;
+  using Gemm = AmpereQkv32Gemm<Stages, TileK, TileM, TileN, WarpM, WarpN>;
   SymbolicDevice device;
   SymbolicSize workspace_bytes{"workspace bytes"};
-  TensorMatcher({kM, kK}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(activation);
-  TensorMatcher({kN, kK}).with_dtype<bf16_t>().with_device(device).verify(weight);
-  TensorMatcher({kM, kN}).with_dtype<bf16_t>().with_device(device).verify(output);
-  TensorMatcher({workspace_bytes}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  TensorMatcher({kM, kK}).with_strides({kK, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(activation);
+  TensorMatcher({kN, kK}).with_strides({kK, 1}).with_dtype<bf16_t>().with_device(device).verify(weight);
+  TensorMatcher({kM, kN}).with_strides({kN, 1}).with_dtype<bf16_t>().with_device(device).verify(output);
+  TensorMatcher({workspace_bytes}).with_strides({1}).with_dtype<uint8_t>().with_device(device).verify(workspace);
+  RuntimeCheck(reinterpret_cast<uintptr_t>(activation.data_ptr()) % 16 == 0,
+               "qkv activation must be 16-byte aligned");
+  RuntimeCheck(reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0,
+               "qkv weight must be 16-byte aligned");
+  RuntimeCheck(reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0,
+               "qkv output must be 16-byte aligned");
   const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
