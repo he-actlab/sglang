@@ -111,6 +111,19 @@ struct Qkv224TailBranchKernel : cutlass::gemm::kernel::GemmUniversal<
     BranchMma, typename OriginalKernel::Epilogue, typename Unmasked::ThreadblockSwizzle> {};
 using BranchGemm = cutlass::gemm::device::GemmUniversalBase<Qkv224TailBranchKernel>;
 
+static_assert(OriginalMma::kCacheOpA == cutlass::arch::CacheOperation::Global &&
+              OriginalMma::kCacheOpB == cutlass::arch::CacheOperation::Global);
+// Reuse activations through L1 without allocating streamed weights there.
+using CacheAMma = cutlass::gemm::threadblock::MmaMultistage<
+    typename OriginalMma::Shape, typename OriginalMma::IteratorA,
+    typename OriginalMma::SmemIteratorA, cutlass::arch::CacheOperation::Always,
+    typename OriginalMma::IteratorB, typename OriginalMma::SmemIteratorB,
+    OriginalMma::kCacheOpB, typename OriginalMma::ElementC,
+    typename OriginalMma::LayoutC, typename OriginalMma::Policy, 4>;
+struct Qkv224CacheAKernel : cutlass::gemm::kernel::GemmUniversal<
+    CacheAMma, typename OriginalKernel::Epilogue, typename Unmasked::ThreadblockSwizzle> {};
+using CacheAGemm = cutlass::gemm::device::GemmUniversalBase<Qkv224CacheAKernel>;
+
 }  // namespace sglang::drafter_sm120_bf16_qkv224_detail
 
 // Retain the existing cp.async/MMA/epilogue/launch implementation. These
@@ -163,4 +176,11 @@ inline void drafter_sm120_bf16_qkv224_tail_branch(
     tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {
   drafter_qkv32_ampere_schedule<4, 32, 64, 64, 32, 32, 224,
       sglang::drafter_sm120_bf16_qkv224_detail::BranchGemm>(output, activation, weight, workspace);
+}
+
+inline void drafter_sm120_bf16_qkv224_l1_a(
+    tvm::ffi::TensorView output, tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {
+  drafter_qkv32_ampere_schedule<4, 32, 64, 64, 32, 32, 224,
+      sglang::drafter_sm120_bf16_qkv224_detail::CacheAGemm>(output, activation, weight, workspace);
 }
