@@ -41,6 +41,12 @@ def test_exact_shape_eager_and_graph(config, seed):
         drafter_sm120_bf16_qkv224(config, out, a, w, workspace)
     stream.synchronize()
     torch.testing.assert_close(out.float(), reference, rtol=0.02, atol=0.02)
+    if config == "tail_masked":
+        control = torch.empty_like(out)
+        with torch.cuda.stream(stream):
+            drafter_sm120_bf16_qkv224("topology_s4", control, a, w, workspace)
+        stream.synchronize()
+        assert torch.equal(out, control)
     expected = out.clone()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

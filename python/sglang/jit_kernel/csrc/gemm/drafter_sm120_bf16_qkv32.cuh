@@ -372,7 +372,9 @@ SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n16_s8, 16, 8)
 SGLANG_DRAFTER_QKV32_DEFINE_WRAPPER(drafter_sm120_bf16_qkv32_n32_s3, 32, 3)
 
 template <int Stages, int TileK = 32, int TileM = 32, int TileN = 32,
-          int WarpM = 32, int WarpN = 32, int Rows = 32>
+          int WarpM = 32, int WarpN = 32, int Rows = 32,
+          typename GemmOverride = sglang::drafter_sm120_bf16_qkv32_detail::
+              AmpereQkv32Gemm<Stages, TileK, TileM, TileN, WarpM, WarpN>>
 inline void drafter_qkv32_ampere_schedule(tvm::ffi::TensorView output,
                                           tvm::ffi::TensorView activation,
                                           tvm::ffi::TensorView weight,
@@ -381,7 +383,7 @@ inline void drafter_qkv32_ampere_schedule(tvm::ffi::TensorView output,
   using namespace sglang::drafter_sm120_bf16_qkv32_detail;
   static_assert(Rows == 32 || Rows == 224);
   constexpr int kM = Rows;
-  using Gemm = AmpereQkv32Gemm<Stages, TileK, TileM, TileN, WarpM, WarpN>;
+  using Gemm = GemmOverride;
   SymbolicDevice device;
   SymbolicSize workspace_bytes{"workspace bytes"};
   TensorMatcher({kM, kK}).with_strides({kK, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(activation);
