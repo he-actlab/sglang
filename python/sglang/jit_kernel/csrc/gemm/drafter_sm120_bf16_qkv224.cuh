@@ -139,6 +139,12 @@ inline void drafter_sm120_bf16_qkv224_topology_s4(
   drafter_qkv32_ampere_schedule<4, 32, 64, 64, 32, 32, 224>(output, activation, weight, workspace);
 }
 
+inline void drafter_sm120_bf16_qkv224_topology_s3(
+    tvm::ffi::TensorView output, tvm::ffi::TensorView activation,
+    tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {
+  drafter_qkv32_ampere_schedule<3, 32, 64, 64, 32, 32, 224>(output, activation, weight, workspace);
+}
+
 inline void drafter_sm120_bf16_qkv224_k64_s3(
     tvm::ffi::TensorView output, tvm::ffi::TensorView activation,
     tvm::ffi::TensorView weight, tvm::ffi::TensorView workspace) {
