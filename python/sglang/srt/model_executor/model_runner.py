@@ -1150,8 +1150,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "TP1 Qwen3-0.6B family"
             )
         logger.info(
-            "Qwen3 draft-extend five-GEMM integration enabled: qkv128 dedicated "
-            "stream, fused out128/down128 boundaries, full-device gate-up128, "
+            "Qwen3 draft-extend five-GEMM integration enabled: per-operator QKV "
+            "placement, fused out128/down128 boundaries, full-device gate-up128, "
             "and full-device LM head. Active M=%d.",
             32 * self.server_args.speculative_num_draft_tokens,
         )
