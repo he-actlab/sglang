@@ -236,6 +236,7 @@ class DedicatedQkv128PolicyTests(CustomTestCase):
         linear=None,
         forward_batch=None,
         supports_linear=True,
+        placement="auto",
     ):
         with (
             patch.dict(
@@ -243,7 +244,8 @@ class DedicatedQkv128PolicyTests(CustomTestCase):
                 {
                     "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM": (
                         "1" if enabled else "0"
-                    )
+                    ),
+                    "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT": placement,
                 },
                 clear=False,
             ),
@@ -291,6 +293,61 @@ class DedicatedQkv128PolicyTests(CustomTestCase):
             self._eligible(linear=SimpleNamespace(weight=_FakeCudaTensor((6144, 1024))))
         )
         self.assertFalse(self._eligible(supports_linear=False))
+
+    def test_integrated_k6_placement_override_is_qkv_only(self):
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
+            for placement, expected in (("auto", True), ("full", True), ("small", False)):
+                with self.subTest(placement=placement):
+                    self.assertEqual(
+                        self._eligible(
+                            enabled=False, activation=_FakeCudaTensor((224, 1024)),
+                            placement=placement,
+                        ),
+                        expected,
+                    )
+                    self.assertTrue(envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get())
+
+    def test_full_override_does_not_bypass_k6_integration_requirement(self):
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(False):
+            self.assertFalse(self._eligible(
+                activation=_FakeCudaTensor((224, 1024)), placement="full",
+            ))
+            self.assertTrue(self._eligible(enabled=False, placement="full"))
+
+    def test_explicit_placement_retains_shape_and_phase_gates(self):
+        with envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True):
+            for placement in ("small", "full"):
+                with self.subTest(placement=placement), patch.object(qwen3.logger, "info") as log:
+                    self.assertFalse(self._eligible(
+                        activation=_FakeCudaTensor((192, 1024)), placement=placement,
+                    ))
+                    self.assertFalse(self._eligible(
+                        forward_batch=SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                        placement=placement,
+                    ))
+                    self.assertFalse(self._eligible(
+                        linear=SimpleNamespace(weight=_FakeCudaTensor((6144, 1024))),
+                        placement=placement,
+                    ))
+                    log.assert_not_called()
+
+    def test_small_override_emits_exact_activation_log(self):
+        with (
+            envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.override(True),
+            patch.object(qwen3, "_logged_small_draft_extend_qkv128", False),
+            patch.object(qwen3.logger, "info") as log,
+        ):
+            self.assertFalse(self._eligible(
+                activation=_FakeCudaTensor((224, 1024)), placement="small",
+            ))
+        log.assert_called_once_with(
+            "Qwen3 drafter SMALL qkv128 placement armed: exact "
+            "DRAFT_EXTEND_V2 M=%d K=1024 N=4096 BF16 TP1 path", 224,
+        )
+
+    def test_invalid_placement_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "must be auto, small, or full"):
+            self._eligible(placement="typo")
 
 
 class FullDeviceGateUpCallSiteTests(CustomTestCase):
@@ -352,6 +409,32 @@ class FullDeviceGateUpCallSiteTests(CustomTestCase):
 
 
 class DedicatedQkv128CallSiteTests(CustomTestCase):
+    def test_small_path_keeps_partition_dispatch_without_stream_handoff(self):
+        q, k, v = object(), object(), object()
+        hidden_states = object()
+        output = SimpleNamespace(split=lambda sizes, dim: (q, k, v))
+        attention = SimpleNamespace(
+            _drafter_projection_dispatch=object(), qkv_proj=object(),
+            q_size=2, kv_size=1, q_norm=object(), k_norm=object(),
+            head_dim=128, alt_stream=None,
+            rotary_emb=lambda positions, q_value, k_value: (q_value, k_value),
+        )
+        with (
+            patch.object(qwen3, "_use_dedicated_draft_extend_qkv128", return_value=False),
+            patch.object(qwen3, "_qwen3_drafter_projection_or_linear", return_value=(output, None)) as projection,
+            patch.object(qwen3, "apply_qk_norm", return_value=(q, k)),
+            patch.object(qwen3.torch.cuda, "current_stream", side_effect=AssertionError("no stream handoff expected")),
+        ):
+            result = qwen3.Qwen3Attention.forward_prepare_native(
+                attention, positions=object(), hidden_states=hidden_states,
+                forward_batch=object(),
+            )
+
+        self.assertEqual(result, (q, k, v))
+        projection.assert_called_once_with(
+            attention._drafter_projection_dispatch, attention.qkv_proj, hidden_states,
+        )
+
     def test_qkv128_path_bypasses_partition_tactic_and_records_lifetimes(self):
         calls = []
         source_stream = object()
@@ -455,7 +538,6 @@ class FullDeviceOperatorRegionTests(CustomTestCase):
         self.large = _FakeStream("large", self.calls)
         self.small = _FakeStream("small", self.calls)
         self.full = _FakeStream("full", self.calls)
-        self.qkv128 = _FakeStream("qkv128", self.calls)
 
     @contextmanager
     def _stream_context(self, stream):
@@ -501,10 +583,12 @@ class FullDeviceOperatorRegionTests(CustomTestCase):
             "current_stream",
             side_effect=AssertionError("CUDA must not be queried"),
         ):
-            with pdmux_context.spec_pdmux_full_device_operator_region(
-                False, source_partition="small"
-            ) as stream:
-                self.assertIsNone(stream)
+            for region in (
+                pdmux_context.spec_pdmux_full_device_operator_region,
+                pdmux_context.spec_pdmux_qkv128_operator_region,
+            ):
+                with region(False, source_partition="small") as stream:
+                    self.assertIsNone(stream)
 
     def test_small_full_small_event_chain_and_hint_restore(self):
         patches = self._patches(self.small)
@@ -530,12 +614,15 @@ class FullDeviceOperatorRegionTests(CustomTestCase):
             ],
         )
 
-    def test_small_qkv128_small_event_chain_and_hint_restore(self):
+    def test_qkv_compatibility_getter_returns_shared_stream(self):
+        with patch.object(pdmux_context, "SPEC_PREFILL_STREAM", self.full):
+            self.assertIs(pdmux_context.get_spec_qkv128_stream(), self.full)
+
+    def test_qkv_reuses_small_full_small_event_chain_and_hint_restore(self):
         patches = self._patches(self.small)
         with (
             patches[0],
             patches[1],
-            patch.object(pdmux_context, "SPEC_QKV128_STREAM", self.qkv128),
             patches[2],
             patches[3],
             patches[4],
@@ -544,20 +631,20 @@ class FullDeviceOperatorRegionTests(CustomTestCase):
             with pdmux_context.spec_pdmux_qkv128_operator_region(
                 True, source_partition="small"
             ) as stream:
-                self.assertIs(stream, self.qkv128)
+                self.assertIs(stream, self.full)
                 self.calls.append(("operator", stream.name))
 
         self.assertEqual(
             self.calls,
             [
                 ("record", 0, self.small),
-                ("wait", "qkv128", 0),
-                ("stream-enter", "qkv128"),
+                ("wait", "full", 0),
+                ("stream-enter", "full"),
                 ("hint-enter", 0),
-                ("operator", "qkv128"),
+                ("operator", "full"),
                 ("hint-exit", 0),
-                ("record", 1, self.qkv128),
-                ("stream-exit", "qkv128"),
+                ("record", 1, self.full),
+                ("stream-exit", "full"),
                 ("wait", "small", 1),
             ],
         )

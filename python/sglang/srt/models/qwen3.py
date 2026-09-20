@@ -67,6 +67,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _has_fused_qk_norm_mrope = False
 _logged_full_device_draft_extend_gate_up = False
 _logged_dedicated_draft_extend_qkv128 = False
+_logged_small_draft_extend_qkv128 = False
 
 _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_INPUT_SHAPE = (128, 1024)
 _FULL_DEVICE_DRAFT_EXTEND_GATE_UP_WEIGHT_SHAPE = (6144, 1024)
@@ -878,10 +879,18 @@ def _use_dedicated_draft_extend_qkv128(
     linear: nn.Module,
     forward_batch: Optional[ForwardBatch],
 ) -> bool:
-    """Fail-closed policy for the exact M=128 drafter QKV projection."""
+    """Fail-closed QKV policy for the shared full-device placement stream."""
     global _logged_dedicated_draft_extend_qkv128
+    global _logged_small_draft_extend_qkv128
+    placement = envs.SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT.get()
+    if placement not in ("auto", "small", "full"):
+        raise ValueError(
+            "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT must be "
+            f"auto, small, or full; got {placement!r}"
+        )
     if not (
-        envs.SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM.get()
+        placement != "auto"
+        or envs.SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM.get()
         or envs.SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION.get()
     ):
         return False
@@ -900,9 +909,18 @@ def _use_dedicated_draft_extend_qkv128(
     if not _Qwen3DrafterSM120KernelDispatch.supports_linear(linear):
         return False
     eligible = tuple(linear.weight.shape) == _DEDICATED_DRAFT_EXTEND_QKV128_WEIGHT_SHAPE
+    if eligible and placement == "small":
+        if not _logged_small_draft_extend_qkv128:
+            logger.info(
+                "Qwen3 drafter SMALL qkv128 placement armed: exact "
+                "DRAFT_EXTEND_V2 M=%d K=1024 N=4096 BF16 TP1 path",
+                activation.shape[0],
+            )
+            _logged_small_draft_extend_qkv128 = True
+        return False
     if eligible and not _logged_dedicated_draft_extend_qkv128:
         logger.info(
-            "Qwen3 drafter dedicated qkv128 stream armed: exact "
+            "Qwen3 drafter shared full-device qkv128 stream armed: exact "
             "DRAFT_EXTEND_V2 M=%d K=1024 N=4096 BF16 TP1 path",
             activation.shape[0],
         )

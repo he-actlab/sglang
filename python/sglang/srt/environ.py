@@ -749,7 +749,7 @@ class Envs:
     # Experimental and default-off.
     SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED = EnvBool(False)
     # Exact Qwen3-0.6B TP1 BF16 M=128 draft-extend five-GEMM evaluation:
-    # dedicated qkv128 stream, fused out128/down128 residual-norm boundaries,
+    # shared full-device QKV, fused out128/down128 residual-norm boundaries,
     # full-device gate-up128, and full-device LM head. Requires the retained
     # sequential 136,52 SM120 draft stack and is default-off.
     SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION = EnvBool(False)
@@ -861,10 +861,14 @@ class Envs:
     # target 0 can select a full-device schedule. Experimental and default-off.
     SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP = EnvBool(False)
     # Route only the exact Qwen3-0.6B TP1 BF16 M=128 draft-extend QKV
-    # projection through a dedicated plain CUDA stream. The 52-SM draft
-    # partition remains the source/destination; the stock 128-CTA QKV grid
-    # bounds effective occupancy on this fourth stream. Experimental/off.
+    # projection through the existing shared full-device stream, also used by
+    # gate-up and LM head. The 52-SM draft partition remains source/destination;
+    # the legacy flag name does not create a fourth stream. Experimental/off.
     SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM = EnvBool(False)
+    # Exact-shape QKV placement override: auto preserves the flag/integration
+    # policy; small keeps the partition dispatch; full uses the shared stream.
+    # M160/M224 still require the integrated stack. No kernel override.
+    SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT = EnvStr("auto")
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

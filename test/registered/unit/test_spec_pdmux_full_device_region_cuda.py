@@ -16,11 +16,11 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 class FullDeviceOperatorRegionCudaTests(CustomTestCase):
     def test_two_draft_graphs_reuse_workspace_with_verifier_in_flight(self):
         # Both request slots use one SMALL FIFO; the verifier has its own
-        # stream/storage. Each wider region must rejoin before workspace reuse.
+        # stream/storage. QKV and the other full-device operators share the
+        # third placement stream and rejoin before workspace reuse.
         source = torch.cuda.Stream()
         large = torch.cuda.Stream()
         full = torch.cuda.Stream()
-        qkv = torch.cuda.Stream()
         workspace = torch.empty((128, 128), device="cuda")
         inputs = [torch.full_like(workspace, n) for n in (1, 2)]
         outputs = [torch.empty_like(workspace) for _ in inputs]
@@ -30,7 +30,6 @@ class FullDeviceOperatorRegionCudaTests(CustomTestCase):
         with (
             patch.object(pdmux_context, "SPEC_STREAM_PAIR", (large, source)),
             patch.object(pdmux_context, "SPEC_PREFILL_STREAM", full),
-            patch.object(pdmux_context, "SPEC_QKV128_STREAM", qkv),
         ):
             for inp, out in zip(inputs, outputs):
                 graph = torch.cuda.CUDAGraph()
@@ -38,11 +37,13 @@ class FullDeviceOperatorRegionCudaTests(CustomTestCase):
                     workspace.copy_(inp)
                     with pdmux_context.spec_pdmux_qkv128_operator_region(
                         True, source_partition="small"
-                    ):
+                    ) as qkv_stream:
+                        self.assertIs(qkv_stream, full)
                         workspace.add_(1)
                     with pdmux_context.spec_pdmux_full_device_operator_region(
                         True, source_partition="small"
-                    ):
+                    ) as full_stream:
+                        self.assertIs(full_stream, qkv_stream)
                         workspace.mul_(3)
                     out.copy_(workspace)
                 graphs.append(graph)
