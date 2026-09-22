@@ -1272,7 +1272,12 @@ def _validate_fixed52_runtime(
             int(args.max_running_requests) == (32 if flashinfer_hint else 64),
             f"max_running_requests={args.max_running_requests}",
         ),
-        (not bool(args.disable_radix_cache), "radix cache is disabled"),
+        # Concurrent serving is restricted to passive plan metadata above;
+        # active and sequential diagnostics retain their radix-on contract.
+        (
+            concurrent_hint or not bool(args.disable_radix_cache),
+            "radix cache is disabled",
+        ),
         (
             int(args.speculative_num_steps) in (3, 4, 6),
             f"speculative_num_steps={args.speculative_num_steps}",
@@ -1380,6 +1385,7 @@ def _validate_fixed52_runtime(
         "requested_sm_split": list(requested_split),
         "allocated_sm_split": list(allocated_split),
         "serialized": not retained_hint,
+        "disable_radix_cache": bool(args.disable_radix_cache),
         "slots": None if flashinfer_hint else int(args.spec_pdmux_slots),
         "concurrency": int(args.max_running_requests),
         "speculative_num_steps": int(args.speculative_num_steps),
