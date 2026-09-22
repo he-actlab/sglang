@@ -4769,6 +4769,33 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        if self.device == "cuda" and torch.cuda.is_initialized():
+            # Process/device-wide allocator counters include both models and
+            # allocator-managed graph pools. Peaks are lifetime values unless
+            # another caller resets them; this endpoint never resets, flushes,
+            # or synchronizes. External CUDA allocations are NOT included.
+            # Some cudaMallocAsync statistics are not meaningful; expose the
+            # backend indicator rather than silently treating them as native.
+            allocator_stats = torch.cuda.memory_stats(self.ps.gpu_id)
+            ret["memory_usage"]["cuda_allocator"] = {
+                "pid": os.getpid(),
+                "device_id": int(self.ps.gpu_id),
+                "native_allocator": int(torch.cuda.get_allocator_backend() == "native"),
+                **{
+                    name: int(allocator_stats[name])
+                    for name in (
+                        "allocated_bytes.all.current",
+                        "allocated_bytes.all.peak",
+                        "reserved_bytes.all.current",
+                        "reserved_bytes.all.peak",
+                        "active_bytes.all.current",
+                        "active_bytes.all.peak",
+                        "num_alloc_retries",
+                        "num_ooms",
+                    )
+                    if name in allocator_stats
+                },
+            }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if (
