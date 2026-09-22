@@ -151,13 +151,14 @@ def test_all_accepted_prefixes_match_dense_bitwise(lengths):
 
 
 @CUDA
-@pytest.mark.parametrize("hv", [32, 48])
-def test_b3_model_head_shapes_at_batch32(hv):
-    state, inputs, dense, compact = _case([7] * 32, layers=1, hv=hv, h=16)
+@pytest.mark.parametrize("hv,steps", [(32, 7), (48, 7), (32, 5)])
+def test_model_head_shapes_at_batch32(hv, steps):
+    # B3 target/draft D7 and the B4 target's native D5 verifier width.
+    state, inputs, dense, compact = _case([steps] * 32, layers=1, hv=hv, h=16)
     control = _forward(state, inputs, dense=dense)
     candidate = _forward(state, inputs, compact=compact)
     assert _bitwise_equal(control, candidate)
-    accepted = torch.arange(32, dtype=torch.int32, device="cuda") % 7
+    accepted = torch.arange(32, dtype=torch.int32, device="cuda") % steps
     expected = _expected(
         state,
         dense,
