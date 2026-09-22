@@ -136,9 +136,29 @@ class ModelRunnerKVCacheMixin:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        compact_spec = getattr(server_args, "enable_gdn_compact_spec_state", False)
+        if compact_spec and self.hybrid_gdn_config is None:
+            raise ValueError(
+                "Compact speculative state is only implemented for GDN models"
+            )
+        intermediate_per_req = 0
+        # Legacy accounting is preserved unless compact rollback is selected.
+        # The compact layout charges the actual factors + deduplicated conv
+        # windows, including the padding slot. It does not relax admission.
+        dummy_slots = int(compact_spec)
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
+            intermediate_per_req = (
+                config.mamba2_cache_params.gdn_compact_spec_state_bytes(
+                    server_args.speculative_num_draft_tokens
+                )
+                if compact_spec
+                else config.mamba2_cache_params.mamba_cache_per_req
+                * server_args.speculative_num_draft_tokens
+            )
+        elif compact_spec:
+            raise ValueError("Compact speculative state requires speculative decoding")
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -153,11 +173,7 @@ class ModelRunnerKVCacheMixin:
                     // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
-                    * server_args.speculative_num_draft_tokens
-                )
+                intermediate_size = intermediate_per_req * (capped_reqs + dummy_slots)
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
             server_args.disable_radix_cache
@@ -169,10 +185,8 @@ class ModelRunnerKVCacheMixin:
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
+                intermediate_size = intermediate_per_req * (
+                    server_args.max_mamba_cache_size + dummy_slots
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -194,11 +208,19 @@ class ModelRunnerKVCacheMixin:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
-                )
+                if compact_spec:
+                    server_args.max_mamba_cache_size = int(
+                        (mamba_budget_bytes - per_req - intermediate_per_req)
+                        // (per_req + intermediate_per_req / ratio)
+                    )
+                else:
+                    # Retain the original floating-point/floor order for the
+                    # dense baseline, including adaptive legacy behavior.
+                    D = server_args.speculative_num_draft_tokens
+                    server_args.max_mamba_cache_size = int(
+                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
@@ -206,7 +228,7 @@ class ModelRunnerKVCacheMixin:
                     // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = intermediate_per_req * (capped_reqs + dummy_slots)
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
@@ -228,7 +250,7 @@ class ModelRunnerKVCacheMixin:
             )
 
         mamba_state_memory = (
-            server_args.max_mamba_cache_size
+            (server_args.max_mamba_cache_size + dummy_slots)
             * config.mamba2_cache_params.mamba_cache_per_req
             / (1 << 30)
         )
@@ -414,6 +436,9 @@ class ModelRunnerKVCacheMixin:
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,
+                    enable_gdn_compact_spec_state=getattr(
+                        self.server_args, "enable_gdn_compact_spec_state", False
+                    ),
                     linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
                     mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
                 )

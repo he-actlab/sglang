@@ -1176,14 +1176,34 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Use fully fused kernel that handles masking internally
-        # This avoids separate nonzero() and index_select() calls
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        if mamba_caches.compact_ssm_k is not None:
+            from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+                fused_gdn_compact_state_commit,
+            )
+
+            # Both destinations must be reconstructed from the SAME immutable
+            # pre-verify prefix. A second call after committing the active state
+            # would replay the prefix twice when writing the radix checkpoint.
+            fused_gdn_compact_state_commit(
+                ssm_states,
+                mamba_caches.compact_ssm_k,
+                mamba_caches.compact_ssm_d,
+                mamba_caches.compact_ssm_alpha,
+                state_indices_tensor,
+                last_correct_step_indices,
+                intermediate_state_indices=self.linear_attn_backend.verify_intermediate_state_indices[
+                    :request_number
+                ],
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
+        else:
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
         # conv intermediate uses the deduplicated sliding-window (overlapping)
         # layout, so it needs the strided-read scatter variant.
         fused_conv_window_scatter_with_mask(
@@ -1197,12 +1217,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
             # Use fully fused kernel for track scatter operations
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
+            if mamba_caches.compact_ssm_k is None:
+                fused_mamba_state_scatter_with_mask(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
             fused_conv_window_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,

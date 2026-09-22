@@ -124,6 +124,27 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    def gdn_compact_spec_state_bytes(self, num_draft_tokens: int) -> int:
+        """Physical rollback scratch per request, excluding the padding slot.
+
+        Scalar GDN records the native FP32 normalized key, corrected delta and
+        decay instead of a full state matrix after each token. Conv rollback
+        retains the existing overlapping-window layout for a linear chain.
+        """
+        if self.is_kda or self.dtype.temporal != torch.float32:
+            raise ValueError(
+                "Compact GDN rollback requires scalar gates and FP32 state"
+            )
+        if num_draft_tokens < 1:
+            raise ValueError("Compact GDN rollback requires at least one draft token")
+        hv, v_dim, k_dim = self.shape.temporal
+        factors = num_draft_tokens * hv * (k_dim + v_dim + 1) * 4
+        conv = sum(
+            dim * (num_draft_tokens + win - 1) * self.dtype.conv.itemsize
+            for dim, win in self.shape.conv
+        )
+        return len(self.layers) * (factors + conv)
+
     @property
     def is_kda(self) -> bool:
         """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
