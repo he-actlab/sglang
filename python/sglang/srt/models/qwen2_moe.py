@@ -93,6 +93,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.multiplex.pdmux_context import get_spec_pdmux_auxiliary_stream
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -493,7 +494,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_fused_gate: bool = False,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
+        alt_stream = get_spec_pdmux_auxiliary_stream(self.alt_stream)
+        alt_stream.wait_stream(current_stream)
         shared_output = (
             self._forward_shared_experts(
                 hidden_states.clone(), apply_gate=not use_fused_gate
@@ -518,10 +520,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 staged = True
         # ===== END TO BE REFACTORED ====
 
-        with torch.cuda.stream(self.alt_stream):
+        with torch.cuda.stream(alt_stream):
             router_output = self._forward_router_experts(hidden_states)
 
-        current_stream.wait_stream(self.alt_stream)
+        current_stream.wait_stream(alt_stream)
 
         if staged and unstage_shared_expert_add() is None:
             # The dispatch consumed the staging (add already enqueued); skip the caller's add.

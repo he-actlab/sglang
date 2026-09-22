@@ -31,6 +31,146 @@ SPEC_SM_ALLOCATED_SPLIT: Optional[Tuple[int, int]] = None
 # must fence their source partition around each use.
 SPEC_PREFILL_STREAM: Optional[torch.cuda.Stream] = None
 
+# The spatial factory keeps both leaf green contexts alive for the process.
+# Siblings borrow them (no reconstruction/repartitioning). Retain source and
+# ExternalStreams for that same lifetime; ExternalStream does not own its handle.
+# These native auxiliaries are additional streams, not new model-placement roles.
+_SPEC_AUXILIARY_STREAMS = {}
+_CUDA_GREEN_STREAM_LIB = None
+
+
+def _cuda_green_stream_lib():
+    import ctypes
+
+    global _CUDA_GREEN_STREAM_LIB
+    if _CUDA_GREEN_STREAM_LIB is None:
+        lib = ctypes.CDLL("libcuda.so.1")
+        signatures = {
+            "cuStreamGetGreenCtx": [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+            "cuGreenCtxStreamCreate": [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_int,
+            ],
+            "cuStreamDestroy_v2": [ctypes.c_void_p],
+        }
+        for name, args in signatures.items():
+            fn = getattr(lib, name)  # Missing driver support must fail closed.
+            fn.argtypes = args
+            fn.restype = ctypes.c_int
+        _CUDA_GREEN_STREAM_LIB = lib
+    return _CUDA_GREEN_STREAM_LIB
+
+
+def _stream_green_context(stream: torch.cuda.Stream) -> Optional[int]:
+    """Borrow the exact owning context, without switching or taking ownership."""
+    import ctypes
+
+    context = ctypes.c_void_p()
+    rc = _cuda_green_stream_lib().cuStreamGetGreenCtx(
+        ctypes.c_void_p(stream.cuda_stream), ctypes.byref(context)
+    )
+    if rc != 0:
+        raise RuntimeError(f"cuStreamGetGreenCtx -> {rc}")
+    return context.value
+
+
+def _create_green_context_sibling(source: torch.cuda.Stream) -> torch.cuda.Stream:
+    import ctypes
+
+    context = _stream_green_context(source)
+    if context is None:
+        raise RuntimeError("spec-pdmux auxiliary source has no green context")
+    handle = ctypes.c_void_p()
+    lib = _cuda_green_stream_lib()
+    # CUDA requires CU_STREAM_NON_BLOCKING (1), as used by the spatial factory.
+    rc = lib.cuGreenCtxStreamCreate(
+        ctypes.byref(handle), ctypes.c_void_p(context), 1, source.priority
+    )
+    if rc != 0:
+        raise RuntimeError(f"cuGreenCtxStreamCreate auxiliary -> {rc}")
+    try:
+        sibling = torch.cuda.ExternalStream(handle.value, device=source.device)
+        if _stream_green_context(sibling) != context:
+            raise RuntimeError("spec-pdmux auxiliary green-context identity mismatch")
+        return sibling
+    except Exception:
+        lib.cuStreamDestroy_v2(handle)
+        raise
+
+
+def register_spec_pdmux_auxiliary_stream(native: torch.cuda.Stream) -> None:
+    """Pre-create partition-affined siblings for an opt-in model before capture.
+
+    Full-chip sequential is unchanged. LARGE/SMALL siblings preserve native
+    fork/join overlap; the original plain auxiliary remains for full-device
+    prefill. Unknown source streams are not treated as full-chip fallbacks.
+    """
+    if SPEC_STREAM_PAIR is None or native is None:
+        return
+    if native.cuda_stream in _SPEC_AUXILIARY_STREAMS:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("spec-pdmux auxiliary streams must register before capture")
+    if _stream_green_context(native) is not None:
+        raise RuntimeError("native full-device auxiliary stream must be plain CUDA")
+    full = get_spec_full_device_stream()
+    if _stream_green_context(full) is not None:
+        raise RuntimeError("spec-pdmux full-device placement stream must be plain CUDA")
+    # Include the exact plain construction/forward source, not arbitrary
+    # unrecognized streams. The model runner has already initialized the pair.
+    construction_source = torch.cuda.current_stream(device=native.device)
+    full_sources = [full]
+    if _stream_green_context(construction_source) is None:
+        full_sources.append(construction_source)
+    siblings = []
+    try:
+        for source in SPEC_STREAM_PAIR:
+            siblings.append(_create_green_context_sibling(source))
+    except Exception:
+        import ctypes
+
+        for sibling in siblings:
+            _cuda_green_stream_lib().cuStreamDestroy_v2(
+                ctypes.c_void_p(sibling.cuda_stream)
+            )
+        raise
+    _SPEC_AUXILIARY_STREAMS[native.cuda_stream] = (
+        native,
+        SPEC_STREAM_PAIR,
+        tuple(siblings),
+        tuple(full_sources),
+    )
+    logger.info(
+        "[spec-pdmux] native auxiliary stream=%d registered: "
+        "LARGE sibling=%d SMALL sibling=%d; three placement roles retain "
+        "additional native auxiliary streams",
+        native.cuda_stream,
+        siblings[0].cuda_stream,
+        siblings[1].cuda_stream,
+    )
+
+
+def get_spec_pdmux_auxiliary_stream(native: torch.cuda.Stream) -> torch.cuda.Stream:
+    """Resolve the pre-created sibling of the CURRENT source phase."""
+    if native is None:
+        return None
+    streams = _SPEC_AUXILIARY_STREAMS.get(native.cuda_stream)
+    if streams is None:
+        return native  # Unregistered model (including B1), exact old behavior.
+    _, sources, siblings, full_sources = streams
+    current = torch.cuda.current_stream(device=native.device)
+    for source, sibling in zip(sources, siblings):
+        if current == source:
+            return sibling
+    if any(current == source for source in full_sources):
+        return native
+    raise RuntimeError(
+        "spec-pdmux native auxiliary entered from an unregistered source stream "
+        f"{current.cuda_stream}; refusing full-device fallback"
+    )
+
 
 @dataclass
 class PDMuxConfig:
