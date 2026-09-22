@@ -91,6 +91,10 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
+from sglang.srt.multiplex.pdmux_context import (
+    get_spec_pdmux_auxiliary_stream,
+    register_spec_pdmux_auxiliary_stream,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 
@@ -484,11 +488,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and _gdn_use_alt_stream
         ):
             current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
+            alt_stream = get_spec_pdmux_auxiliary_stream(self.alt_stream)
+            alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            with torch.cuda.stream(self.alt_stream):
+            with torch.cuda.stream(alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
-            current_stream.wait_stream(self.alt_stream)
+            current_stream.wait_stream(alt_stream)
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
@@ -870,13 +875,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and _qknorm_use_alt_stream
         ):
             current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
+            alt_stream = get_spec_pdmux_auxiliary_stream(self.alt_stream)
+            alt_stream.wait_stream(current_stream)
             q_by_head = q.reshape(-1, self.head_dim)
             q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
+            with torch.cuda.stream(alt_stream):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
+            current_stream.wait_stream(alt_stream)
         elif _is_hip or _is_xpu:
             q_by_head, k_by_head = fused_qk_gemma_rmsnorm(
                 q,
@@ -1200,6 +1206,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
         alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
+        if _is_cuda:
+            register_spec_pdmux_auxiliary_stream(alt_stream)
 
         # Embedding layer
         if self.pp_group.is_first_rank:
