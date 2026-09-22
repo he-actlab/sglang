@@ -391,6 +391,11 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        self.spec_state_size = spec_state_size
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        self.speculative_eagle_topk = speculative_eagle_topk
+        self.envelope_layout = envelope_layout
+        self.enable_gdn_compact_spec_state = enable_gdn_compact_spec_state
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
 
@@ -1176,6 +1181,106 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
+
+
+class HybridReqToTokenPoolStateView(HybridReqToTokenPool):
+    """Model-local recurrent tensors over another pool's request/state indices.
+
+    The scheduler's pool remains the only index owner. Mapping properties read
+    through to it, including after reset or tensor rebinding. State clear/COW
+    must be executed explicitly on this view's ``mamba_pool``; owner allocation,
+    free and reset do not initialize these model-local tensors.
+
+    This storage seam does not provide speculative rollback or paired radix
+    publication. Hybrid STANDALONE must remain guarded until those are wired.
+    """
+
+    def __init__(
+        self,
+        index_owner: HybridReqToTokenPool,
+        *,
+        cache_params: BaseLinearStateParams,
+        mamba_layer_ids: List[int],
+        start_layer: int = 0,
+    ):
+        if not isinstance(index_owner, HybridReqToTokenPool) or isinstance(
+            index_owner, HybridReqToTokenPoolStateView
+        ):
+            raise TypeError("A state view requires an owning HybridReqToTokenPool")
+        if index_owner.mamba_ckpt_pool is not None:
+            raise ValueError("Model-local int8 checkpoint ownership is not implemented")
+        if not mamba_layer_ids or len(set(mamba_layer_ids)) != len(mamba_layer_ids):
+            raise ValueError(
+                "Model-local recurrent layer IDs must be nonempty and unique"
+            )
+        if not set(mamba_layer_ids).issubset(cache_params.layers):
+            raise ValueError(
+                "Model-local recurrent layers are absent from cache_params"
+            )
+
+        self.index_owner = index_owner
+        self.size = index_owner.size
+        self._alloc_size = index_owner._alloc_size
+        self.max_context_len = index_owner.max_context_len
+        self.device = index_owner.device
+        self.enable_memory_saver = index_owner.enable_memory_saver
+        self.enable_mamba_extra_buffer = index_owner.enable_mamba_extra_buffer
+        self.enable_mamba_extra_buffer_lazy = index_owner.enable_mamba_extra_buffer_lazy
+        self.mamba_ping_pong_track_buffer_size = (
+            index_owner.mamba_ping_pong_track_buffer_size
+        )
+        self.start_layer = start_layer
+        self.layer_transfer_counter = None
+        self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
+        self.mamba_ckpt_pool = None
+
+        owner_state = index_owner.mamba_pool
+        self.mamba_pool = MambaPool(
+            size=owner_state.size,
+            spec_state_size=owner_state.spec_state_size,
+            cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
+            device=self.device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=owner_state.speculative_num_draft_tokens,
+            speculative_eagle_topk=owner_state.speculative_eagle_topk,
+            enable_linear_replayssm=owner_state.enable_linear_replayssm,
+            linear_replayssm_cache_len=owner_state.linear_replayssm_cache_len,
+            envelope_layout=owner_state.envelope_layout,
+            enable_gdn_compact_spec_state=owner_state.enable_gdn_compact_spec_state,
+        )
+
+    @property
+    def req_to_token(self):
+        return self.index_owner.req_to_token
+
+    @property
+    def free_slots(self):
+        return self.index_owner.free_slots
+
+    @property
+    def req_index_to_mamba_index_mapping(self):
+        return self.index_owner.req_index_to_mamba_index_mapping
+
+    @property
+    def req_index_to_mamba_ping_pong_track_buffer_mapping(self):
+        return self.index_owner.req_index_to_mamba_ping_pong_track_buffer_mapping
+
+    @property
+    def mamba_allocator(self):
+        raise RuntimeError("Recurrent-state views do not own request/state indices")
+
+    def _reject_index_mutation(self, *args, **kwargs):
+        raise RuntimeError("Recurrent-state views do not own request/state indices")
+
+    write = _reject_index_mutation
+    alloc = _reject_index_mutation
+    free = _reject_index_mutation
+    clear = _reject_index_mutation
+    free_mamba_cache = _reject_index_mutation
+    _alloc_ping_pong_buffer = _reject_index_mutation
+    set_mamba_ping_pong_slot = _reject_index_mutation
+    donate_mamba_ping_pong_slot = _reject_index_mutation
 
 
 @dataclass
