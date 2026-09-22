@@ -14,6 +14,95 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class FullDeviceOperatorRegionCudaTests(CustomTestCase):
+    def test_k6_qkv_two_slots_on_real_green_contexts(self):
+        device = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device)
+        if torch.cuda.get_device_capability(device) != (12, 0) or (
+            properties.multi_processor_count != 188
+        ):
+            self.skipTest("requires the retained 188-SM Blackwell configuration")
+
+        # Exercise the production 136/52 allocation and exact K6 QKV shape,
+        # not an ordinary-stream substitute. Both draft slots reuse SMALL
+        # scratch; verifier storage and graph pool remain independent.
+        with (
+            patch.object(pdmux_context, "SPEC_STREAM_PAIR", None),
+            patch.object(pdmux_context, "SPEC_SM_SPLIT", None),
+            patch.object(pdmux_context, "SPEC_SM_ALLOCATED_SPLIT", None),
+            patch.object(pdmux_context, "SPEC_PREFILL_STREAM", None),
+        ):
+            large, small = pdmux_context.initialize_spec_stream_pair(device, 132, 56)
+            full = pdmux_context.get_spec_full_device_stream()
+            self.assertEqual(pdmux_context.get_spec_sm_allocated_split(), (136, 52))
+            self.assertIs(pdmux_context.get_spec_qkv128_stream(), full)
+            self.assertEqual(len({s.cuda_stream for s in (large, small, full)}), 3)
+
+            torch.manual_seed(17)
+            inputs = [
+                torch.randn((224, 1024), device=device, dtype=torch.bfloat16)
+                for _ in range(2)
+            ]
+            weight = torch.randn((4096, 1024), device=device, dtype=torch.bfloat16)
+            scratch = torch.empty_like(inputs[0])
+            outputs = [
+                torch.empty((224, 4096), device=device, dtype=torch.bfloat16)
+                for _ in inputs
+            ]
+            full.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(full), pdmux_context.cublas_sm_count_target(0):
+                expected = [
+                    (torch.nn.functional.linear(x, weight) + 1) * 3 for x in inputs
+                ]
+            verifier_input = torch.ones((224, 1024), device=device)
+            verifier_output = torch.empty_like(verifier_input)
+            torch.cuda.synchronize()
+
+            draft_pool = torch.cuda.graph_pool_handle()
+            verifier_pool = torch.cuda.graph_pool_handle()
+            self.assertNotEqual(draft_pool, verifier_pool)
+            verifier_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(verifier_graph, pool=verifier_pool, stream=large):
+                verifier_output.copy_(verifier_input)
+                verifier_output.add_(2)
+
+            graphs = []
+            with pdmux_context.cublas_sm_count_target(52):
+                for inp, out in zip(inputs, outputs):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=draft_pool, stream=small):
+                        scratch.copy_(inp)
+                        with pdmux_context.spec_pdmux_qkv128_operator_region(
+                            True, source_partition="small"
+                        ) as qkv_stream:
+                            scratch.record_stream(qkv_stream)
+                            qkv = torch.nn.functional.linear(scratch, weight)
+                        qkv.record_stream(small)
+                        qkv.add_(1)
+                        with pdmux_context.spec_pdmux_full_device_operator_region(
+                            True, source_partition="small"
+                        ) as operator_stream:
+                            self.assertIs(operator_stream, qkv_stream)
+                            qkv.record_stream(operator_stream)
+                            qkv.mul_(3)
+                        out.copy_(qkv)
+                    graphs.append(graph)
+                    self.assertEqual(pdmux_context._cublas_sm_count_target_get(), 52)
+
+            # No device join between slots or verifier replays. The production
+            # source/full/source graph edges must protect scratch and outputs.
+            for _ in range(20):
+                with torch.cuda.stream(large):
+                    verifier_graph.replay()
+                with torch.cuda.stream(small):
+                    for graph in graphs:
+                        graph.replay()
+            torch.cuda.synchronize()
+            for actual, reference in zip(outputs, expected):
+                torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
+            torch.testing.assert_close(
+                verifier_output, verifier_input + 2, rtol=0, atol=0
+            )
+
     def test_two_draft_graphs_reuse_workspace_with_verifier_in_flight(self):
         # Both request slots use one SMALL FIFO; the verifier has its own
         # stream/storage. QKV and the other full-device operators share the

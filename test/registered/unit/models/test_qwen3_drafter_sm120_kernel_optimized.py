@@ -231,6 +231,15 @@ class ModelRunnerQwen3DrafterSM120RoleTests(CustomTestCase):
             with self.subTest(steps=steps):
                 self._check_ported_extend(steps)
 
+    def test_k6_explicit_full_qkv_keeps_two_slot_portfolios(self):
+        # The placement override must not disable the integrated K6 stack or
+        # reinterpret two 32-request slots as one M448 draft-extend batch.
+        with (
+            envs.SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT.override("full"),
+            envs.SGLANG_SPEC_PDMUX_SERIALIZE.override(False),
+        ):
+            self._check_ported_extend(6)
+
     def _check_ported_extend(self, steps):
         runner = self._runner()
         runner.server_args.enable_spec_sm_partition = False
