@@ -698,6 +698,7 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
                     "draft model path",
                 ),
                 ("random_seed", 1, "server random seed"),
+                ("disable_radix_cache", True, "radix cache is disabled"),
             )
             for field, value, reason in invalid:
                 original = getattr(args, field)
@@ -881,6 +882,11 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
             self.assertTrue(identity["draft_extend_gemm_integration"])
             self.assertEqual(stream, "small-stream")
 
+            args.disable_radix_cache = True
+            with self.assertRaisesRegex(RuntimeError, "radix cache is disabled"):
+                probe_module._validate_fixed52_runtime(runner, [32], 4)
+            args.disable_radix_cache = False
+
             args.random_seed = 1
             with self.assertRaisesRegex(RuntimeError, "server random seed"):
                 probe_module._validate_fixed52_runtime(runner, [32], 4)
@@ -912,16 +918,36 @@ class DraftExtendSurfaceProbeTests(CustomTestCase):
                 with self.assertRaises(RuntimeError):
                     probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
                 setattr(args, name, previous)
-            for steps in (4, 6):
+            for steps in (3, 4, 6):
                 args.speculative_num_steps = steps
                 args.speculative_num_draft_tokens = steps + 1
-                identity, stream = probe_module._validate_fixed52_runtime(runner, [32, 64], steps + 1)
-                self.assertEqual(identity["speculative_num_draft_tokens"], steps + 1)
-                with self.assertRaises(RuntimeError):
-                    probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
+                for disable_radix_cache in (True, False):
+                    args.disable_radix_cache = disable_radix_cache
+                    with self.subTest(steps=steps, disable_radix_cache=disable_radix_cache):
+                        identity, stream = probe_module._validate_fixed52_runtime(
+                            runner, [32, 64], steps + 1
+                        )
+                        self.assertEqual(identity["speculative_num_draft_tokens"], steps + 1)
+                        self.assertEqual(identity["disable_radix_cache"], disable_radix_cache)
+                if steps != 3:
+                    with self.assertRaises(RuntimeError):
+                        probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
             args.speculative_num_steps = 3
             args.speculative_num_draft_tokens = 4
-            with envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE.override("measure"):
+            args.disable_radix_cache = True
+            for setting, value in (
+                (envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE, "measure"),
+                (envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_MODE, "capture-only"),
+                (envs.SGLANG_DRAFT_EXTEND_NCU_RANGE, True),
+                (envs.SGLANG_DRAFT_EXTEND_SURFACE_PROBE_CACHE_MODE, "cold-entry"),
+            ):
+                with self.subTest(setting=setting, value=value), setting.override(value):
+                    with self.assertRaisesRegex(RuntimeError, "plan metadata only"):
+                        probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
+            with patch.dict(
+                probe_module.os.environ,
+                {"SGLANG_DRAFT_EXTEND_ATTENTION_SNAPSHOT_PATH": "/tmp/unit-snapshot.pt"},
+            ):
                 with self.assertRaisesRegex(RuntimeError, "plan metadata only"):
                     probe_module._validate_fixed52_runtime(runner, [32, 64], 4)
 
