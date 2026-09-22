@@ -348,8 +348,11 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
+        intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+        compact_ssm_k: Optional[torch.Tensor] = None
+        compact_ssm_d: Optional[torch.Tensor] = None
+        compact_ssm_alpha: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -365,11 +368,22 @@ class MambaPool:
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
+        enable_gdn_compact_spec_state: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
+        if enable_gdn_compact_spec_state:
+            if envelope_layout:
+                raise ValueError("Compact GDN rollback requires contiguous state pools")
+            if not _is_cuda or speculative_eagle_topk != 1:
+                raise ValueError("Compact GDN rollback requires CUDA and top-k1")
+            if speculative_num_draft_tokens is None or enable_linear_replayssm:
+                raise ValueError(
+                    "Compact GDN rollback requires speculative decoding without ReplaySSM"
+                )
+            cache_params.gdn_compact_spec_state_bytes(speculative_num_draft_tokens)
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -494,20 +508,37 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
+                intermediate_ssm_state_cache = None
+                compact_ssm_k = compact_ssm_d = compact_ssm_alpha = None
+                if enable_gdn_compact_spec_state:
+                    hv, v_dim, k_dim = temporal_state_shape
+                    factor_shape = (
                         num_mamba_layers,
                         spec_state_size + 1,
                         speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
+                        hv,
+                    )
+                    compact_ssm_k = torch.zeros(
+                        (*factor_shape, k_dim), dtype=torch.float32, device=device
+                    )
+                    compact_ssm_d = torch.zeros(
+                        (*factor_shape, v_dim), dtype=torch.float32, device=device
+                    )
+                    compact_ssm_alpha = torch.zeros(
+                        factor_shape, dtype=torch.float32, device=device
+                    )
+                else:
+                    # Dense legacy rollback: [layer, slot, token, HV, V, K].
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            *temporal_state_shape,
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
                 #
@@ -593,6 +624,9 @@ class MambaPool:
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
+                    compact_ssm_k=compact_ssm_k,
+                    compact_ssm_d=compact_ssm_d,
+                    compact_ssm_alpha=compact_ssm_alpha,
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
                     replayssm_g=replayssm_g,
@@ -602,7 +636,8 @@ class MambaPool:
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                    f"intermediate_ssm_state_cache size: {(get_tensor_size_bytes(intermediate_ssm_state_cache) if intermediate_ssm_state_cache is not None else 0) / GB:.2f}GB "
+                    f"compact_ssm_factors size: {(get_tensor_size_bytes([compact_ssm_k, compact_ssm_d, compact_ssm_alpha]) if compact_ssm_k is not None else 0) / GB:.2f}GB "
                     # Report the deduplicated PHYSICAL conv-window buffers (the view
                     # over-reports its logical, un-deduplicated size).
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
@@ -741,7 +776,13 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             # Skip intermediate buffers used only for speculative decoding
             # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "compact_ssm_k",
+                "compact_ssm_d",
+                "compact_ssm_alpha",
+            ):
                 continue
             # Skip GDN ReplaySSM ring buffers: they are derived/transient decode
             # scratch, not part of the persistent transferable state.
@@ -783,6 +824,9 @@ class MambaPool:
             if field in (
                 "intermediate_ssm",
                 "intermediate_conv_window",
+                "compact_ssm_k",
+                "compact_ssm_d",
+                "compact_ssm_alpha",
                 "replayssm_d",
                 "replayssm_k",
                 "replayssm_g",
@@ -829,6 +873,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
+        enable_gdn_compact_spec_state: bool = False,
     ):
         super().__init__(
             size=size,
@@ -855,6 +900,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
+            enable_gdn_compact_spec_state=enable_gdn_compact_spec_state,
         )
 
     def _init_mamba_pool(
@@ -870,6 +916,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
+        enable_gdn_compact_spec_state: bool = False,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -883,6 +930,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
+            enable_gdn_compact_spec_state=enable_gdn_compact_spec_state,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

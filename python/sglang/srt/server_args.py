@@ -1866,6 +1866,12 @@ class ServerArgs:
         "models. Requires the Triton linear-attn decode backend and "
         "--mamba-scheduler-strategy no_buffer (the default).",
     ] = False
+    enable_gdn_compact_spec_state: A[
+        bool,
+        "Store native FP32 GDN speculative updates as compact factors and replay "
+        "the accepted prefix at commit. Requires CUDA, top-k1 and the Triton "
+        "linear-attention backends. Does not change the persistent radix pool.",
+    ] = False
     linear_replayssm_cache_len: A[
         int,
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
@@ -5263,6 +5269,30 @@ class ServerArgs:
         # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
         # cursor of the donated/kept slot would not be reset there. Handling
         # that donation path is a follow-up; for now require no_buffer.
+        if self.enable_gdn_compact_spec_state:
+            if self.enable_page_major_kv_layout or self.speculative_adaptive:
+                raise ValueError(
+                    "Compact GDN rollback requires contiguous pools and fixed speculative depth"
+                )
+            if not is_cuda() or decode != "triton" or prefill != "triton":
+                raise ValueError(
+                    "--enable-gdn-compact-spec-state requires CUDA and Triton "
+                    "linear-attention backends"
+                )
+            if (
+                self.speculative_eagle_topk != 1
+                or not self.speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    "--enable-gdn-compact-spec-state requires top-k1 speculative decoding"
+                )
+            if self.mamba_ssm_dtype not in (None, "float32"):
+                raise ValueError("Compact GDN rollback requires native FP32 state")
+            if self.enable_linear_replayssm or self.disaggregation_mode != "null":
+                raise ValueError(
+                    "Compact GDN rollback does not support ReplaySSM or disaggregation"
+                )
+
         if self.enable_linear_replayssm:
             if decode != "triton":
                 raise ValueError(

@@ -153,6 +153,18 @@ class StandaloneDraftWorker(EagleDraftWorker):
         token_to_kv_pool_allocator=None,
     ):
         """Standalone: allocate pools without sharing embeddings."""
+        if (
+            getattr(self.server_args, "enable_gdn_compact_spec_state", False)
+            and self.draft_runner.mambaish_config is not None
+        ):
+            # Compact target rollback alone does not provide independent draft
+            # state, speculative draft recovery, or paired radix publication.
+            # Do not let its smaller allocation admit the shared-state path.
+            raise ValueError(
+                "Compact target rollback cannot admit a hybrid STANDALONE draft: "
+                "independent draft-state ownership, rejected-suffix recovery and "
+                "paired radix checkpoints are not implemented"
+            )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         # Unsharded drafter: the draft KV pool sizes its head count via

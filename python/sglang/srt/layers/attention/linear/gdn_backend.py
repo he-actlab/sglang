@@ -529,6 +529,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
+                **(
+                    dict(
+                        compact_ssm_k=mamba_cache_params.compact_ssm_k,
+                        compact_ssm_d=mamba_cache_params.compact_ssm_d,
+                        compact_ssm_alpha=mamba_cache_params.compact_ssm_alpha,
+                    )
+                    if mamba_cache_params.compact_ssm_k is not None
+                    else {}
+                ),
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)

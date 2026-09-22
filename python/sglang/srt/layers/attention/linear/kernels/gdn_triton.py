@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
@@ -215,6 +217,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        compact_ssm_k: Optional[torch.Tensor] = None,
+        compact_ssm_d: Optional[torch.Tensor] = None,
+        compact_ssm_alpha: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         return fused_sigmoid_gating_delta_rule_update(
@@ -238,4 +243,13 @@ class TritonGDNKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            **(
+                dict(
+                    compact_ssm_k=compact_ssm_k,
+                    compact_ssm_d=compact_ssm_d,
+                    compact_ssm_alpha=compact_ssm_alpha,
+                )
+                if compact_ssm_k is not None
+                else {}
+            ),
         )

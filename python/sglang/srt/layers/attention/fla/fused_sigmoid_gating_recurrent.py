@@ -3,6 +3,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -50,7 +51,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
+    CACHE_COMPACT_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    compact_ssm_k=None,
+    compact_ssm_d=None,
+    compact_ssm_alpha=None,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -120,7 +125,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Prepare intermediate state cache index if enabled
     cache_idx = -1
-    if CACHE_INTERMEDIATE_STATES:
+    if CACHE_INTERMEDIATE_STATES or CACHE_COMPACT_STATES:
         cache_idx = tl.load(intermediate_state_indices + i_n)
 
     step_idx = 0
@@ -184,7 +189,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if IS_KDA:
             b_h *= tl.exp(b_g[:, None])
         else:
-            b_h *= tl.exp(b_g)
+            b_alpha = tl.exp(b_g)
+            b_h *= b_alpha
 
         # Delta rule: v -= sum(h * k, dim=0)
         b_v -= tl.sum(b_h * b_k[:, None], 0)
@@ -198,6 +204,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Compute output: o = sum(h * q, dim=0)
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        # Retain the actual FP32 update operands, not a rounded/recomputed
+        # approximation. Recovery applies each update in its original order.
+        if CACHE_COMPACT_STATES:
+            if cache_idx >= 0:
+                compact_offset = (cache_idx * cache_steps + step_idx) * HV + i_hv
+                tl.store(compact_ssm_d + compact_offset * V + o_v, b_v, mask=mask_v)
+                if i_v == 0:
+                    tl.store(
+                        compact_ssm_k + compact_offset * K + o_k,
+                        b_k,
+                        mask=mask_k,
+                    )
+                    tl.store(compact_ssm_alpha + compact_offset, b_alpha)
 
         # Cache intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
@@ -238,6 +258,57 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
+def _validate_compact_capture(
+    keys,
+    deltas,
+    alphas,
+    state,
+    indices,
+    dense,
+    is_kda,
+    parents,
+    disable_state_update,
+    hv,
+    k_dim,
+    v_dim,
+    steps,
+):
+    present = (keys is not None, deltas is not None, alphas is not None)
+    if not any(present):
+        return False
+    if not all(present):
+        raise ValueError("compact GDN capture requires all three FP32 factor buffers")
+    if dense is not None or is_kda or parents is not None:
+        raise ValueError("compact GDN capture supports only scalar, linear-chain GDN")
+    if not disable_state_update:
+        raise ValueError("compact verify must preserve its initial recurrent state")
+    if state is None or indices is None:
+        raise ValueError("compact GDN capture requires state and intermediate indices")
+    if keys.ndim != 4 or keys.shape[2:] != (hv, k_dim):
+        raise ValueError("compact keys must have shape [slots, steps, HV, K]")
+    if deltas.shape != (*keys.shape[:3], v_dim) or alphas.shape != keys.shape[:3]:
+        raise ValueError("compact delta/decay shapes do not match the key buffer")
+    if not isinstance(steps, int) or steps <= 0 or steps > keys.shape[1]:
+        raise ValueError("compact GDN capture requires a valid bounded cache_steps")
+    if state.ndim != 4 or state.shape[1:] != (hv, v_dim, k_dim):
+        raise ValueError("compact GDN requires native [slots, HV, V, K] state")
+    for tensor in (state, keys, deltas, alphas):
+        if tensor.dtype != torch.float32 or not tensor.is_contiguous():
+            raise ValueError("compact GDN state and factors must be contiguous FP32")
+    for tensor in (state, keys, deltas, alphas):
+        if not tensor.is_cuda or tensor.device != state.device:
+            raise ValueError("compact GDN state and factors must share a CUDA device")
+    if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "compact intermediate indices must be a one-dimensional integer tensor"
+        )
+    if indices.device != state.device or not indices.is_contiguous():
+        raise ValueError(
+            "compact intermediate indices must be contiguous on the state device"
+        )
+    return True
+
+
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -262,6 +333,9 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    compact_ssm_k: Optional[torch.Tensor] = None,
+    compact_ssm_d: Optional[torch.Tensor] = None,
+    compact_ssm_alpha: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -284,6 +358,21 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    compact = _validate_compact_capture(
+        compact_ssm_k,
+        compact_ssm_d,
+        compact_ssm_alpha,
+        initial_state_source,
+        intermediate_state_indices,
+        intermediate_states_buffer,
+        is_kda,
+        retrieve_parent_token,
+        disable_state_update,
+        HV,
+        K,
+        V,
+        T if cu_seqlens is None else cache_steps,
+    )
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -314,7 +403,7 @@ def fused_sigmoid_gating_delta_rule_update(
     cache_stride_steps = (
         intermediate_states_buffer.shape[1]
         if intermediate_states_buffer is not None
-        else 0
+        else compact_ssm_k.shape[1] if compact else 0
     )
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
@@ -334,6 +423,9 @@ def fused_sigmoid_gating_delta_rule_update(
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
         cache_steps=cache_stride_steps,
+        compact_ssm_k=compact_ssm_k,
+        compact_ssm_d=compact_ssm_d,
+        compact_ssm_alpha=compact_ssm_alpha,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
@@ -358,9 +450,183 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_KDA=is_kda,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        CACHE_COMPACT_STATES=compact,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
     o = o.squeeze(0)
     return o
+
+
+@triton.jit
+def _gdn_compact_state_commit_kernel(
+    state,
+    keys,
+    deltas,
+    alphas,
+    state_indices,
+    accepted_steps,
+    intermediate_indices,
+    track_indices,
+    track_steps,
+    STATE_SLOTS: tl.constexpr,
+    FACTOR_SLOTS: tl.constexpr,
+    STEPS: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    HAS_INTERMEDIATE_INDICES: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    layer = tl.program_id(1).to(tl.int64)
+    hv_v = tl.program_id(2)
+    nv = tl.cdiv(V, BV)
+    head = hv_v // nv
+    value_block = hv_v % nv
+    slot = tl.load(state_indices + request).to(tl.int64)
+    factor_slot = request.to(tl.int64)
+    if HAS_INTERMEDIATE_INDICES:
+        factor_slot = tl.load(intermediate_indices + request).to(tl.int64)
+    if (
+        slot < 0
+        or slot >= STATE_SLOTS
+        or factor_slot < 0
+        or factor_slot >= FACTOR_SLOTS
+    ):
+        return
+    accepted = tl.load(accepted_steps + request)
+    tracked = -1
+    track_slot = -1
+    if HAS_TRACK:
+        tracked = tl.load(track_steps + request)
+        track_slot = tl.load(track_indices + request).to(tl.int64)
+        if track_slot < 0 or track_slot >= STATE_SLOTS:
+            tracked = -1
+    last_step = tl.maximum(accepted, tracked)
+    if last_step < 0 or last_step >= STEPS:
+        return
+    kk = tl.arange(0, BK)
+    vv = value_block * BV + tl.arange(0, BV)
+    mask = (kk[:, None] < K) & (vv[None, :] < V)
+    within_state = head * V * K + vv[None, :] * K + kk[:, None]
+    state_ptr = state + (layer * STATE_SLOTS + slot) * HV * V * K + within_state
+    # Every program owns one disjoint state tile. Read its old value once;
+    # accepted and radix-tracked outputs are both derived from this same base.
+    h = tl.load(state_ptr, mask=mask, other=0)
+    for step in range(last_step + 1):
+        factor_offset = (
+            (layer * FACTOR_SLOTS + factor_slot) * STEPS + step
+        ) * HV + head
+        key = tl.load(keys + factor_offset * K + kk, mask=kk < K, other=0)
+        delta = tl.load(deltas + factor_offset * V + vv, mask=vv < V, other=0)
+        alpha = tl.load(alphas + factor_offset)
+        # The original decay is consumed by the delta reduction, so it rounds
+        # before the rank-1 FMA. Explicit mul_rn prevents contracting this decay
+        # into the following update when the reduction is absent in recovery.
+        h = libdevice.mul_rn(h, alpha)
+        h = tl.fma(key[:, None], delta[None, :], h)
+        if step == accepted:
+            tl.store(state_ptr, h, mask=mask)
+        if HAS_TRACK:
+            if step == tracked:
+                track_ptr = (
+                    state
+                    + (layer * STATE_SLOTS + track_slot) * HV * V * K
+                    + within_state
+                )
+                tl.store(track_ptr, h, mask=mask)
+
+
+def fused_gdn_compact_state_commit(
+    state: torch.Tensor,
+    compact_ssm_k: torch.Tensor,
+    compact_ssm_d: torch.Tensor,
+    compact_ssm_alpha: torch.Tensor,
+    state_indices: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    *,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
+    mamba_track_indices: Optional[torch.Tensor] = None,
+    mamba_steps_to_track: Optional[torch.Tensor] = None,
+):
+    """Commit exact FP32 linear-chain GDN states without dense token snapshots.
+
+    ``state`` is [L,C,HV,V,K]; factors are [L,S,D,HV,K],
+    [L,S,D,HV,V], and [L,S,D,HV]. Indices refer to request rows unless
+    ``intermediate_state_indices`` supplies the factor-row mapping. Negative
+    state/factor slots are padding, and negative steps suppress that output.
+
+    Caller ownership contract: active state slots are unique, track slots are
+    distinct from all active slots, and all source states still represent the
+    pre-verify prefix. The same records must not be committed twice. All buffers
+    and index addresses can remain static for CUDA graph capture/replay.
+    """
+    if state.ndim != 5 or compact_ssm_k.ndim != 5:
+        raise ValueError("compact recovery requires all-layer state/factor tensors")
+    layers, slots, hv, v_dim, k_dim = state.shape
+    if compact_ssm_k.shape[0] != layers or compact_ssm_k.shape[3:] != (hv, k_dim):
+        raise ValueError("compact recovery key shape does not match state")
+    if compact_ssm_d.shape != (*compact_ssm_k.shape[:4], v_dim):
+        raise ValueError("compact recovery delta shape does not match state")
+    if compact_ssm_alpha.shape != compact_ssm_k.shape[:4]:
+        raise ValueError("compact recovery decay shape does not match keys")
+    for tensor in (state, compact_ssm_k, compact_ssm_d, compact_ssm_alpha):
+        if tensor.dtype != torch.float32 or not tensor.is_contiguous():
+            raise ValueError("compact recovery requires contiguous FP32 state/factors")
+        if not tensor.is_cuda or tensor.device != state.device:
+            raise ValueError("compact recovery requires a shared CUDA device")
+    if (mamba_track_indices is None) != (mamba_steps_to_track is None):
+        raise ValueError("both radix tracking tensors must be provided together")
+    for tensor in (
+        state_indices,
+        last_correct_step_indices,
+        intermediate_state_indices,
+        mamba_track_indices,
+        mamba_steps_to_track,
+    ):
+        if tensor is None:
+            continue
+        if tensor.ndim != 1 or tensor.shape != state_indices.shape:
+            raise ValueError(
+                "compact recovery indices must be matching one-dimensional tensors"
+            )
+        if tensor.dtype not in (torch.int32, torch.int64):
+            raise ValueError("compact recovery indices must use int32 or int64")
+        if tensor.device != state.device or not tensor.is_contiguous():
+            raise ValueError(
+                "compact recovery indices must be contiguous on the state device"
+            )
+    if state_indices.numel() == 0:
+        return
+    steps = compact_ssm_k.shape[2]
+    if steps <= 0 or k_dim <= 0 or v_dim <= 0:
+        raise ValueError("compact recovery state dimensions and steps must be positive")
+    bk, bv = triton.next_power_of_2(k_dim), min(triton.next_power_of_2(v_dim), 32)
+    _gdn_compact_state_commit_kernel[
+        (state_indices.numel(), layers, hv * triton.cdiv(v_dim, bv))
+    ](
+        state,
+        compact_ssm_k,
+        compact_ssm_d,
+        compact_ssm_alpha,
+        state_indices,
+        last_correct_step_indices,
+        intermediate_state_indices,
+        mamba_track_indices,
+        mamba_steps_to_track,
+        STATE_SLOTS=slots,
+        FACTOR_SLOTS=compact_ssm_k.shape[1],
+        STEPS=steps,
+        HV=hv,
+        K=k_dim,
+        V=v_dim,
+        BK=bk,
+        BV=bv,
+        HAS_INTERMEDIATE_INDICES=intermediate_state_indices is not None,
+        HAS_TRACK=mamba_track_indices is not None,
+        num_warps=1,
+    )
