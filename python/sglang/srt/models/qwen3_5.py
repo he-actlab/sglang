@@ -1807,6 +1807,32 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            # The Qwen3.5 MoE SpecForge EAGLE3 checkpoint uses outputs of
+            # the first, middle, and penultimate full-attention layers.
+            # For the 40-layer target these are layers 3, 23, and 35.
+            full_attention_layers = [
+                i
+                for i, layer_type in enumerate(self.config.layers_block_type)
+                if layer_type == "attention"
+            ]
+            if len(full_attention_layers) < 5:
+                raise ValueError(
+                    "Qwen3.5 MoE default EAGLE3 capture requires at least five "
+                    "full-attention layers; provide explicit layer_ids."
+                )
+            layer_ids = [
+                full_attention_layers[0],
+                full_attention_layers[len(full_attention_layers) // 2],
+                full_attention_layers[-2],
+            ]
+        # Reuse the existing wrapper's output-layer -> next-layer conversion
+        # and the Qwen3.5 body's per-layer capture markers, as for DFlash.
+        self.set_dflash_layers_to_capture(layer_ids)
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
