@@ -869,6 +869,9 @@ class Envs:
     # policy; small keeps the partition dispatch; full uses the shared stream.
     # M160/M224 still require the integrated stack. No kernel override.
     SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT = EnvStr("auto")
+    # The same three controls support exact native EAGLE3 B2 K3/topk4/tree16
+    # and B4 K4/topk1/tree5 via native_eagle3_draft_placement.py.
+    # That policy is isolated from the Qwen3 shape guards and custom kernels.
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
