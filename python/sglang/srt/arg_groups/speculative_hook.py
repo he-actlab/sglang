@@ -73,7 +73,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "select the non-overlap (synchronous) path."
         )
 
-    kwargs = {}
+    # Architecture probing must use the same pinned draft as the model loader.
+    kwargs = {"revision": server_args.speculative_draft_model_revision}
 
     override_config_file = server_args.decrypted_draft_config_file
     if override_config_file and override_config_file.strip():
