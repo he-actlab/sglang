@@ -292,6 +292,44 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
+def _validate_consumed_u(k, w, u, g, gk, initial_state):
+    if (
+        torch.is_grad_enabled()
+        or not u.is_cuda
+        or u.dtype != torch.bfloat16
+        or k.dtype != u.dtype
+        or w.dtype != u.dtype
+        or u.ndim != 4
+        or u.shape[0] != 1
+        or u.shape[2:] not in ((32, 128), (48, 128))
+        or k.shape != (*u.shape[:2], 16, 128)
+        or w.shape != u.shape
+        or not u.is_contiguous()
+        or not w.is_contiguous()
+        or u.storage_offset() != 0
+        or u.untyped_storage().nbytes() != u.numel() * u.element_size()
+        or any(
+            t.requires_grad for t in (k, w, u, g, gk, initial_state) if t is not None
+        )
+    ):
+        raise ValueError(
+            "Consumed GDN u requires an owned contiguous native BF16 workspace"
+        )
+    others = [t for t in (k, w, g, gk, initial_state) if t is not None]
+    storage = u.untyped_storage().data_ptr()
+    if any(
+        t.device != u.device or t.untyped_storage().data_ptr() == storage
+        for t in others
+    ):
+        raise ValueError("Consumed GDN u must have disjoint input/state storage")
+    if any(
+        w.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
+        for t in (k, g, gk, initial_state)
+        if t is not None
+    ):
+        raise ValueError("Retired GDN w must have disjoint input/state storage")
+
+
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -303,6 +341,7 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
+    consume_u: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -323,7 +362,18 @@ def chunk_gated_delta_rule_fwd_h(
 
     h = k.new_empty(B, NT, H, V, K)
 
-    v_new = torch.empty_like(u) if save_new_value else None
+    if consume_u:
+        if not save_new_value:
+            raise ValueError("Consumed GDN u requires the native v_new output")
+        _validate_consumed_u(k, w, u, g, gk, initial_state)
+        if h.untyped_storage().data_ptr() == u.untyped_storage().data_ptr():
+            raise ValueError("Consumed GDN u must not alias h output storage")
+        # Each (request, head, V-tile) CTA reads its u chunk before writing
+        # that same v_new chunk, then uses register b_v for the recurrence.
+        # No cross-CTA or subsequent-chunk read targets the overwritten data.
+        v_new = u
+    else:
+        v_new = torch.empty_like(u) if save_new_value else None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)

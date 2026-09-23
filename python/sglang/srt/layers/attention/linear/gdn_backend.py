@@ -598,6 +598,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                **(
+                    {"consume_u": True}
+                    if is_cuda()
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                    and not get_is_capture_mode()
+                    and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+                    and isinstance(
+                        self.kernel_dispatcher.extend_kernel, TritonGDNKernel
+                    )
+                    and not torch.is_grad_enabled()
+                    else {}
+                ),
             )
 
             if is_npu() and last_recurrent_state is not None:

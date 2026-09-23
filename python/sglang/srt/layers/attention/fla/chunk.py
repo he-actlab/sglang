@@ -33,6 +33,38 @@ if is_intel:
 CHUNK_SIZE = 64
 
 
+def _can_consume_prefill_u(q, k, v, g, beta, initial_state):
+    # Evaluate before Function.apply: forward() itself always disables grad.
+    tensors = (q, k, v, g, beta, initial_state)
+    if (
+        torch.is_grad_enabled()
+        or SUPPRESS_LEVEL >= 3
+        or any(t is None or t.requires_grad or not t.is_cuda for t in tensors)
+        or any(t.device != q.device or not t.is_contiguous() for t in tensors)
+        or q.dtype != torch.bfloat16
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+        or g.dtype != torch.float32
+        or beta.dtype != torch.float32
+        or initial_state.dtype != torch.float32
+        or q.ndim != 4
+        or q.shape[0] != 1
+        or q.shape[1] == 0
+        or q.shape[2:] != (16, 128)
+        or k.shape != q.shape
+        or v.shape[:2] != q.shape[:2]
+        or v.shape[2:] not in ((32, 128), (48, 128))
+        or g.shape != v.shape[:-1]
+        or beta.shape != g.shape
+        or initial_state.ndim != 4
+        or initial_state.shape[1:] != (v.shape[2], 128, 128)
+    ):
+        return False
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
+    return not get_is_capture_mode() and not torch.cuda.is_current_stream_capturing()
+
+
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -44,7 +76,12 @@ def chunk_gated_delta_rule_fwd(
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
+    consume_u: bool = False,
 ):
+    if consume_u and SUPPRESS_LEVEL >= 3:
+        raise ValueError(
+            "Consumed GDN workspace cannot satisfy retained-intermediate mode"
+        )
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
@@ -68,7 +105,12 @@ def chunk_gated_delta_rule_fwd(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        **({"consume_u": True} if consume_u else {}),
     )
+    if consume_u:
+        # u is now owned by v_new; w has no consumer after the h kernel and
+        # is not returned in this inference-only SUPPRESS_LEVEL<3 path.
+        del u, w
     o = chunk_fwd_o(
         q=q,
         k=k,
@@ -101,6 +143,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
+        consume_u: bool = False,
     ):
         q_orig = q
         k_orig = k
@@ -125,6 +168,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            consume_u=consume_u,
         )
         return o.to(q.dtype), h
 
@@ -142,6 +186,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    consume_u: bool = False,
 ):
     r"""
     Args:
@@ -245,6 +290,7 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    consume_u = consume_u and _can_consume_prefill_u(q, k, v, g, beta, initial_state)
     o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -256,6 +302,7 @@ def chunk_gated_delta_rule(
         initial_state_indices,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        consume_u,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
