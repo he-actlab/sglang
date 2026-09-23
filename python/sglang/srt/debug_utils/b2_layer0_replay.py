@@ -16,6 +16,7 @@ SELECTED_SHA = "48fe8385fbb26aa35fed4cf0902b6f33b16167897c1429856172274e70ebf8b9
 SHARD = "model-00001-of-00004.safetensors"
 CHECKPOINT_HASHES = {
     "config.json": "29e4c210b0d6ac178b16b2a255a568bdb23b581e50ca1ef6a6d071dd85704e6e",
+    "generation_config.json": "189fb0c0d7fd8a527db217c0a60a0e013f0394cd8800f9697a666a9e75e5f7fd",
     "model.safetensors.index.json": "146776fce3f6db1103aa6f249e65ee5544c5923ce6f971b092eee79aa6e5d37b",
     SHARD: "2b1879f356aed350030bb40eb45ad362c89d9891096f79a3ab323d3ba5607668",
 }
@@ -223,25 +224,41 @@ def native_chain(embedding, norm, attention, member, capture=True):
             hook.remove()
 
 
+def native_attention_config(config):
+    # Same selection as LlamaDecoderLayer.__init__; no effective-value guesses.
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is not None:
+        rope_theta = rope_parameters.get("rope_theta", 10000)
+        rope_scaling = rope_parameters
+    else:
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
+        rope_scaling["original_max_position_embeddings"] = config.original_max_position_embeddings
+    return dict(
+        rope_theta=rope_theta, rope_scaling=rope_scaling,
+        rope_is_neox_style=getattr(config, "rope_is_neox_style", True),
+        max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
+        bias=getattr(config, "attention_bias", False) or getattr(config, "bias", False),
+    )
+
+
 def build_native(snapshot):
     from safetensors import safe_open
-    from transformers import LlamaConfig
     from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
     from sglang.srt.model_loader.utils import set_default_torch_dtype
     from sglang.srt.model_loader.weight_utils import default_weight_loader
     from sglang.srt.models.llama import LlamaAttention
+    from sglang.srt.server_args import get_global_server_args
 
-    config = LlamaConfig.from_pretrained(snapshot, local_files_only=True)
+    config = get_global_server_args().get_model_config().hf_config
     with set_default_torch_dtype(torch.bfloat16), torch.device("cuda"):
         embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         attention = LlamaAttention(
             config, config.hidden_size, config.num_attention_heads, config.num_key_value_heads,
-            layer_id=0, start_layer=0, rope_theta=config.rope_theta,
-            rope_scaling=config.rope_scaling,
-            max_position_embeddings=config.max_position_embeddings,
-            rope_is_neox_style=True, bias=False,
+            layer_id=0, start_layer=0, **native_attention_config(config),
         )
     with safe_open(Path(snapshot) / SHARD, framework="pt", device="cpu") as weights:
         embedding.weight.weight_loader(embedding.weight, weights.get_tensor("model.embed_tokens.weight"))
@@ -269,7 +286,7 @@ def run(plan, members, output):
     free, total = torch.cuda.mem_get_info()
     if free < DEVICE_ADMISSION:
         raise ValueError("component requires 2 GiB physically free before initialization")
-    args = ServerArgs(model_path=REPO, revision=PIN, dtype="bfloat16",
+    args = ServerArgs(model_path=plan["snapshot"], revision=PIN, dtype="bfloat16",
                       disable_radix_cache=True, enable_deterministic_inference=False)
     if args.enable_tf32_matmul:
         raise ValueError("unexpected native TF32 override")

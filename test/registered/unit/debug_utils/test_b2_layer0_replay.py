@@ -158,6 +158,99 @@ def test_bitwise_comparison_is_not_tolerance():
     with pytest.raises(ValueError): replay.comparison(a,b)
 
 
+def test_local_native_config_equivalence_without_hub_or_token_calls(tmp_path,monkeypatch):
+    import huggingface_hub.utils._auth as auth
+    import transformers.utils.hub as hub
+    from transformers import LlamaConfig
+    from sglang.srt.server_args import ServerArgs
+
+    def forbidden(*args,**kwargs):
+        raise AssertionError("local component must not access HF Hub or tokens")
+
+    monkeypatch.setattr(hub,"hf_hub_download",forbidden)
+    monkeypatch.setattr(auth,"_get_token_from_file",forbidden)
+    monkeypatch.setattr(auth,"get_token",forbidden)
+    config=LlamaConfig(
+        architectures=["LlamaForCausalLM"],hidden_size=4096,intermediate_size=14336,
+        num_hidden_layers=32,num_attention_heads=32,num_key_value_heads=8,
+        vocab_size=128256,rms_norm_eps=1e-5,rope_theta=500000.0,
+        max_position_embeddings=131072,torch_dtype="bfloat16",
+        rope_scaling=dict(factor=8.0,low_freq_factor=1.0,high_freq_factor=4.0,
+                          original_max_position_embeddings=8192,rope_type="llama3"),
+    )
+    config.save_pretrained(tmp_path)
+    (tmp_path/"generation_config.json").write_text(json.dumps(dict(bos_token_id=128000,eos_token_id=[128001,128008,128009])))
+    # Config-only CPU gate; it does not assert CUDA launch defaults or run math.
+    args=ServerArgs(model_path=str(tmp_path),revision=replay.PIN,dtype="bfloat16",device="cpu",
+                    disable_radix_cache=True,enable_deterministic_inference=False)
+    native=args.get_model_config()
+    direct=LlamaConfig.from_pretrained(tmp_path,local_files_only=True)
+    for field in ("architectures","hidden_size","intermediate_size","num_hidden_layers",
+                  "num_attention_heads","num_key_value_heads","vocab_size","rms_norm_eps",
+                  "max_position_embeddings"):
+        assert getattr(native.hf_config,field)==getattr(direct,field)==getattr(config,field)
+    # Native normalization is deliberately observed, not discarded for equality.
+    assert "type" not in direct.rope_parameters
+    assert native.hf_config.rope_parameters==dict(direct.rope_parameters,type="llama3")
+    assert native.dtype==torch.bfloat16 and native.quantization is None
+    assert native.hf_generation_config.eos_token_id==[128001,128008,128009]
+    assert args.revision==replay.PIN and args.model_path==str(tmp_path)
+    assert args.disable_radix_cache and not args.enable_deterministic_inference
+
+
+def test_component_local_path_call_and_generation_hash_are_bound():
+    import ast
+    tree=ast.parse(PATH.read_text())
+    calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=="ServerArgs"]
+    assert len(calls)==1
+    model_path=next(k.value for k in calls[0].keywords if k.arg=="model_path")
+    assert ast.dump(model_path)==ast.dump(ast.parse('plan["snapshot"]',mode="eval").body)
+    build=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=="build_native")
+    config=next(n.value for n in build.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="config" for t in n.targets))
+    assert ast.dump(config)==ast.dump(ast.parse('get_global_server_args().get_model_config().hf_config',mode="eval").body)
+    assert replay.CHECKPOINT_HASHES["generation_config.json"]=="189fb0c0d7fd8a527db217c0a60a0e013f0394cd8800f9697a666a9e75e5f7fd"
+
+
+def test_wrong_generation_config_hash_rejected_before_weight_headers(tmp_path,monkeypatch):
+    def file_sha(path):
+        return "wrong" if Path(path).name=="generation_config.json" else replay.CHECKPOINT_HASHES[Path(path).name]
+    monkeypatch.setattr(replay,"sha",file_sha)
+    with pytest.raises(ValueError,match="generation_config.json"):
+        replay.checkpoint_headers(tmp_path/"snapshots"/replay.PIN)
+
+
+@pytest.mark.parametrize("source",["pinned_local","legacy_fields"])
+def test_native_decoder_attention_configuration_parity(source,monkeypatch):
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.models import llama
+
+    if source=="pinned_local":
+        # Required local config only (not weights). Missing cache fails closed.
+        path=Path("/hf-cache/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots")/replay.PIN
+        assert replay.sha(path/"config.json")==replay.CHECKPOINT_HASHES["config.json"]
+        assert replay.sha(path/"generation_config.json")==replay.CHECKPOINT_HASHES["generation_config.json"]
+        config=ModelConfig(model_path=str(path),revision=replay.PIN,dtype="bfloat16").hf_config
+        assert not hasattr(config,"rope_theta")
+        assert config.rope_parameters["type"]==config.rope_parameters["rope_type"]=="llama3"
+    else:
+        config=SimpleNamespace(hidden_size=128,num_attention_heads=4,num_key_value_heads=2,
+                               intermediate_size=256,hidden_act="silu",rms_norm_eps=1e-5,
+                               rope_theta=12345,rope_scaling={"rope_type":"linear","factor":2},
+                               original_max_position_embeddings=512,max_position_embeddings=1024,
+                               rope_is_neox_style=False,attention_bias=True)
+    recorded={}
+    def constructor(**kwargs):
+        recorded.update(kwargs)
+        return torch.nn.Identity()
+    monkeypatch.setattr(llama,"LlamaAttention",constructor)
+    monkeypatch.setattr(llama,"LlamaMLP",lambda **kwargs:torch.nn.Identity())
+    monkeypatch.setattr(llama,"RMSNorm",lambda *args,**kwargs:torch.nn.Identity())
+    llama.LlamaDecoderLayer(copy.deepcopy(config),layer_id=0)
+    actual=replay.native_attention_config(copy.deepcopy(config))
+    assert actual=={key:recorded[key] for key in actual}
+    assert recorded["layer_id"]==recorded["start_layer"]==0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(),reason="root-owned reserved GPU required")
 def test_cuda_component_native_modules_hook_no_feedback(tmp_path):
     from transformers import LlamaConfig
