@@ -15,6 +15,7 @@ from sglang.srt.debug_utils import b2_layer0_invariant as arm
     ("input_output_dtype", "float16"), ("accumulator_dtype", "bfloat16"),
     ("cpu_live_snapshot_limit_bytes", 64 << 20), ("global_invariant_mode", True),
     ("performance_eligible", True), ("k", 4096.0),
+    ("model_ownership_gate", False),
 ])
 def test_changed_arm_contract_fails_before_source_or_weights(tmp_path, key, bad):
     contract = dict(arm.CONTRACT, **{key: bad})
@@ -152,7 +153,16 @@ def test_control_first_failure_retention_and_no_baseline_substitution(tmp_path, 
     events = []
     members = [dict(ids=[0] * rows) for rows in (43, 237)]
     control = tmp_path / "saved.pt"; control.write_bytes(b"fixture")
-    monkeypatch.setattr(arm.native, "build_native", lambda _: (None, None, None))
+    def build(_):
+        embedding, norm, attention = (torch.nn.Module() for _ in range(3))
+        embedding.register_parameter("weight", torch.nn.Parameter(torch.zeros(1)))
+        norm.register_parameter("weight", torch.nn.Parameter(torch.zeros(1)))
+        attention.qkv_proj = torch.nn.Linear(1, 1, bias=False)
+        attention.o_proj = torch.nn.Linear(1, 1, bias=False)
+        return embedding, norm, attention
+    monkeypatch.setattr(arm.native, "build_native", build)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (2 << 30, 4 << 30))
     @contextmanager
     def qkv(attention, records):
         events.append("enter_qkv")

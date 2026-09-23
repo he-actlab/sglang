@@ -1,9 +1,11 @@
 """Isolated layer0 QKV reduction diagnostic; never installed in serving."""
 import argparse
 from contextlib import contextmanager
+import gc
 import json
 from pathlib import Path
 from unittest.mock import patch
+import weakref
 
 import torch
 
@@ -20,7 +22,8 @@ CONTROL_HASHES = {
 CONTRACT = dict(arm="existing_triton_qkv_only", shapes_m=[43, 237], k=4096, n=6144,
                 input_output_dtype="bfloat16", accumulator_dtype="float32",
                 cpu_live_snapshot_limit_bytes=32 << 20,
-                global_invariant_mode=False, performance_eligible=False)
+                global_invariant_mode=False, performance_eligible=False,
+                model_ownership_gate=True)
 
 
 def validate_plan(path):
@@ -137,6 +140,60 @@ def compare_saved(observed_path, control_path):
                 cpu_live_snapshot_bytes=payload)
 
 
+class ModelOwnership:
+    """Observe owners without retaining them or globally cached rotary buffers."""
+
+    def __init__(self):
+        self.refs = {}
+
+    def observe(self, owners):
+        if self.refs or len(owners) != 3 or any(not isinstance(x, torch.nn.Module) for x in owners):
+            raise ValueError("exactly one native model owner set required")
+        for name, owner in zip(("embedding", "norm", "attention"), owners):
+            self.refs[name] = weakref.ref(owner)
+            self.refs.update({f"{name}.{key}": weakref.ref(value) for key, value in owner.named_parameters()})
+        if set(self.refs) != {"embedding", "norm", "attention", "embedding.weight", "norm.weight",
+                             "attention.qkv_proj.weight", "attention.o_proj.weight"}:
+            raise ValueError("native component owner/parameter layout mismatch")
+
+    def collect(self, report):
+        if not self.refs:
+            raise ValueError("native model owners were not observed")
+        report["allocated_before_python_gc"] = torch.cuda.memory_allocated()
+        report["python_collected_objects"] = gc.collect()
+        report["allocated_after_python_gc"] = torch.cuda.memory_allocated()
+        report["live_owner_or_parameter_names"] = [name for name, ref in self.refs.items() if ref() is not None]
+        report["observed_names"] = list(self.refs)
+        free, total = torch.cuda.mem_get_info()
+        report.update(physical_free_after_release=free, physical_total=total,
+                      physical_headroom_passed=free >= native.DEVICE_HEADROOM)
+        report["status"] = "MODEL_OWNERS_RELEASED" if not report["live_owner_or_parameter_names"] else "MODEL_OWNERS_RETAINED"
+        if report["live_owner_or_parameter_names"]:
+            raise ValueError("native model owners/parameters retained after scoped restoration and GC")
+        if not report["physical_headroom_passed"]:
+            raise ValueError("component post-release physical headroom gate failed")
+
+
+def run_owned(plan, members, path, ownership, records=None):
+    from contextlib import ExitStack
+
+    tracker = ModelOwnership()
+    ownership["status"] = "NOT_CHECKED_RUN_OR_RESTORATION_INCOMPLETE"
+    original_build = native.build_native
+    with ExitStack() as stack:
+        def build(snapshot):
+            owners = original_build(snapshot)
+            tracker.observe(owners)
+            if records is not None:
+                stack.enter_context(qkv_arm(owners[2], records))
+            return owners
+        stack.enter_context(patch.object(native, "build_native", build))
+        native.run(plan, members, path)
+    # The native run's locals and candidate patch contexts are now out of scope.
+    # Cyclic loaders are Python owners, not allocator cache; never empty_cache.
+    tracker.collect(ownership)
+
+
 def run(plan, members, control, output):
     native_path = output.with_name(output.stem + ".native.json")
     candidate_path = output.with_name(output.stem + ".candidate.json")
@@ -147,26 +204,20 @@ def run(plan, members, control, output):
     report = dict(status="INCOMPLETE", runtime_revision=plan["runtime_revision"],
                   reduction_changed=True, serving_gate_passed=False, performance_eligible=False,
                   native_control_tensors_sha256=native.sha(control), dispatch=records,
-                  limitations=plan["limitations"])
+                  limitations=plan["limitations"], model_ownership={})
     try:
         # The original run owns config/loading, physical gates, observations and
         # finally teardown. A complete fresh native control always runs first.
         report["phase"] = "native"
-        native.run(plan, members, native_path)
+        report["model_ownership"]["native"] = {}
+        run_owned(plan, members, native_path, report["model_ownership"]["native"])
         check = compare_saved(native_path.with_suffix(".pt"), control)
         report["native"] = check
         if not check["all_stages_match_native"] or not check["repeat_order"]["same_cohort_bitwise_repeatable"]:
             raise ValueError("fresh native reproduction failed; candidate not run")
         report["phase"] = "candidate"
-        original_build = native.build_native
-        from contextlib import ExitStack
-        with ExitStack() as stack:
-            def build(snapshot):
-                embedding, norm, attention = original_build(snapshot)
-                stack.enter_context(qkv_arm(attention, records))
-                return embedding, norm, attention
-            stack.enter_context(patch.object(native, "build_native", build))
-            native.run(plan, members, candidate_path)
+        report["model_ownership"]["candidate"] = {}
+        run_owned(plan, members, candidate_path, report["model_ownership"]["candidate"], records)
         check = compare_saved(candidate_path.with_suffix(".pt"), control)
         report["candidate"] = check
         if [r["m"] for r in records] != [len(members[i]["ids"]) for i in native.ORDER_SCHEDULE]:
