@@ -16,8 +16,14 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPoolStateView, MambaPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -521,6 +527,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 layer.head_v_dim,
             )
+            if (
+                not is_target_verify
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and not get_is_capture_mode()
+                and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+            ):
+                # The contiguous Q/K/V outputs no longer alias this conv
+                # result. Release it before the eager FLA workspace grows.
+                del mixed_qkv
         else:
             query, key, value = torch.split(
                 mixed_qkv,

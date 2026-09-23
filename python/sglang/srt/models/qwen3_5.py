@@ -531,6 +531,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_k_dim,
                 self.head_v_dim,
             )
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and not get_is_capture_mode()
+                and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+            ):
+                # The fused split owns fresh outputs. Eager prefill can reuse
+                # these dead projection buffers on its current stream.
+                # Keep capture/warmup and the view-based fallback unchanged.
+                del projected_states_qkvz, projected_states_ba
         elif _is_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
                 torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
