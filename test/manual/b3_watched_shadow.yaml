@@ -1,0 +1,60 @@
+# Correctness-only opt-in. Frozen native K6, live 2x32, graph64, BF16/FP32.
+# No tensor dumps, timing/profiling, serving parity or all-64 numerical claim.
+patches:
+  - target: sglang.srt.debug_utils.dumper._Dumper.apply_source_patches
+    edits:
+      - match: config_path = self._config.source_patcher_config
+        replacement: return
+  - target: sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import initialize
+    edits:
+      - match: self.eager_runner = EagerRunner(self)
+        prepend: initialize(self)
+  - target: sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend.forward_extend
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import capture, output
+    edits:
+      - match: core_attn_out = self.kernel_dispatcher.target_verify(
+        prepend: capture(self, layer, query, key, value, a, b, ssm_states, cache_indices, query_start_loc, retrieve_parent_token, forward_batch)
+      - match: return core_attn_out
+        prepend: |
+          if is_target_verify:
+              output(self, layer.layer_id, core_attn_out)
+  - target: sglang.srt.layers.attention.hybrid_linear_attn_backend.HybridLinearAttnBackend.update_mamba_state_after_mtp_verify
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import check
+    edits:
+      - match: "# Track indices used for tracking mamba states for prefix cache"
+        prepend: check(self.linear_attn_backend, last_correct_step_indices, mamba_track_indices, mamba_steps_to_track)
+  - target: sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import begin_target, selection
+    edits:
+      - match: fwd_stream = torch.get_device_module(self.device).current_stream()
+        prepend: begin_target(self, batch)
+      - match: new_seq_lens = batch.seq_lens + accept_lens
+        prepend: selection(self, batch, verify_input, predict, accept_lens, accept_index)
+  - target: sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.forward_batch_generation
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import attach_result
+    edits:
+      - match: batch_output = self.verify(batch)
+        append: attach_result(batch, batch_output)
+  - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker._draft_extend_for_decode_impl
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import begin_draft, draft_feed
+    edits:
+      - match: "# Batch 2: Draft extend"
+        prepend: begin_draft(self, batch, batch_result)
+      - match: maybe_detect_nan(
+        prepend: draft_feed(self, batch, forward_batch, batch_result, can_cuda_graph)
+  - target: sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2._complete_paired_mamba_publication
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import publish
+    edits:
+      - match: result.standalone_mamba_ready_event.record(stream)
+        prepend: publish(result)
+  - target: sglang.srt.managers.utils.GenerationBatchResult.wait_for_standalone_mamba_state
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import drain
+    edits:
+      - match: self.standalone_mamba_ready_event.synchronize()
+        append: drain(self)
+  - target: sglang.srt.managers.scheduler.Scheduler.get_internal_state
+    preamble: from sglang.srt.debug_utils.b3_watched_shadow import snapshot
+    edits:
+      - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        append: ret["b3_watched_shadow"] = snapshot()
