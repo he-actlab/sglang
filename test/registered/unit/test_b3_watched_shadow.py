@@ -380,10 +380,13 @@ def test_device_metadata_selection_and_shifted_feed_no_cpu_readback(monkeypatch)
     )
     bonus = predicted.gather(1, (accepted - 1)[:, None]).flatten()
     result = NS(
+        can_run_cuda_graph=True,
         accept_lens=accepted,
         next_token_ids=predicted.flatten(),
         next_draft_input=NS(bonus_tokens=bonus),
     )
+    fixture.attach_result(batch, result)
+    assert result._b3_watched_ticket is t
     fixture.begin_draft(None, batch, result)
     source = NS(
         req_pool_indices=t.req_rows,
@@ -410,6 +413,34 @@ def test_device_metadata_selection_and_shifted_feed_no_cpu_readback(monkeypatch)
     assert t.meta[5] == 1
 
 
+@pytest.mark.parametrize("value", [False, None, 1])
+def test_target_result_rejects_eager_or_missing_native_graph_flag(value):
+    batch = NS(forward_mode=NS(is_idle=lambda: False), _b3_watched_ticket=object())
+    result = NS(can_run_cuda_graph=value) if value is not None else NS()
+    with pytest.raises(
+        AssertionError, match="target result requires actual CUDA graph replay"
+    ):
+        fixture.attach_result(batch, result)
+    assert not hasattr(result, "_b3_watched_ticket")
+
+
+@pytest.mark.parametrize("value", [False, None, 1])
+def test_draft_feed_rejects_eager_or_missing_native_graph_flag(value):
+    batch = NS(forward_mode=NS(is_idle=lambda: False))
+    with pytest.raises(
+        AssertionError, match="draft extend requires actual CUDA graph replay"
+    ):
+        fixture.draft_feed(None, batch, None, None, value)
+
+
+def test_idle_batch_has_no_watched_replay_requirement():
+    batch = NS(forward_mode=NS(is_idle=lambda: True))
+    result = NS()
+    fixture.attach_result(batch, result)
+    fixture.draft_feed(None, batch, None, result, False)
+    assert not hasattr(result, "_b3_watched_ticket")
+
+
 def cpu_pair_for_drain():
     pair = fixture.PairedWatch.__new__(fixture.PairedWatch)
     pair.ledger, pair.inflight = fixture.OwnershipLedger(), {}
@@ -419,6 +450,7 @@ def cpu_pair_for_drain():
         pairs=0,
         mismatches=0,
         slot_pairs=[0, 0],
+        slot_max_batch=[0, 0],
         watched_rows=[],
         watched_state_rows=[],
         generations=[],
@@ -463,11 +495,39 @@ def test_result_mailboxes_remain_owned_across_newer_epoch_and_recycled_row():
     pair.drain(NS(_b3_watched_ticket=recycled))
     assert pair.stats["pairs"] == 4
     assert pair.stats["slot_pairs"] == [3, 1]
+    assert pair.stats["slot_max_batch"] == [1, 1]
     assert pair.stats["slot_watched_rows"] == [[33], [64]]
     assert pair.stats["continuity_pairs"] == pair.stats["recycled_watched_rows"] == 1
     assert pair.stats["verified_layer_forwards"] == {"target": 192, "draft": 96}
     assert not pair.inflight
     assert len(set(pair.free_mailboxes)) == 4
+
+
+def test_full_batch_coverage_uses_drained_result_slot_not_current_ticket():
+    pair = cpu_pair_for_drain()
+    slot0 = ready_ticket(pair, 0, [NS(req_pool_idx=i) for i in range(1, 33)])
+    slot1 = ready_ticket(pair, 1, [NS(req_pool_idx=64)])
+    newer0 = ready_ticket(pair, 0, [NS(req_pool_idx=33)])
+    pair.drain(NS(_b3_watched_ticket=slot1))
+    assert pair.stats["slot_max_batch"] == [0, 1]
+    pair.drain(NS(_b3_watched_ticket=newer0))
+    assert pair.stats["slot_max_batch"] == [1, 1]
+    pair.drain(NS(_b3_watched_ticket=slot0))
+    assert pair.stats["slot_max_batch"] == [32, 1]
+    # Full slot0 cannot establish full slot1 coverage.
+    assert pair.stats["slot_max_batch"] != [32, 32]
+    full1 = ready_ticket(pair, 1, [NS(req_pool_idx=i) for i in range(33, 65)])
+    pair.drain(NS(_b3_watched_ticket=full1))
+    assert pair.stats["slot_max_batch"] == [32, 32]
+
+
+def test_failed_result_does_not_publish_batch_coverage():
+    pair = cpu_pair_for_drain()
+    ticket = ready_ticket(pair, 1, [NS(req_pool_idx=i) for i in range(33, 65)])
+    ticket.readback[5] = 1
+    with pytest.raises(AssertionError, match="sampled recurrent/ownership"):
+        pair.drain(NS(_b3_watched_ticket=ticket))
+    assert pair.stats["slot_max_batch"] == [0, 0]
 
 
 @pytest.mark.parametrize("broken", ["flag", "coverage", "unpublished"])
