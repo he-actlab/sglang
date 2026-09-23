@@ -9,6 +9,7 @@ from sglang.srt.debug_utils.b4_carried_state_diagnostic import (
     TRANSIENT_ALLOWANCE,
     Layout,
     OwnershipLedger,
+    CarriedBuffers,
     accepted_conv_window,
     graph_copy_rows,
 )
@@ -173,3 +174,123 @@ def test_conv_reference_uses_raw_inputs_not_predictions_or_rejected_suffix(accep
 def test_conv_reference_rejects_precision_and_shape_substitution():
     with pytest.raises(RuntimeError):
         accepted_conv_window(torch.zeros(1,2,3), torch.zeros(1,2,5), torch.ones(1, dtype=torch.int64))
+
+
+def tiny_engine(n=32):
+    layout = Layout(layers=2, heads=1, value_heads=1, dim=2, conv_channels=4)
+    engine = CarriedBuffers(torch.device("cpu"), {0:0,1:1}, layout)
+    temporal = torch.arange(2*65*4,dtype=torch.float32).reshape(2,65,1,2,2)
+    conv = torch.arange(2*65*4*3,dtype=torch.bfloat16).reshape(2,65,4,3)
+    reqs = [[Request(f"{slot}-{r}") for r in range(n)] for slot in range(2)]
+    return engine, OwnershipLedger(64), temporal, conv, reqs
+
+
+def enter(engine, ledger, temporal, conv, requests, slot, length=149, root=7):
+    n = len(requests)
+    ticket = prepare(ledger, requests, slot, lengths=[length]*n)
+    indices = torch.tensor([r.pool_row for r in ticket.members],dtype=torch.int64)
+    inputs = torch.full((n,5),root,dtype=torch.int64)
+    positions = torch.arange(length,length+5).expand(n,-1)
+    engine.entry(ticket,temporal,conv,indices,inputs,positions,torch.full((n,),length),indices)
+    return ticket
+
+
+def captured(engine, ticket, omit_raw=False):
+    s = engine.layout
+    raw = torch.arange(64*s.conv_channels*5,dtype=torch.bfloat16).reshape(64,s.conv_channels,5)
+    q = torch.ones((1,64*5,s.heads,s.dim),dtype=torch.bfloat16)
+    v = torch.ones((1,64*5,s.value_heads,s.dim),dtype=torch.bfloat16)
+    ab = torch.ones((1,64*5,s.value_heads),dtype=torch.bfloat16)
+    for layer in range(s.layers):
+        if not omit_raw:
+            engine.capture_raw(layer,raw)
+        engine.capture_operands(SimpleNamespace(layer_id=layer,A_log=torch.zeros(1),dt_bias=torch.zeros(1)),q,q,v,ab,ab,None)
+        engine.capture_output(layer,v)
+    return raw
+
+
+def cpu_dense_fixture(**kw):
+    # A deterministic test double for ownership/coverage only, not evidence of
+    # native GDN arithmetic. The CUDA component gate must use the native kernel.
+    base = kw["initial_state_source"]
+    for step in range(5):
+        kw["intermediate_states_buffer"][:,step].copy_(base + step + 1)
+    return kw["v"].clone()
+
+
+def advance(engine, ticket, temporal, conv, accepted=2, corrupt=False):
+    n, s = len(ticket.members), engine.layout
+    lens = torch.full((n,),accepted,dtype=torch.int64)
+    index = torch.arange(n*5).reshape(n,5)
+    engine.select(ticket,torch.full((n*5,),9),lens,index)
+    for layer in range(s.layers):
+        for row, m in enumerate(ticket.members):
+            temporal[layer,m.pool_row].add_(accepted)
+            conv[layer,m.pool_row].copy_(accepted_conv_window(
+                conv[layer,m.pool_row:m.pool_row+1],engine.buffers["raw"][ticket.slot,layer,row:row+1],lens[row:row+1])[0])
+    if corrupt:
+        temporal[0,ticket.members[0].pool_row].add_(1)
+    engine.commit(ticket,temporal,conv,ticket.indices,lens-1,dense_update=cpu_dense_fixture)
+
+
+def test_full32_two_slots_graph64_copies_and_independent_continuity():
+    engine, ledger, temporal, conv, reqs = tiny_engine()
+    for slot in range(2):
+        ticket = enter(engine,ledger,temporal,conv,reqs[slot],slot)
+        captured(engine,ticket)
+        advance(engine,ticket,temporal,conv)
+        assert not ticket.flags.any()
+        publish(ledger,ticket)
+    for slot in range(2):
+        ticket = enter(engine,ledger,temporal,conv,reqs[slot],slot,length=151,root=9)
+        captured(engine,ticket)
+        advance(engine,ticket,temporal,conv)
+        assert not ticket.flags.any()
+        publish(ledger,ticket)
+    ledger.require_complete()
+
+
+@pytest.mark.parametrize("corrupt", ["recurrent", "conv", "root", "length"])
+def test_second_entry_corruption_cannot_reseed_reference(corrupt):
+    engine, ledger, temporal, conv, reqs = tiny_engine(n=1)
+    first = enter(engine,ledger,temporal,conv,reqs[0],0)
+    captured(engine,first)
+    advance(engine,first,temporal,conv)
+    publish(ledger,first)
+    prior = engine.buffers["carry"].clone()
+    prior_conv = engine.buffers["conv_carry"].clone()
+    if corrupt == "recurrent":
+        temporal[0,1].add_(1)
+    if corrupt == "conv":
+        conv[0,1].add_(100)
+    second = enter(engine,ledger,temporal,conv,reqs[0],0,
+                   length=152 if corrupt == "length" else 151,root=8 if corrupt == "root" else 9)
+    assert second.flags.any()
+    assert torch.equal(prior.view(torch.uint8),engine.buffers["carry"].view(torch.uint8))
+    assert torch.equal(prior_conv.view(torch.uint8),engine.buffers["conv_carry"].view(torch.uint8))
+
+
+@pytest.mark.parametrize("case", ["missing_raw", "missing_output", "bad_accept", "commit_corruption"])
+def test_capture_and_commit_flags_are_sticky(case):
+    engine, ledger, temporal, conv, reqs = tiny_engine(n=1)
+    ticket = enter(engine,ledger,temporal,conv,reqs[0],0)
+    captured(engine,ticket,omit_raw=case == "missing_raw")
+    if case == "missing_output":
+        engine.buffers["capture_epochs"][0,1,1].zero_()
+    if case == "bad_accept":
+        engine.select(ticket,torch.full((5,),9),torch.tensor([0]),torch.arange(5).reshape(1,5))
+        assert ticket.flags[:,:,7].all()  # Saved BEFORE diagnostic clamp.
+        return
+    advance(engine,ticket,temporal,conv,corrupt=case == "commit_corruption")
+    assert ticket.flags.any()
+
+
+def test_capture_snapshots_are_owned_and_never_feed_inputs():
+    engine, ledger, temporal, conv, reqs = tiny_engine(n=1)
+    ticket = enter(engine,ledger,temporal,conv,reqs[0],0)
+    raw = captured(engine,ticket)
+    before = engine.buffers["raw"][0,:,0].clone()
+    raw.zero_()
+    assert torch.equal(before,engine.buffers["raw"][0,:,0])
+    engine.buffers["raw"][0,:,0].fill_(123)
+    assert not raw.any()
