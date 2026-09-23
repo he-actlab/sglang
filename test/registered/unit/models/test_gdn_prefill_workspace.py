@@ -568,7 +568,7 @@ def test_cuda_component_rewrite_reseed_padding_rejection_and_recycled_slots(
             if role == "draft"
             else ForwardMode.TARGET_VERIFY
         ),
-        spec_info=NS(num_tokens_per_req=7),
+        spec_info=NS(num_tokens_per_req=7, draft_token_num=7),
     )
     poison_pool = pools[1].mamba_pool
     if role == "draft":
