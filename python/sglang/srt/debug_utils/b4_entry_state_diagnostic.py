@@ -5,6 +5,7 @@ are observations, not a recovery failure or a numerical-cause attribution.
 No diagnostic value is fed back to the native model or its cache.
 """
 
+import json
 import math
 from dataclasses import dataclass
 
@@ -182,7 +183,19 @@ class EntryObserver:
         if length not in LENGTHS[1:]:
             return
         anchor = LENGTHS.index(length, 1)
-        require(can_graph and len(batch.reqs) == 32, "matched entry requires native batch/graph32")
+        reason = "matched entry requires native batch/graph32"
+        if not (can_graph and len(batch.reqs) == 32):
+            # Failure-only host metadata: no device read, event, or snapshot ID.
+            context = dict(rid=req.rid, idx=idx, anchor=ANCHORS[anchor],
+                           native_seq_len=length, selected_row=row,
+                           native_batch_size=len(batch.reqs),
+                           forward_batch_size=forward.batch_size, can_graph=can_graph,
+                           forward_metadata_ready=forward.forward_metadata_ready,
+                           req_pool_index=req.req_pool_idx,
+                           last_snapshot=self.observer.serial,
+                           pending_count=len(self.observer.pending))
+            reason += "; context=" + json.dumps(context, sort_keys=True)
+        require(can_graph and len(batch.reqs) == 32, reason)
         require(forward.forward_metadata_ready, "entry before native graph plan")
         require(not hasattr(forward, "_b4_entry_selection"), "duplicate entry selection")
         forward._b4_entry_selection = (row, req, idx, anchor)

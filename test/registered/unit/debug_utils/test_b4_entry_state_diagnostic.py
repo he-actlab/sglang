@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -142,6 +143,39 @@ def test_old_entry_declaration_rejected_before_pool_or_gpu_access():
         private_tensor_bytes=274661916,incremental_guard_bytes=512<<20)))
     with pytest.raises(RuntimeError,match="five-anchor declaration"):
         entry.EntryObserver(NS(),observer)
+
+
+@pytest.mark.parametrize("can_graph,native_count", [(False, 32), (True, 31), (False, 31)])
+def test_failed_match_has_cpu_context_and_retains_gate(can_graph, native_count):
+    observer, mapping, _ = fake_observer()
+    request = req(observer, 187)
+    batch, forward, _, _ = graph_case(observer, mapping, request, length=157)
+    if native_count == 31:
+        batch.reqs.pop(0)
+    observer.observer.serial = 675
+    observer.observer.pending = {674, 675}
+    with patch.object(torch.cuda, "synchronize", side_effect=AssertionError("no GPU fence")), \
+         patch.object(torch.Tensor, "cpu", side_effect=AssertionError("no device copy")), \
+         pytest.raises(RuntimeError, match="matched entry requires native batch/graph32") as exc:
+        observer.before_verify(batch, forward, can_graph)
+    context = json.loads(str(exc.value).split("; context=", 1)[1])
+    assert context == dict(rid=request.rid, idx=187, anchor=9, native_seq_len=157,
+                          selected_row=native_count - 1, native_batch_size=native_count,
+                          forward_batch_size=32, can_graph=can_graph,
+                          forward_metadata_ready=True, req_pool_index=23,
+                          last_snapshot=675, pending_count=2)
+    assert not hasattr(forward, "_b4_entry_selection")
+    assert observer.enqueued == observer.published == set()
+    assert observer.observer.serial == 675 and observer.observer.pending == {674, 675}
+
+
+def test_matching_entry_does_not_construct_failure_context():
+    observer, mapping, _ = fake_observer()
+    request = req(observer, 107)
+    batch, forward, _, _ = graph_case(observer, mapping, request, length=157)
+    with patch.object(json, "dumps", side_effect=AssertionError("failure path only")):
+        observer.before_verify(batch, forward, True)
+    assert forward._b4_entry_selection == (31, request, 107, 4)
 
 
 def test_reference_is_immutable_and_comparison_never_writes_native_state():
