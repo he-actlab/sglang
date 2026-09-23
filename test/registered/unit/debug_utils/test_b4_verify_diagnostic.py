@@ -649,7 +649,7 @@ def patched_functions():
 
 
 def test_yaml_matches_all_actual_native_methods_uniquely_and_compiles():
-    assert len(patched_functions()) == 7
+    assert len(patched_functions()) == 8
 
 
 def test_verify_hook_order_and_native_constructor_unchanged():

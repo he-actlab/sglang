@@ -29,8 +29,10 @@ patches:
               )
               capture_prefill(self, batch, forward_batch, batch_result, is_verify)
   - target: sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify
-    preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import capture_verify, attach_result
+    preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import capture_verify, attach_result, prepare_entry
     edits:
+      - match: "# Run target verify batch in the main compute stream (GPU compute)."
+        prepend: prepare_entry(self, batch, verify_forward_batch, can_run_cuda_graph)
       - match: new_seq_lens = batch.seq_lens + accept_lens
         prepend: |
           diagnostic_capture = capture_verify(self, batch, verify_forward_batch, verify_input, logits_output, predict, accept_lens, accept_index, can_run_cuda_graph)
@@ -60,6 +62,11 @@ patches:
               indexer_topk_output=forward_batch_output.indexer_topk_output,
               extra_keep_alive_refs=[verify_forward_batch],
           ), diagnostic_capture)
+  - target: sglang.srt.model_executor.runner.decode_cuda_graph_runner.DecodeCudaGraphRunner.execute
+    preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import capture_graph_entry
+    edits:
+      - match: self.load_batch(forward_batch, pp_proxy_tensors)
+        append: capture_graph_entry(self, forward_batch)
   - target: sglang.srt.managers.scheduler_components.batch_result_processor.SchedulerBatchResultProcessor.process_batch_result_prefill
     preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import publish, discard_finished
     edits:
