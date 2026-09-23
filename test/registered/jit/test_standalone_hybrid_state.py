@@ -19,7 +19,7 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _pools(device="cpu"):
+def _pools(device="cpu", share_draft_compact_scratch=False):
     params = Mamba2CacheParams(
         shape=SimpleNamespace(conv=[(512, 3)], temporal=(2, 128, 128)),
         dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
@@ -53,6 +53,7 @@ def _pools(device="cpu"):
             cache_params=params,
             mamba_layer_ids=[0],
             enable_draft_working_state=True,
+            share_draft_compact_scratch=share_draft_compact_scratch,
         )
     owner.req_index_to_mamba_index_mapping[:5] = torch.tensor(
         [0, 3, 1, 4, 2], dtype=torch.int32, device=device
@@ -283,7 +284,8 @@ def test_worker_commits_only_accepted_shifted_prefix_after_extend():
 
 
 @CUDA
-def test_native_gdn_draft_extend_recovery_and_graph_replay():
+@pytest.mark.parametrize("share_draft_compact_scratch", [False, True])
+def test_native_gdn_draft_extend_recovery_and_graph_replay(share_draft_compact_scratch):
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
     )
@@ -291,7 +293,7 @@ def test_native_gdn_draft_extend_recovery_and_graph_replay():
     from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 
     torch.manual_seed(953)
-    owner, view = _pools("cuda")
+    owner, view = _pools("cuda", share_draft_compact_scratch)
     pools = [owner, view]
     initial = torch.randn_like(owner.mamba_pool.mamba_cache.temporal)
     initial_conv = torch.randn_like(owner.mamba_pool.mamba_cache.conv[0])

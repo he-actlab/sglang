@@ -309,6 +309,22 @@ class ReqToTokenPool:
         self.free_slots = list(range(1, self._alloc_size))
 
 
+def _compact_scratch_view(backing, offset_bytes, shape, dtype):
+    """A bounded typed view; its owner outlives every captured draft graph."""
+    width = dtype.itemsize
+    size_bytes = int(np.prod(shape)) * width
+    if (
+        offset_bytes < 0
+        or offset_bytes % width
+        or offset_bytes + size_bytes > backing.nbytes
+    ):
+        raise ValueError("Compact scratch view exceeds its aligned working storage")
+    raw = backing.view(torch.uint8).flatten()
+    view = raw.narrow(0, offset_bytes, size_bytes).view(dtype).view(shape)
+    view.zero_()
+    return view
+
+
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -369,6 +385,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_gdn_compact_spec_state: bool = False,
+        compact_scratch_backing: Optional[torch.Tensor] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -389,6 +406,55 @@ class MambaPool:
         )
         num_mamba_layers = len(mamba_layer_ids)
 
+        self._compact_scratch_backing = compact_scratch_backing
+        self.shared_compact_scratch_bytes = 0
+        if compact_scratch_backing is not None:
+            expected_device = torch.device(device)
+            if expected_device.type == "cuda" and expected_device.index is None:
+                expected_device = torch.device("cuda", torch.cuda.current_device())
+            backing = compact_scratch_backing
+            if (
+                not enable_gdn_compact_spec_state
+                or enable_memory_saver
+                or not conv_window_dedup_enabled(
+                    _is_npu, _is_cpu, speculative_eagle_topk
+                )
+                or backing.device.type != "cuda"
+                or backing.device != expected_device
+                or backing.dtype != torch.float32
+                or backing.requires_grad
+                or backing._base is not None
+                or not backing.is_contiguous()
+                or backing.storage_offset() != 0
+                or backing.untyped_storage().nbytes() != backing.nbytes
+                or backing.ndim != 5
+                or backing.shape[0] != num_mamba_layers
+                or backing.shape[1] < spec_state_size + 1
+                or tuple(backing.shape[2:]) != tuple(temporal_state_shape)
+                or conv_dtype != torch.bfloat16
+            ):
+                raise ValueError(
+                    "Compact scratch requires owned native CUDA working storage"
+                )
+            # Cache params may describe more layers than this local pool.
+            if (
+                not mamba_layer_ids
+                or len(set(mamba_layer_ids)) != num_mamba_layers
+                or not set(mamba_layer_ids).issubset(cache_params.layers)
+            ):
+                raise ValueError("Shared compact scratch requires known local layers")
+            per_layer, remainder = divmod(
+                cache_params.gdn_compact_spec_state_bytes(speculative_num_draft_tokens),
+                len(cache_params.layers),
+            )
+            if remainder:
+                raise ValueError("Compact scratch layer accounting changed")
+            self._shared_compact_scratch_expected_bytes = (
+                per_layer * num_mamba_layers * (spec_state_size + 1)
+            )
+            if self._shared_compact_scratch_expected_bytes > backing.nbytes:
+                raise ValueError("Compact scratch exceeds working-state capacity")
+
         self.size = size
         self.device = device
         self.spec_state_size = spec_state_size
@@ -403,6 +469,10 @@ class MambaPool:
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+        if compact_scratch_backing is not None and self.enable_custom_mem_pool:
+            raise ValueError(
+                "Shared compact scratch does not support custom memory pools"
+            )
 
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
@@ -523,13 +593,13 @@ class MambaPool:
                         speculative_num_draft_tokens,
                         hv,
                     )
-                    compact_ssm_k = torch.zeros(
+                    compact_ssm_k = self._allocate_compact_scratch(
                         (*factor_shape, k_dim), dtype=torch.float32, device=device
                     )
-                    compact_ssm_d = torch.zeros(
+                    compact_ssm_d = self._allocate_compact_scratch(
                         (*factor_shape, v_dim), dtype=torch.float32, device=device
                     )
-                    compact_ssm_alpha = torch.zeros(
+                    compact_ssm_alpha = self._allocate_compact_scratch(
                         factor_shape, dtype=torch.float32, device=device
                     )
                 else:
@@ -576,7 +646,7 @@ class MambaPool:
                         shared_win = (
                             speculative_num_draft_tokens + win - 1
                         )  # D + (K-1) - 1
-                        phys = torch.zeros(
+                        phys = self._allocate_compact_scratch(
                             size=(
                                 num_mamba_layers,
                                 spec_state_size + 1,
@@ -695,8 +765,33 @@ class MambaPool:
                 mem_usage_bytes += get_tensor_size_bytes(
                     self._intermediate_conv_window_phys
                 )
+            if compact_scratch_backing is not None:
+                if (
+                    self.shared_compact_scratch_bytes
+                    != self._shared_compact_scratch_expected_bytes
+                ):
+                    raise ValueError("Shared compact scratch byte accounting changed")
+                # The working pool owns these bytes. This pool reports only its
+                # own physical storage, not the logical borrowed views twice.
+                mem_usage_bytes -= self.shared_compact_scratch_bytes
+                logger.info(
+                    "Mamba compact scratch borrows %d bytes from draft working state",
+                    self.shared_compact_scratch_bytes,
+                )
             self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
+
+    def _allocate_compact_scratch(self, size, *, dtype, device):
+        if self._compact_scratch_backing is None:
+            return torch.zeros(size=size, dtype=dtype, device=device)
+        value = _compact_scratch_view(
+            self._compact_scratch_backing,
+            self.shared_compact_scratch_bytes,
+            size,
+            dtype,
+        )
+        self.shared_compact_scratch_bytes += value.nbytes
+        return value
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -1231,6 +1326,7 @@ class HybridReqToTokenPoolStateView(HybridReqToTokenPool):
         mamba_layer_ids: List[int],
         start_layer: int = 0,
         enable_draft_working_state: bool = False,
+        share_draft_compact_scratch: bool = False,
     ):
         if not isinstance(index_owner, HybridReqToTokenPool) or isinstance(
             index_owner, HybridReqToTokenPoolStateView
@@ -1264,6 +1360,25 @@ class HybridReqToTokenPoolStateView(HybridReqToTokenPool):
         self.mamba_ckpt_pool = None
 
         owner_state = index_owner.mamba_pool
+        self.draft_working_pool = None
+        self.draft_working_indices = None
+        if share_draft_compact_scratch:
+            if (
+                not enable_draft_working_state
+                or not owner_state.enable_gdn_compact_spec_state
+                or owner_state.envelope_layout
+                or owner_state.enable_linear_replayssm
+                or owner_state.enable_custom_mem_pool
+                or self.enable_memory_saver
+                or not _is_cuda
+                or torch.device(self.device).type != "cuda"
+                or cache_params.dtype.temporal != torch.float32
+                or cache_params.dtype.conv != torch.bfloat16
+            ):
+                raise ValueError(
+                    "Shared compact scratch requires native draft working state"
+                )
+            self._init_draft_working_state(owner_state, cache_params, mamba_layer_ids)
         self.mamba_pool = MambaPool(
             size=owner_state.size,
             spec_state_size=owner_state.spec_state_size,
@@ -1277,27 +1392,37 @@ class HybridReqToTokenPoolStateView(HybridReqToTokenPool):
             linear_replayssm_cache_len=owner_state.linear_replayssm_cache_len,
             envelope_layout=owner_state.envelope_layout,
             enable_gdn_compact_spec_state=owner_state.enable_gdn_compact_spec_state,
+            compact_scratch_backing=(
+                self.draft_working_pool.mamba_cache.temporal
+                if share_draft_compact_scratch
+                else None
+            ),
+        )
+        self.draft_compact_scratch_shared_bytes = (
+            self.mamba_pool.shared_compact_scratch_bytes
         )
 
-        self.draft_working_pool = None
-        self.draft_working_indices = None
-        if enable_draft_working_state:
-            if owner_state.envelope_layout or owner_state.enable_linear_replayssm:
-                raise ValueError("Draft working state requires contiguous native state")
-            # Preserve all admitted request/graph rows, including two-slot capacity.
-            # This is scratch shared only by FIFO draft forwards, never a cache row.
-            capacity = max(index_owner.size, owner_state.spec_state_size)
-            self.draft_working_pool = MambaPool(
-                size=capacity,
-                spec_state_size=0,
-                cache_params=cache_params,
-                mamba_layer_ids=mamba_layer_ids,
-                device=self.device,
-                enable_memory_saver=self.enable_memory_saver,
-            )
-            self.draft_working_indices = torch.arange(
-                1, capacity + 1, dtype=torch.int32, device=self.device
-            )
+        if enable_draft_working_state and not share_draft_compact_scratch:
+            self._init_draft_working_state(owner_state, cache_params, mamba_layer_ids)
+
+    def _init_draft_working_state(self, owner_state, cache_params, mamba_layer_ids):
+        if owner_state.envelope_layout or owner_state.enable_linear_replayssm:
+            raise ValueError("Draft working state requires contiguous native state")
+        # All admitted rows, including graph padding, remain available. Only
+        # draft decode and extend/commit are phase-exclusive on the SMALL FIFO;
+        # committed state and target scratch must never use this backing.
+        capacity = max(self.index_owner.size, owner_state.spec_state_size)
+        self.draft_working_pool = MambaPool(
+            size=capacity,
+            spec_state_size=0,
+            cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
+            device=self.device,
+            enable_memory_saver=self.enable_memory_saver,
+        )
+        self.draft_working_indices = torch.arange(
+            1, capacity + 1, dtype=torch.int32, device=self.device
+        )
 
     def prepare_draft_working_state(self, req_pool_indices: torch.Tensor):
         """Seed speculative work from committed state; safe to capture and replay."""
