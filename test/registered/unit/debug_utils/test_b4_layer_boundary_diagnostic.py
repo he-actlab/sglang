@@ -133,7 +133,7 @@ def fake_observer():
     return observer
 
 
-def selected(observer, idx=107, anchor=3):
+def selected(observer, idx=107, anchor=4):
     req = NS(rid=str(idx))
     forward = NS(_b4_entry_selection=(31, req, idx, anchor), batch_size=32)
     graph = NS(model_runner=observer.runner, bs=32, raw_bs=32)
@@ -145,10 +145,10 @@ def test_selection_only_uses_existing_native_anchor_and_graph_hook():
     req, graph, forward = selected(observer)
     with patch.object(torch.cuda, "current_stream", return_value=NS(cuda_stream=91)), patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
         observer.graph_entry(graph, forward)
-    assert forward._b4_boundary_selection == dict(rid="107", idx=107, anchor=7, row=31, generation=1)
+    assert forward._b4_boundary_selection == dict(rid="107", idx=107, anchor=9, row=31, generation=1)
     assert observer.storage.buffers["control"].tolist() == [1, 1, 31, 1]
     observer.before_verify()
-    _, graph, other = selected(observer, 187, anchor=2)
+    _, graph, other = selected(observer, 187, anchor=3)
     observer.graph_entry(graph, other)
     assert not hasattr(other, "_b4_boundary_selection")
     assert observer.storage.buffers["control"][0] == 0
@@ -160,7 +160,7 @@ def test_graph_selection_guard(change):
     req, graph, forward = selected(observer, 187 if change == "comparison_first" else 107)
     if change == "bucket": graph.bs = 31
     if change == "raw": graph.raw_bs = 31
-    if change == "row": forward._b4_entry_selection = (30, req, 107, 3)
+    if change == "row": forward._b4_entry_selection = (30, req, 107, 4)
     if change == "runner": graph.model_runner = object()
     if change == "stream": observer.stream = 92
     with patch.object(torch.cuda, "current_stream", return_value=NS(cuda_stream=91)), patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
@@ -184,13 +184,13 @@ def test_owned_publication_names_earliest_residual_or_final_boundary(changed_sit
         observer.enqueued.add(idx)
         observer.storage.activate(idx == 107, 31, 1 if idx == 107 else 2)
         taps(observer.storage, values, changed_site=changed)
-        forward = NS(_b4_boundary_selection=dict(rid=req.rid, idx=idx, anchor=7, row=31,
+        forward = NS(_b4_boundary_selection=dict(rid=req.rid, idx=idx, anchor=9, row=31,
                                                  generation=1 if idx == 107 else 2))
         tensors, meta = observer.take(forward)
         assert not hasattr(forward, "_b4_boundary_selection")
-        record = dict(metadata=dict(layer_boundary=meta), start_position=7, repetition=1,
+        record = dict(metadata=dict(layer_boundary=meta), start_position=9, repetition=1,
                       tensors={k: v.tolist() for k, v in tensors.items()}, snapshot=idx,
-                      entry_state=dict(anchor=7, idx=idx, byte_differences=[-1 if idx == 107 else 0] * 80))
+                      entry_state=dict(anchor=9, idx=idx, byte_differences=[-1 if idx == 107 else 0] * 80))
         observer.publish(req, record)
     assert observer.records[187]["first_differing_site"] == changed_site
     assert observer.records[187]["first_differing_boundary"] == expected
@@ -200,10 +200,18 @@ def test_owned_publication_names_earliest_residual_or_final_boundary(changed_sit
 def test_entry_state_difference_cannot_be_called_equal_input_boundary_comparison():
     observer = fake_observer()
     observer.enqueued.update((107, 187))
-    record = dict(metadata=dict(layer_boundary=dict(rid="187", idx=187)), start_position=7,
-                  repetition=1, tensors={}, entry_state=dict(anchor=7, idx=187, byte_differences=[1] * 80))
+    record = dict(metadata=dict(layer_boundary=dict(rid="187", idx=187)), start_position=9,
+                  repetition=1, tensors={}, entry_state=dict(anchor=9, idx=187, byte_differences=[1] * 80))
     with pytest.raises(RuntimeError, match="matched selected entry bytes"):
         observer.publish(NS(rid="187"), record)
+
+
+def test_equal_entry7_cannot_substitute_for_unobserved_entry9():
+    observer = fake_observer();observer.enqueued.update((107,187))
+    record = dict(metadata=dict(layer_boundary=dict(rid="187",idx=187)),start_position=9,
+        repetition=1,tensors={},entry_state=dict(anchor=7,idx=187,byte_differences=[0]*80))
+    with pytest.raises(RuntimeError,match="matched selected entry bytes"):
+        observer.publish(NS(rid="187"),record)
 
 
 def test_runtime_keeps_existing_fork_join_and_patches_only_external_boundaries():

@@ -10,10 +10,10 @@ from dataclasses import dataclass
 
 import torch
 
-ANCHORS = (0, 1, 3, 7)
-LENGTHS = (149, 149, 151, 155)
+ANCHORS = (0, 1, 3, 7, 9)
+LENGTHS = (149, 149, 151, 155, 157)
 GUARD_BYTES = 512 << 20
-PRIVATE_BYTES = 274661916
+PRIVATE_BYTES = 342432964
 ENTRY_METADATA_LIMIT = 16 << 10
 SELECTED = (107, 187)
 
@@ -30,15 +30,15 @@ class Layout:
     conv: tuple = (8192, 3)
     kv_layers: int = 10
     kv_shape: tuple = (2, 256)
-    max_length: int = 155
+    max_length: int = 157
 
     def specs(self):
         state_bytes = math.prod(self.temporal) * 4
         return {
-            "temporal": ((4, self.layers, *self.temporal), torch.float32),
-            "conv": ((4, self.layers, *self.conv), torch.bfloat16),
-            "kv": ((4, self.kv_layers, 2, self.max_length, *self.kv_shape), torch.bfloat16),
-            "differences": ((4, 2 * self.layers + 2 * self.kv_layers), torch.int64),
+            "temporal": ((len(ANCHORS), self.layers, *self.temporal), torch.float32),
+            "conv": ((len(ANCHORS), self.layers, *self.conv), torch.bfloat16),
+            "kv": ((len(ANCHORS), self.kv_layers, 2, self.max_length, *self.kv_shape), torch.bfloat16),
+            "differences": ((len(ANCHORS), 2 * self.layers + 2 * self.kv_layers), torch.int64),
             "temporal_work": ((1, *self.temporal), torch.float32),
             "conv_work": ((1, *self.conv), torch.bfloat16),
             "kv_work": ((self.max_length, *self.kv_shape), torch.bfloat16),
@@ -80,7 +80,7 @@ class EntryBuffers:
         torch.sum(scratch, dim=0, dtype=torch.int64, out=destination)
 
     def capture(self, anchor, reference, state, state_index, kv_pool, full_layers, indices):
-        require(anchor in range(4), "anchor index")
+        require(anchor in range(len(ANCHORS)), "anchor index")
         require((anchor not in self.references) if reference else (anchor in self.references),
                 "duplicate/missing immutable reference")
         s, buf = self.layout, self.buffers
@@ -126,6 +126,9 @@ class EntryBuffers:
 class EntryObserver:
     def __init__(self, runner, observer):
         require(Layout().nbytes() == PRIVATE_BYTES, "declared private byte budget")
+        require(observer.config.get("entry_state") == dict(client=1, indices=list(SELECTED),
+                anchors=list(ANCHORS), private_tensor_bytes=PRIVATE_BYTES,
+                incremental_guard_bytes=GUARD_BYTES), "exact five-anchor declaration")
         self.runner, self.observer = runner, observer
         pool = runner.req_to_token_pool
         state = pool.get_speculative_mamba2_params_all_layers()
@@ -365,7 +368,7 @@ class EntryObserver:
 
     def snapshot(self):
         free, _ = torch.cuda.mem_get_info(self.runner.device)
-        expected = {(idx, anchor) for idx in SELECTED for anchor in range(4)}
+        expected = {(idx, anchor) for idx in SELECTED for anchor in range(len(ANCHORS))}
         return dict(performance_eligible=False, private_tensor_bytes=PRIVATE_BYTES,
                     allocator_increment_bytes=self.allocator_increment,
                     incremental_guard_bytes=GUARD_BYTES, current_device_free_bytes=free,

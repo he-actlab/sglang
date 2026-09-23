@@ -35,7 +35,7 @@ def fake_observer(device="cpu"):
     observer.full_layers = (3,)
     mapping = torch.arange(33, device=device, dtype=torch.int32)
     mapping[23], mapping[27] = 27, 23
-    table = torch.arange(33 * 160, device=device, dtype=torch.int32).reshape(33, 160) + 1
+    table = torch.arange(33 * 164, device=device, dtype=torch.int32).reshape(33, 164) + 1
     observer.pool = NS(req_to_token=table, get_mamba_indices=lambda ids: mapping[ids.long()],
                        get_speculative_mamba2_params_all_layers=lambda: state, mamba_map={0: 0, 1: 1})
     observer.observer = NS(rows={}, request_row=lambda req: None)
@@ -103,8 +103,45 @@ def record(tensors, metadata, snapshot=1):
 
 
 def test_exact_declared_private_bytes():
-    assert entry.Layout().nbytes() == entry.PRIVATE_BYTES == 274661916
+    assert entry.Layout().nbytes() == entry.PRIVATE_BYTES == 342432964
     assert entry.GUARD_BYTES == 512 << 20
+
+
+def test_fifth_anchor_preserves_all_previous_reference_banks():
+    assert entry.ANCHORS == (0, 1, 3, 7, 9)
+    assert entry.LENGTHS == (149, 149, 151, 155, 157)
+    store, state, pool, kv = fixture()
+    owner = torch.tensor([27], dtype=torch.int32)
+    for anchor,length in enumerate(entry.LENGTHS):
+        ids = torch.arange(10,10+length,dtype=torch.int32)
+        assert store.capture(anchor,True,state,owner,pool,[3],ids).eq(-1).all()
+    state.temporal[0,27,0,0,0] += 1
+    for anchor,length in enumerate(entry.LENGTHS):
+        counts = store.capture(anchor,False,state,owner,pool,[3],torch.arange(10,10+length,dtype=torch.int32))
+        assert counts[0] > 0 and counts[1:].eq(0).all()
+
+
+def test_entry9_is_selected_from_native_length_and_cannot_publish_as7():
+    observer,mapping,_ = fake_observer()
+    request,tensors,meta,_,_ = capture(observer,mapping,107,length=157)
+    assert meta["anchor"] == 9 and meta["prefix_length"] == 157
+    out = record(tensors,meta);out["start_position"] = 7
+    observer.publish(request,out)
+    assert "entry sequence does not bind native publication window" in out["problems"]
+
+
+def test_missing_entry9_never_completes_old_eight_record_gate():
+    observer,_,_ = fake_observer()
+    observer.published = observer.enqueued = {(idx,a) for idx in entry.SELECTED for a in range(4)}
+    with patch.object(torch.cuda,"mem_get_info",return_value=(1<<30,2<<30)):
+        assert not observer.snapshot()["anchors_complete"]
+
+
+def test_old_entry_declaration_rejected_before_pool_or_gpu_access():
+    observer = NS(config=dict(entry_state=dict(client=1,indices=[107,187],anchors=[0,1,3,7],
+        private_tensor_bytes=274661916,incremental_guard_bytes=512<<20)))
+    with pytest.raises(RuntimeError,match="five-anchor declaration"):
+        entry.EntryObserver(NS(),observer)
 
 
 def test_reference_is_immutable_and_comparison_never_writes_native_state():

@@ -105,7 +105,7 @@ class BoundaryBuffers:
 
 class LayerObserver:
     def __init__(self, runner, observer):
-        expected = dict(client=1, indices=[107, 187], anchor=7, layers=40, hidden=2048,
+        expected = dict(client=1, indices=[107, 187], anchor=9, layers=40, hidden=2048,
                         steps=5, private_limit_bytes=PRIVATE_LIMIT, incremental_guard_bytes=GUARD)
         require(observer.entry is not None and observer.config.get("layer_boundary") == expected,
                 "exact opt-in requires existing matched entry observation")
@@ -131,7 +131,7 @@ class LayerObserver:
 
     def graph_entry(self, graph, forward):
         selected = getattr(forward, "_b4_entry_selection", None)
-        if selected is None or selected[3] != 3:
+        if selected is None or selected[3] != 4:
             return
         row, req, idx, _ = selected
         require(idx in (107, 187) and idx not in self.enqueued, "duplicate selected anchor")
@@ -144,7 +144,7 @@ class LayerObserver:
         require(stream == self.stream and not torch.cuda.is_current_stream_capturing(),
                 "native producing stream changed")
         self.storage.activate(idx == 107, row, 1 if idx == 107 else 2)
-        forward._b4_boundary_selection = dict(rid=req.rid, idx=idx, anchor=7, row=row,
+        forward._b4_boundary_selection = dict(rid=req.rid, idx=idx, anchor=9, row=row,
                                              generation=1 if idx == 107 else 2)
         self.enqueued.add(idx)
 
@@ -164,10 +164,10 @@ class LayerObserver:
             return
         idx, data = meta["idx"], record["tensors"]
         require(idx in self.enqueued and idx not in self.records, "publication generation")
-        require(record["start_position"] == 7 and record["repetition"] == 1,
+        require(record["start_position"] == 9 and record["repetition"] == 1,
                 "anchor publication identity")
         entry = record.get("entry_state")
-        require(entry is not None and entry["anchor"] == 7 and entry["idx"] == idx
+        require(entry is not None and entry["anchor"] == 9 and entry["idx"] == idx
                 and entry["byte_differences"] == ([-1] * 80 if idx == 107 else [0] * 80),
                 "boundary comparison requires matched selected entry bytes")
         validate_result(data, idx == 107, self.layout)
