@@ -190,7 +190,8 @@ def test_cuda_component_native_modules_hook_no_feedback(tmp_path):
         assert set(observed)=={"embedding","input_norm","raw_qkv","post_rope_k","v"}
         for key in original:
             assert torch.equal(original[key].contiguous().view(torch.uint8),observed[key].contiguous().view(torch.uint8))
-        for t in observed.values(): t.zero_()
+        with torch.inference_mode():
+            for t in observed.values(): t.zero_()
         again=replay.native_chain(embedding,norm,attention,member,capture=False)
         for key in original: assert torch.equal(original[key],again[key])
         assert not embedding._forward_hooks and not norm._forward_hooks and not attention.qkv_proj._forward_hooks
