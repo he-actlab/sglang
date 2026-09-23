@@ -827,10 +827,12 @@ class ModelRunnerKVCacheMixin:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
+                    # MTP/EAGLE drafts use the remapped attention layer 0.
+                    # STANDALONE retains its complete native layer identities.
                     full_attention_layer_ids=(
                         [0]
                         if self.is_draft_worker
+                        and not self.spec_algorithm.is_standalone()
                         else [
                             i
                             for i in config.full_attention_layer_ids
