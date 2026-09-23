@@ -3,7 +3,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -525,9 +524,17 @@ def _gdn_compact_state_commit_kernel(
         delta = tl.load(deltas + factor_offset * V + vv, mask=vv < V, other=0)
         alpha = tl.load(alphas + factor_offset)
         # The original decay is consumed by the delta reduction, so it rounds
-        # before the rank-1 FMA. Explicit mul_rn prevents contracting this decay
-        # into the following update when the reduction is absent in recovery.
-        h = libdevice.mul_rn(h, alpha)
+        # before the rank-1 FMA. Preserve that separate rounding and native
+        # gradual underflow: libdevice.mul_rn honors Triton's reflect-FTZ flag
+        # and emits mul.rn.ftz.f32, unlike the native recurrence's mul.f32.
+        h = tl.inline_asm_elementwise(
+            "mul.rn.f32 $0, $1, $2;",
+            constraints="=f,f,f",
+            args=[h, alpha],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
         h = tl.fma(key[:, None], delta[None, :], h)
         if step == accepted:
             tl.store(state_ptr, h, mask=mask)
