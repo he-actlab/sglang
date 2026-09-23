@@ -181,7 +181,8 @@ def test_native_temporary_storage_contract(failure):
 
 
 @pytest.mark.parametrize(
-    "consume,suppress", [(False, 0), (True, 0), (False, 3), (True, 3)]
+    "consume,suppress",
+    [(False, 0), (True, 0), (False, 2), (True, 2), (False, 3), (True, 3)],
 )
 def test_native_python_lifetimes_and_return_contract(consume, suppress):
     refs = {}
@@ -190,10 +191,15 @@ def test_native_python_lifetimes_and_return_contract(consume, suppress):
         w = torch.ones(4)
         u = torch.ones(4) * 2
         A = torch.ones(4) * 3
-        refs.update(w=StorageWeakRef(w.untyped_storage()), u=weakref.ref(u))
+        refs.update(
+            w=StorageWeakRef(w.untyped_storage()),
+            u=weakref.ref(u),
+            A=StorageWeakRef(A.untyped_storage()),
+        )
         return w, u, A
 
     def h(**kwargs):
+        assert refs["A"].expired() is consume, "retire solved A before allocating h"
         assert not refs["w"].expired()
         return torch.ones(1), (
             kwargs["u"] if kwargs.get("consume_u", False) else kwargs["u"].clone()
@@ -232,6 +238,10 @@ def test_native_python_lifetimes_and_return_contract(consume, suppress):
         assert not refs
     else:
         result = fn(**args)
+        assert (result[2] is None) is consume
+        assert refs["A"].expired() is consume
+        if not consume:
+            assert torch.equal(result[2], torch.ones(4) * 3)
         assert (result[3] is not None) == (suppress >= 3)
         assert torch.equal(result[1], torch.ones(4) * 2)
 
@@ -405,6 +415,21 @@ def test_cuda_component_native_output_state_and_reuse(monkeypatch, heads, captur
         seen.append((weakref.ref(u), StorageWeakRef(w.untyped_storage()), u.data_ptr()))
 
     monkeypatch.setattr(h_impl, "_validate_consumed_u", check)
+    original_intra = impl.chunk_gated_delta_rule_fwd_intra
+    original_h = impl.chunk_gated_delta_rule_fwd_h
+    solved = []
+
+    def checked_intra(**kw):
+        result = original_intra(**kw)
+        solved.append(StorageWeakRef(result[2].untyped_storage()))
+        return result
+
+    def checked_h(**kw):
+        assert solved[-1].expired() is bool(kw.get("consume_u", False))
+        return original_h(**kw)
+
+    monkeypatch.setattr(impl, "chunk_gated_delta_rule_fwd_intra", checked_intra)
+    monkeypatch.setattr(impl, "chunk_gated_delta_rule_fwd_h", checked_h)
     with torch.inference_mode():
         # Warm native kernels without changing reference state.
         impl.chunk_gated_delta_rule(**kwargs, initial_state=initial.clone())

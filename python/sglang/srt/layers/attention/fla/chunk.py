@@ -95,6 +95,10 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
+    if consume_u:
+        # recompute_w_u was A's last consumer. The guarded inference path
+        # does not retain intermediates; retire A before allocating h.
+        A = None
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
