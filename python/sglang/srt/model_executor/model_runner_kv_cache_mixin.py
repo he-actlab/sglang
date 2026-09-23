@@ -162,6 +162,12 @@ class ModelRunnerKVCacheMixin:
 
         per_req = config.mamba2_cache_params.mamba_cache_per_req
         paired_draft = self.__dict__.get("standalone_hybrid_draft_runner")
+        workspace_per_req = 0
+        workspace_alias = getattr(
+            server_args, "enable_gdn_draft_workspace_alias", False
+        )
+        if workspace_alias and paired_draft is None:
+            raise ValueError("Draft workspace alias requires validated joint admission")
         if paired_draft is not None:
             # Both models keep independent committed/track/cache states at the
             # owner's indices. Draft decode additionally needs one working state
@@ -171,13 +177,29 @@ class ModelRunnerKVCacheMixin:
                 raise ValueError("Paired hybrid state requires compact rollback")
             draft_params = paired_draft.mambaish_config.mamba2_cache_params
             per_req += draft_params.mamba_cache_per_req
-            intermediate_per_req += (
-                draft_params.gdn_compact_spec_state_bytes(
-                    server_args.speculative_num_draft_tokens
+            draft_compact_bytes = draft_params.gdn_compact_spec_state_bytes(
+                server_args.speculative_num_draft_tokens
+            )
+            if workspace_alias:
+                workspace_per_req = self.__dict__.get(
+                    "_gdn_draft_workspace_shared_bytes_per_req"
                 )
+                if workspace_per_req != draft_compact_bytes or workspace_per_req <= 0:
+                    raise ValueError(
+                        "Draft workspace alias lacks validated native geometry"
+                    )
+            intermediate_per_req += (
+                draft_compact_bytes
+                - workspace_per_req
                 + draft_params.mamba_cache_per_req
                 + 4  # static int32 working-row index (also reserve dummy row)
             )
+
+        physical_intermediate_per_req = intermediate_per_req
+        # Admission-only reservation: no tensor is allocated for these bytes.
+        # Sum integer bytes before the original floor/division/subtraction so
+        # native KV capacity is exactly the same as the unaliased layout.
+        intermediate_per_req += workspace_per_req
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -270,6 +292,25 @@ class ModelRunnerKVCacheMixin:
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + dummy_slots) * per_req / (1 << 30)
         )
+        if workspace_alias:
+            admitted_rows = intermediate_size // intermediate_per_req
+            self.gdn_draft_workspace_budget_reservation_bytes = (
+                workspace_per_req * admitted_rows
+            )
+            self.gdn_physical_state_bytes = (
+                server_args.max_mamba_cache_size + dummy_slots
+            ) * per_req + (physical_intermediate_per_req - 4) * admitted_rows
+            # Preserve the existing padded index allowance separately: the
+            # working arange itself has no dummy entry, unlike the state pools.
+            self.gdn_working_index_budget_bytes = 4 * admitted_rows
+            logger.info(
+                "Native GDN joint admission: physical_state_bytes=%d, "
+                "working_index_budget_bytes=%d, "
+                "unallocated_draft_workspace_reservation_bytes=%d",
+                self.gdn_physical_state_bytes,
+                self.gdn_working_index_budget_bytes,
+                self.gdn_draft_workspace_budget_reservation_bytes,
+            )
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:

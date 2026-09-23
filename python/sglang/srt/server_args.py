@@ -1872,6 +1872,13 @@ class ServerArgs:
         "the accepted prefix at commit. Requires CUDA, top-k1 and the Triton "
         "linear-attention backends. Does not change the persistent radix pool.",
     ] = False
+    enable_gdn_draft_workspace_alias: A[
+        bool,
+        "Alias phase-exclusive native standalone draft rollback scratch with its "
+        "working state. Retain the removed duplicate bytes as an explicit, "
+        "unallocated workspace budget instead of increasing KV capacity. "
+        "Requires the supported Qwen3.5-27B/4B compact K6 cache-off configuration.",
+    ] = False
     linear_replayssm_cache_len: A[
         int,
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
@@ -2695,6 +2702,8 @@ class ServerArgs:
         self._handle_dcp_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
+            if self.enable_gdn_draft_workspace_alias:
+                raise ValueError("Draft workspace alias requires native Qwen3.5 models")
             # Skip for dummy models
             return
 
@@ -2832,6 +2841,12 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+        if self.enable_gdn_draft_workspace_alias:
+            from sglang.srt.model_executor.gdn_draft_workspace import (
+                validate_gdn_draft_workspace_args,
+            )
+
+            validate_gdn_draft_workspace_args(self)
 
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):

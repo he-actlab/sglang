@@ -149,6 +149,16 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
     def _configure_hybrid_state_admission(self, target_runner):
         """Register joint byte accounting before either model allocates pools."""
+        if getattr(self.server_args, "enable_gdn_draft_workspace_alias", False):
+            from sglang.srt.model_executor.gdn_draft_workspace import (
+                gdn_draft_workspace_bytes_per_req,
+            )
+
+            shared_bytes = gdn_draft_workspace_bytes_per_req(
+                self.server_args, target_runner, self.draft_runner
+            )
+            self._gdn_draft_workspace_shared_bytes_per_req = shared_bytes
+            target_runner._gdn_draft_workspace_shared_bytes_per_req = shared_bytes
         if self.draft_runner.mambaish_config is None:
             return
         from sglang.srt.environ import envs
@@ -236,6 +246,22 @@ class StandaloneDraftWorker(EagleDraftWorker):
         ):
             raise ValueError("Hybrid standalone recovery requires compact GDN top-k1")
         params = runner.mambaish_config.mamba2_cache_params
+        shared_bytes = 0
+        view_kwargs = {}
+        if getattr(self.server_args, "enable_gdn_draft_workspace_alias", False):
+            shared_bytes = self._gdn_draft_workspace_shared_bytes_per_req
+            expected = shared_bytes * (index_owner.mamba_pool.spec_state_size + 1)
+            if (
+                index_owner.size != self.server_args.max_running_requests
+                or index_owner.mamba_pool.spec_state_size != index_owner.size
+                or index_owner.mamba_pool.size != index_owner.size
+                or self.target_worker.model_runner.gdn_draft_workspace_budget_reservation_bytes
+                != expected
+            ):
+                raise ValueError(
+                    "Draft workspace alias differs from admitted capacity/budget"
+                )
+            view_kwargs["share_draft_compact_scratch"] = True
         view = HybridReqToTokenPoolStateView(
             index_owner,
             cache_params=params,
@@ -244,7 +270,12 @@ class StandaloneDraftWorker(EagleDraftWorker):
             ],
             start_layer=runner.start_layer,
             enable_draft_working_state=True,
+            **view_kwargs,
         )
+        if shared_bytes and view.draft_compact_scratch_shared_bytes != expected:
+            raise ValueError(
+                "Draft workspace physical alias differs from reserved budget"
+            )
         index_owner.register_paired_mamba_state_view(view)
         return view
 
