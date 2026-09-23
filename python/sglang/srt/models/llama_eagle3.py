@@ -74,6 +74,10 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         self.mlp = LlamaMLP(
             config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
         )
+        # Only the native EAGLE3 draft instances opt into the exact B2 policy.
+        # Target Llama stays unmarked; other EAGLE3 shapes fail the policy.
+        self.self_attn._b2_draft_model_config = config
+        self.mlp._b2_draft_model_config = config
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -106,7 +110,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
 
         return hidden_states, residual
 

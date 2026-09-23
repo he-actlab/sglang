@@ -52,6 +52,10 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.multiplex.b2_draft_placement import (
+    use_b2_draft_full_device_projection,
+)
+from sglang.srt.multiplex.pdmux_context import spec_pdmux_full_device_operator_region
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
@@ -114,7 +118,21 @@ class LlamaMLP(nn.Module):
         forward_batch=None,
         use_reduce_scatter: bool = False,
     ):
-        gate_up, _ = self.gate_up_proj(x)
+        use_full_device = use_b2_draft_full_device_projection(
+            "gate_up",
+            x,
+            self.gate_up_proj,
+            forward_batch,
+            getattr(self, "_b2_draft_model_config", None),
+        )
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_stream:
+            if full_stream is not None:
+                x.record_stream(full_stream)
+            gate_up, _ = self.gate_up_proj(x)
+        if full_stream is not None:
+            gate_up.record_stream(torch.cuda.current_stream())
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
@@ -204,8 +222,22 @@ class LlamaAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-    def forward_prepare_native(self, positions, hidden_states):
-        qkv, _ = self.qkv_proj(hidden_states)
+    def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
+        use_full_device = use_b2_draft_full_device_projection(
+            "qkv",
+            hidden_states,
+            self.qkv_proj,
+            forward_batch,
+            getattr(self, "_b2_draft_model_config", None),
+        )
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_stream:
+            if full_stream is not None:
+                hidden_states.record_stream(full_stream)
+            qkv, _ = self.qkv_proj(hidden_states)
+        if full_stream is not None:
+            qkv.record_stream(torch.cuda.current_stream())
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
@@ -239,6 +271,7 @@ class LlamaAttention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(

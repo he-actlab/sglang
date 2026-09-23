@@ -47,6 +47,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.multiplex.b2_draft_placement import (
+    use_b2_draft_full_device_projection,
+)
 from sglang.srt.multiplex.pdmux_context import (
     spec_pdmux_full_device_operator_region,
 )
@@ -929,6 +932,14 @@ class LogitsProcessor(nn.Module):
 
         use_full_device = _use_full_device_draft_extend_lm_head(
             hidden_states, lm_head, logits_metadata, embedding_bias, self.config
+        )
+        use_full_device = use_full_device or use_b2_draft_full_device_projection(
+            "lm_head",
+            hidden_states,
+            lm_head,
+            logits_metadata,
+            self.config,
+            embedding_bias,
         )
         # Keep both boundaries below hidden-state gathering and above logits
         # gathering. Only the exact LM-head GEMM moves; scaling, collectives,
