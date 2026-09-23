@@ -221,10 +221,11 @@ class EntryObserver:
             require(mrope.ndim == 2 and mrope.shape[0] == 3, "native mRoPE layout")
             tensors["entry_mrope_positions"] = mrope[..., :n * 5 if graph is not None else length]
         if graph is not None:
-            require(len(full.forward_metadata.prefill_wrappers) == 1
-                    and full.forward_metadata.prefill_wrappers[0] is full.prefill_cuda_graph_metadata[32][0],
-                    "executed graph KV wrapper identity")
-            wrapper = full.forward_metadata.prefill_wrappers[0]
+            # Replay replans these graph-owned buffers without rebinding the
+            # eager forward_metadata left by the preceding native prefill.
+            wrappers = full.prefill_cuda_graph_metadata[graph.bs]
+            require(len(wrappers) == 1, "executed graph KV wrapper identity")
+            wrapper = wrappers[0]
             require(wrapper._custom_mask_buf is not None and wrapper._mask_indptr_buf is not None,
                     "native verify packed mask absent")
             tensors.update(

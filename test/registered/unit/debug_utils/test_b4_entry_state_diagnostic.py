@@ -1,5 +1,6 @@
 """CPU observer contracts; actual CUDA ordering remains a separate gate."""
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -295,6 +296,36 @@ def test_real_source_patch_observes_after_load_before_graph_replay():
     assert verify.index("prepare_entry(") < verify.index("self.target_worker.forward_batch_generation(")
 
 
+def test_native_graph_replan_leaves_eager_metadata_and_observer_uses_graph_wrapper():
+    path = ROOT / "python/sglang/srt/layers/attention/flashinfer_backend.py"
+    tree = ast.parse(path.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FlashInferAttnBackend")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "init_forward_metadata_out_graph")
+    namespace = {"ForwardBatch": NS}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    observer, mapping, _ = fake_observer()
+    request = req(observer, 107)
+    batch, forward, graph, wrapper = graph_case(observer, mapping, request)
+    full = graph.attn_backend.full_attn_backend
+    eager = NS(prefill_wrappers=[object()])
+    full.forward_metadata = eager
+    full.use_sliding_window_kv_pool = False
+    planned = []
+    full.indices_updater_prefill = NS(update=lambda *args, **kwargs: planned.append(kwargs["prefill_wrappers"]))
+    native_forward = NS(batch_size=32, req_pool_indices=graph.buffers.req_pool_indices,
+        seq_lens=graph.buffers.seq_lens, seq_lens_cpu=forward.seq_lens_cpu, seq_lens_sum=32 * 149,
+        encoder_lens=None, spec_info=object(),
+        forward_mode=NS(is_decode_or_idle=lambda: False, is_target_verify=lambda: True))
+    namespace["init_forward_metadata_out_graph"](full, native_forward)
+    assert planned == [[wrapper]] and full.forward_metadata is eager
+    observer.before_verify(batch, forward, True)
+    observer.graph_entry(graph, forward)
+    tensors, meta = observer.take_verify(forward)
+    assert meta["kv_source"] == "executed_graph_wrapper_prefix"
+    assert tensors["entry_kv_indptr"].tolist() == wrapper._paged_kv_indptr_buf.tolist()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires explicitly reserved CUDA")
 def test_cuda_component_graph_entry_precedes_mutation_and_resolves_reused_owner():
     observer, mapping, _ = fake_observer("cuda")
@@ -339,6 +370,9 @@ def test_cuda_component_delayed_result_survives_later_scratch_reuse():
     with torch.cuda.stream(producer):
         store.capture(0, True, state, owner, pool, [3], ids)
         warm = store.capture(0, False, state, owner, pool, [3], ids)
+        for index, mask in ((0, 1), (1, -2147483648), (2, 1)):
+            bits[index].bitwise_xor_(mask)
+            bits[index].bitwise_xor_(mask)  # Warm scalar kernels; restore raw bits.
     target = torch.empty_like(warm)
     torch.cuda.synchronize()  # Warm all allocation/kernel paths before the delay.
     produced, consumed = torch.cuda.Event(), torch.cuda.Event()
@@ -346,11 +380,11 @@ def test_cuda_component_delayed_result_survives_later_scratch_reuse():
         torch.cuda._sleep(100_000_000)
         first = store.capture(0, False, state, owner, pool, [3], ids)
         produced.record()
+        assert not produced.query(), "invalid test window: setup consumed the forced delay"
         bits[0].bitwise_xor_(1)  # smallest subnormal -> positive zero
         bits[1].bitwise_xor_(-2147483648)  # negative zero -> positive zero
         bits[2].bitwise_xor_(1)  # distinct NaN payload, still NaN
         second = store.capture(0, False, state, owner, pool, [3], ids)
-    assert not produced.query(), "invalid test window: setup consumed the forced delay"
     with torch.cuda.stream(consumer):
         consumer.wait_event(produced)
         target.copy_(first)

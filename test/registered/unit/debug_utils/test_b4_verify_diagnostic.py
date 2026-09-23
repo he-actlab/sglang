@@ -822,7 +822,7 @@ def test_cuda_component_native_patch_install_restore():
     )
     from sglang.srt.debug_utils.source_patcher.types import PatchConfig
 
-    diag._runtime_identity()  # Clean descendant with only the three fixture files.
+    diag._runtime_identity()  # Clean descendant with only the declared fixture files.
     raw = yaml.safe_load((ROOT / "test/manual/b4_verify_diagnostic.yaml").read_text())
     specs = PatchConfig(**raw).patches
     native = [_resolve_target(s.target) for s in specs]
@@ -830,7 +830,7 @@ def test_cuda_component_native_patch_install_restore():
     with CodePatcher(patches=specs):
         assert all(f.__code__ is not code for f, code in zip(native, codes))
     assert all(f.__code__ is code for f, code in zip(native, codes))
-    assert len(codes) == 7
+    assert len(codes) == 8
 
 
 @pytest.mark.skipif(
