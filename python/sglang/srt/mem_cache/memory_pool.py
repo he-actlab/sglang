@@ -893,6 +893,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        self.paired_mamba_state_view = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -973,6 +974,33 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
+
+    def register_paired_mamba_state_view(self, view):
+        """Attach model-local committed state to this pool's checkpoint indices."""
+        if (
+            not isinstance(view, HybridReqToTokenPoolStateView)
+            or view.index_owner is not self
+        ):
+            raise ValueError("Paired recurrent state must use this pool's indices")
+        if self.paired_mamba_state_view is not None:
+            raise ValueError("Paired recurrent state is already registered")
+        if self.mamba_ckpt_pool is not None:
+            raise ValueError("Paired int8 recurrent checkpoints are unsupported")
+        self.paired_mamba_state_view = view
+
+    def clear_mamba_states(self, indices: torch.Tensor):
+        """Initialize both models on the existing forward-stream clear boundary."""
+        self.mamba_pool.clear_slots(indices)
+        view = self.paired_mamba_state_view
+        if view is not None:
+            view.mamba_pool.clear_slots(indices)
+
+    def copy_mamba_states(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+        """COW a paired checkpoint without creating a second index owner."""
+        self.mamba_pool.copy_from(src_indices, dst_indices)
+        view = self.paired_mamba_state_view
+        if view is not None:
+            view.mamba_pool.copy_from(src_indices, dst_indices)
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
@@ -1202,6 +1230,7 @@ class HybridReqToTokenPoolStateView(HybridReqToTokenPool):
         cache_params: BaseLinearStateParams,
         mamba_layer_ids: List[int],
         start_layer: int = 0,
+        enable_draft_working_state: bool = False,
     ):
         if not isinstance(index_owner, HybridReqToTokenPool) or isinstance(
             index_owner, HybridReqToTokenPoolStateView
@@ -1249,6 +1278,52 @@ class HybridReqToTokenPoolStateView(HybridReqToTokenPool):
             envelope_layout=owner_state.envelope_layout,
             enable_gdn_compact_spec_state=owner_state.enable_gdn_compact_spec_state,
         )
+
+        self.draft_working_pool = None
+        self.draft_working_indices = None
+        if enable_draft_working_state:
+            if owner_state.envelope_layout or owner_state.enable_linear_replayssm:
+                raise ValueError("Draft working state requires contiguous native state")
+            # Preserve all admitted request/graph rows, including two-slot capacity.
+            # This is scratch shared only by FIFO draft forwards, never a cache row.
+            capacity = max(index_owner.size, owner_state.spec_state_size)
+            self.draft_working_pool = MambaPool(
+                size=capacity,
+                spec_state_size=0,
+                cache_params=cache_params,
+                mamba_layer_ids=mamba_layer_ids,
+                device=self.device,
+                enable_memory_saver=self.enable_memory_saver,
+            )
+            self.draft_working_indices = torch.arange(
+                1, capacity + 1, dtype=torch.int32, device=self.device
+            )
+
+    def prepare_draft_working_state(self, req_pool_indices: torch.Tensor):
+        """Seed speculative work from committed state; safe to capture and replay."""
+        if self.draft_working_pool is None:
+            raise RuntimeError("Draft working state was not allocated")
+        bs = req_pool_indices.numel()
+        if bs > self.draft_working_pool.size:
+            raise ValueError("Draft batch exceeds admitted working-state capacity")
+        src = self.get_mamba_indices(req_pool_indices).to(dtype=torch.int64)
+        committed = self.mamba_pool.mamba_cache
+        working = self.draft_working_pool.mamba_cache
+        for source, destination in zip(committed.conv, working.conv):
+            torch.index_select(source, 1, src, out=destination[:, 1 : bs + 1])
+        torch.index_select(
+            committed.temporal, 1, src, out=working.temporal[:, 1 : bs + 1]
+        )
+        return self.draft_working_indices[:bs]
+
+    def clear_mamba_states(self, indices: torch.Tensor):
+        # Draft prefill can carry the same deferred initialization metadata as
+        # target prefill. Reinitialize only this model, never erase the target
+        # prefix that has already been computed on the owning pool.
+        self.mamba_pool.clear_slots(indices)
+
+    def copy_mamba_states(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+        self.mamba_pool.copy_from(src_indices, dst_indices)
 
     @property
     def req_to_token(self):

@@ -101,6 +101,7 @@ def _make_model_runner(
     mr.kv_cache_dtype = "fake_bf16"
 
     sa = SimpleNamespace()
+    sa.spec_pdmux_draft_unsharded = lambda: False
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache

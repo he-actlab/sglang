@@ -138,12 +138,8 @@ import json
 import os
 
 _NVTX_PROFILE = os.environ.get("SGLANG_NVTX_PROFILE", "0") == "1"
-_PHASE_EVENTS = (
-    os.environ.get("SGLANG_PHASE_EVENTS", "0") == "1" and not _NVTX_PROFILE
-)
-_PHASE_EVENTS_OUT = os.environ.get(
-    "SGLANG_PHASE_EVENTS_OUT", "/tmp/phase_times.jsonl"
-)
+_PHASE_EVENTS = os.environ.get("SGLANG_PHASE_EVENTS", "0") == "1" and not _NVTX_PROFILE
+_PHASE_EVENTS_OUT = os.environ.get("SGLANG_PHASE_EVENTS_OUT", "/tmp/phase_times.jsonl")
 
 
 class _PhaseEventLog:
@@ -687,6 +683,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TokenspeedMLABackend,
             FlashInferAttnBackend,
         ]
+        if (
+            self.speculative_algorithm.is_standalone()
+            and self.draft_runner.mambaish_config is not None
+        ):
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+            )
+
+            graph_supported_backend_types.append(HybridLinearAttnBackend)
         if _is_cuda or _is_musa:
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
             # deep_gemm and the rest of the sparse-attention stack at import time.
@@ -811,9 +816,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ev.record(torch.get_device_module(self.device).current_stream())
         return gpu[:n]
 
-    def _ip_local_batch_view(
-        self, batch: ScheduleBatch, my_pos: List[int], key: str
-    ):
+    def _ip_local_batch_view(self, batch: ScheduleBatch, my_pos: List[int], key: str):
         """Shallow local view of `batch` restricted to this rank's owned rows.
         Returns (local_batch, owned_idx_gpu). Only the fields the draft-side
         prepare/forward paths consume are re-sliced; everything else is
@@ -898,9 +901,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         send = torch.zeros((max_cnt, num_steps), dtype=torch.int64, device=device)
         if draft_tokens_local is not None:
             send[: len(my_pos)].copy_(draft_tokens_local.view(-1, num_steps))
-        recv = torch.empty(
-            (tp * max_cnt, num_steps), dtype=torch.int64, device=device
-        )
+        recv = torch.empty((tp * max_cnt, num_steps), dtype=torch.int64, device=device)
         from sglang.srt.distributed import parallel_state as _ps
 
         dup = _ps._PDMUX_PREFILL_TP_GROUP
@@ -1575,9 +1576,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             "implemented (the fused extend would have to be partitioned across "
             "ranks too)."
         )
-        merged_batch, merged_result, sizes = self._spec_pdmux_merge_for_extend(
-            pendings
-        )
+        merged_batch, merged_result, sizes = self._spec_pdmux_merge_for_extend(pendings)
         self._draft_extend_for_decode_impl(merged_batch, merged_result)
         # Split the merged next-draft state back into each slot's OWN live
         # EagleDraftInput (the object the slot's spec_info already points at and
@@ -1660,21 +1659,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         pos_by_rank = self._ip_partition(batch)
         my_pos = pos_by_rank[self.tp_rank]
-        full_topk_p = torch.zeros(
-            (bs, self.topk), dtype=torch.float32, device=device
-        )
-        full_topk_index = torch.zeros(
-            (bs, self.topk), dtype=torch.int64, device=device
-        )
+        full_topk_p = torch.zeros((bs, self.topk), dtype=torch.float32, device=device)
+        full_topk_index = torch.zeros((bs, self.topk), dtype=torch.int64, device=device)
         if my_pos:
             local_batch, owned_idx = self._ip_local_batch_view(
                 batch, my_pos, "ext_owned"
             )
             # Per-req blocks of the verify tree: predict tokens + the tree's
             # cache locations (the extend's write targets), ndt per request.
-            local_batch.out_cache_loc = (
-                batch.out_cache_loc.view(bs, ndt)[owned_idx].reshape(-1)
-            )
+            local_batch.out_cache_loc = batch.out_cache_loc.view(bs, ndt)[
+                owned_idx
+            ].reshape(-1)
             local_result = SimpleNamespace(
                 logits_output=SimpleNamespace(hidden_states=None),
                 next_token_ids=batch_result.next_token_ids.view(bs, ndt)[
@@ -2167,10 +2162,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         for _, p in pend:
                             self.draft_worker.spec_pdmux_fused_extend([p])
                     else:
-                        self.draft_worker.spec_pdmux_fused_extend(
-                            [p for _, p in pend]
-                        )
+                        self.draft_worker.spec_pdmux_fused_extend([p for _, p in pend])
                 for _, p in pend:
+                    self._complete_paired_mamba_publication(
+                        p["publication_result"], small, draft_result=p["result"]
+                    )
                     if p["on_relay"] is not None:
                         # FutureMap stash on the small stream, per slot (its own
                         # future_indices, its own rows): the slot's next-tick
@@ -2256,13 +2252,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     try:
-                        next_draft_input = (
-                            self.draft_worker._draft_extend_for_prefill(
-                                p["batch"],
-                                p["hidden_states"],
-                                p["next_token_ids"],
-                                p["mm_input_embeds"],
-                            )
+                        next_draft_input = self.draft_worker._draft_extend_for_prefill(
+                            p["batch"],
+                            p["hidden_states"],
+                            p["next_token_ids"],
+                            p["mm_input_embeds"],
                         )
                     except ValueError as e:
                         # Plan-vs-q mismatch context (trunk bug #5 class): the
@@ -2293,10 +2287,33 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # FutureMap stash on the small stream (extend outputs:
                 # topk_p/topk_index/bonus/hidden). The scheduler-side shell
                 # spec_info is filled by the newcomers' first-tick gathers.
+                self._complete_paired_mamba_publication(p["publication_result"], small)
                 p["on_relay"](SimpleNamespace(next_draft_input=next_draft_input))
         if st["prefill_flush_done"] is None:
             st["prefill_flush_done"] = dev.Event()
         st["prefill_flush_done"].record(small)
+
+    def _prepare_paired_mamba_publication(self, result):
+        pool = self.target_worker.model_runner.req_to_token_pool
+        if getattr(pool, "paired_mamba_state_view", None) is not None:
+            result.standalone_mamba_ready_event = torch.get_device_module(
+                self.device
+            ).Event()
+            result.standalone_mamba_pending = True
+
+    def _complete_paired_mamba_publication(self, result, stream, draft_result=None):
+        if result.standalone_mamba_ready_event is None:
+            return
+        if draft_result is not None and not getattr(
+            draft_result, "standalone_mamba_committed", False
+        ):
+            raise RuntimeError(
+                "Paired checkpoint cannot publish an uncommitted draft prefix"
+            )
+        # CPU publication/free waits this result-specific event, not the earlier
+        # verify/copy event. The existing flush_done still orders GPU consumers.
+        result.standalone_mamba_ready_event.record(stream)
+        result.standalone_mamba_pending = False
 
     def _spec_pdmux_join_flush_done(self) -> None:
         """Make the CURRENT stream wait both slots' last deferred-extend+stash
@@ -2530,8 +2547,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     # already recorded the event on the prefill stream.
                     prefill_done = dev.Event()
                     prefill_done.record(dev.current_stream())
+                self._prepare_paired_mamba_publication(batch_output)
                 self._spec_pdmux_state["prefill_pending"].append(
                     {
+                        "publication_result": batch_output,
                         # copy.copy at exactly the sync call point: isolates
                         # the extend's SB rebinds/in-place input_ids rotation
                         # source set from the scheduler's post-tick mutations
@@ -2747,9 +2766,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # verify() records the other verify_input fields on the
                 # forward stream (record_stream_for_v2_verify); draft_probs
                 # is the one small-stream allocation it does not cover.
-                record_stream_each(
-                    (verify_input.draft_probs,), dev.current_stream()
-                )
+                record_stream_each((verify_input.draft_probs,), dev.current_stream())
                 # Steady-state key move: launch the deferred extends(+stash)
                 # now, AFTER this tick's draft is in the small FIFO and BEFORE
                 # this tick's verify is enqueued on large, so the whole
@@ -2831,7 +2848,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     pending_batch._spec_pdmux_ip_pool_idx = [
                         r.req_pool_idx for r in batch.reqs
                     ]
+                self._prepare_paired_mamba_publication(batch_output)
                 self._spec_pdmux_state["pending"][slot] = {
+                    "publication_result": batch_output,
                     "batch": pending_batch,
                     "result": SimpleNamespace(
                         logits_output=SimpleNamespace(
@@ -2840,6 +2859,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         next_token_ids=batch_output.next_token_ids,
                         accept_lens=batch_output.accept_lens,
                         next_draft_input=batch_output.next_draft_input,
+                        standalone_mamba_track_indices=batch_output.standalone_mamba_track_indices,
+                        standalone_mamba_steps_to_track=batch_output.standalone_mamba_steps_to_track,
                     ),
                     "on_relay": on_relay,
                     "verify_done": verify_done,
@@ -2871,6 +2892,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.accept_lens,
                         batch_output.logits_output.hidden_states,
                         batch_output.next_draft_input.bonus_tokens,
+                        batch_output.standalone_mamba_track_indices,
+                        batch_output.standalone_mamba_steps_to_track,
                         batch.seq_lens,
                         batch.seq_lens_cpu,
                         batch.req_pool_indices,
@@ -3301,7 +3324,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         # Update mamba state for hybrid GDN models after verification
-        commit_mamba_states_after_verify(
+        standalone_mamba_checkpoint = commit_mamba_states_after_verify(
             self.target_worker,
             batch,
             accept_lens,
@@ -3352,6 +3375,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
+            standalone_mamba_track_indices=(
+                standalone_mamba_checkpoint[0]
+                if standalone_mamba_checkpoint is not None
+                else None
+            ),
+            standalone_mamba_steps_to_track=(
+                standalone_mamba_checkpoint[1]
+                if standalone_mamba_checkpoint is not None
+                else None
+            ),
         )
 
     def _finalize_accept_tree_path(

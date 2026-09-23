@@ -16,7 +16,10 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    HybridReqToTokenPoolStateView,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
@@ -66,9 +69,7 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0
         ):
-            self.req_to_token_pool.mamba_pool.clear_slots(
-                forward_batch.mamba_clear_indices
-            )
+            self.req_to_token_pool.clear_mamba_states(forward_batch.mamba_clear_indices)
         if (
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
@@ -83,13 +84,32 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.mamba_cow_dst_indices,
                 )
             else:
-                self.req_to_token_pool.mamba_pool.copy_from(
+                self.req_to_token_pool.copy_mamba_states(
                     forward_batch.mamba_cow_src_indices,
                     forward_batch.mamba_cow_dst_indices,
                 )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
+
+    def _uses_standalone_working_state(self, forward_mode):
+        return (
+            isinstance(self.req_to_token_pool, HybridReqToTokenPoolStateView)
+            and forward_mode.is_decode_or_idle()
+        )
+
+    def _state_indices(self, req_pool_indices, forward_mode):
+        if self._uses_standalone_working_state(forward_mode):
+            # The committed prefix remains at the owner's indices. Draft-chain
+            # decode alone mutates the row-local working copy, refreshed once
+            # at chain entry (inside draft graph capture/replay).
+            return torch.arange(
+                1,
+                req_pool_indices.shape[0] + 1,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+        return self.req_to_token_pool.get_mamba_indices(req_pool_indices)
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -103,8 +123,8 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
-        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
+        mamba_cache_indices = self._state_indices(
+            forward_batch.req_pool_indices, forward_batch.forward_mode
         )
         _real_bs = getattr(forward_batch, "_original_batch_size", None)
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
@@ -190,10 +210,16 @@ class MambaAttnBackendBase(AttentionBackend):
                     write_pos_buf[uniq_slots] = new_vals
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
-                # unconditionally, but DRAFT_EXTEND_V2 only runs full-attn layers in
-                # the draft model, so mamba metadata can be skipped.
-                query_start_loc = None
+                if not isinstance(
+                    self.req_to_token_pool, HybridReqToTokenPoolStateView
+                ):
+                    raise ValueError(
+                        "Hybrid draft-extend requires independent committed state"
+                    )
+                query_start_loc = (
+                    torch.arange(bs + 1, dtype=torch.int32, device=self.device)
+                    * forward_batch.spec_info.num_tokens_per_req
+                )
             elif forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
                     0,
@@ -549,13 +575,13 @@ class MambaAttnBackendBase(AttentionBackend):
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
-        elif forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        mamba_indices = self._state_indices(req_pool_indices[:bs], forward_mode)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # GDN ReplaySSM (slice 1b): point at the STATIC per-bs write-cursor
@@ -617,8 +643,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
         # Make sure forward metadata is correctly handled for padding reqs
+        req_pool_indices = req_pool_indices[:bs]
         req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        mamba_indices = self._state_indices(req_pool_indices, forward_mode)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # GDN ReplaySSM (slice 1b): refresh the STATIC per-row write cursor the
@@ -711,7 +738,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     bs - num_padding
                 )
-        elif forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -721,7 +748,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    (bs - num_padding) * spec_info.draft_token_num
+                    (bs - num_padding)
+                    * (
+                        spec_info.num_tokens_per_req
+                        if forward_mode.is_draft_extend_v2()
+                        else spec_info.draft_token_num
+                    )
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -782,6 +814,9 @@ class MambaAttnBackendBase(AttentionBackend):
             ssm_states[mamba_track_indices[i]] = ssm_states[cache_indices[i]]
         for all requests where mamba_track_mask[i] is True.
         """
+        if self._uses_standalone_working_state(forward_batch.forward_mode):
+            # Speculative chain state is disposable, never a radix checkpoint.
+            return
         if forward_batch.mamba_track_mask is not None:
             track_mamba_states_if_needed(
                 conv_states,
@@ -939,6 +974,46 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
 
+class HybridMultiStepDraftBackend:
+    """Keep native full-attention planning and add one row-local GDN chain.
+
+    The GDN query/state indices are identical at every decode step; only the
+    working state changes. Full attention retains its per-step KV metadata.
+    """
+
+    def __init__(self, full_attn_backend, linear_attn_backend, full_attn_layers):
+        self.full_attn_backend = full_attn_backend
+        self.linear_attn_backend = linear_attn_backend
+        self.attn_backends = [
+            HybridLinearAttnBackend(backend, linear_attn_backend, full_attn_layers)
+            for backend in full_attn_backend.attn_backends
+        ]
+        self.needs_cpu_seq_lens = (
+            full_attn_backend.needs_cpu_seq_lens
+            or linear_attn_backend.needs_cpu_seq_lens
+        )
+
+    def init_forward_metadata(self, forward_batch):
+        self.full_attn_backend.init_forward_metadata(forward_batch)
+        self.linear_attn_backend.init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        self.full_attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+        self.linear_attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        self.full_attn_backend.init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
+        self.linear_attn_backend.init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
+
+    def init_forward_metadata_in_graph(self, forward_batch):
+        self.full_attn_backend.init_forward_metadata_in_graph(forward_batch)
+        self.linear_attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
@@ -980,7 +1055,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_draft_extend_v2():
+        if forward_batch.forward_mode.is_draft_extend_v2() and not isinstance(
+            self.linear_attn_backend.req_to_token_pool,
+            HybridReqToTokenPoolStateView,
+        ):
             # DRAFT_EXTEND_V2 only runs full-attn layers in the draft model,
             # so skip linear/mamba backend metadata which requires query_start_loc.
             self.full_attn_backend.init_forward_metadata(forward_batch)

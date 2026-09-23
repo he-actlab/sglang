@@ -847,7 +847,7 @@ def commit_mamba_states_after_verify(
     accept_lens: torch.Tensor,
     accept_index: torch.Tensor,
     draft_token_num: int,
-) -> None:
+) -> Optional[tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]:
     """Commit accepted per-step mamba states into the persistent caches.
 
     During TARGET_VERIFY, hybrid linear attention backends keep per-step
@@ -857,7 +857,7 @@ def commit_mamba_states_after_verify(
     for prefix-cache tracking (mamba extra_buffer mode).
 
     No-op for models without mamba-style state or backends without the
-    commit hook.
+    commit hook. A paired hybrid draft receives frozen checkpoint metadata.
     """
     model_runner = target_worker.model_runner
     if model_runner.mambaish_config is None:
@@ -917,6 +917,29 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
         )
+        if (
+            getattr(
+                getattr(model_runner, "req_to_token_pool", None),
+                "paired_mamba_state_view",
+                None,
+            )
+            is not None
+        ):
+            # Freeze the target's destination/step before the next verify or
+            # CPU ping-pong update can reuse its metadata. Draft commit consumes
+            # this exact boundary, not a later mutable Req state.
+            return (
+                (
+                    batch.mamba_track_indices.clone()
+                    if batch.mamba_track_indices is not None
+                    else None
+                ),
+                (
+                    mamba_steps_to_track.clone()
+                    if mamba_steps_to_track is not None
+                    else None
+                ),
+            )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:

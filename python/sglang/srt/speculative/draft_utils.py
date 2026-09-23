@@ -63,11 +63,12 @@ class DraftBackendFactory:
             "dsv4": self._create_dsv4_decode_backend,
         }
 
-        return self._create_backend(
+        backend = self._create_backend(
             "decode_attention_backend",
             backend_map,
             "EAGLE is not supported in decode attention backend {backend_type}",
         )
+        return self._wrap_standalone_hybrid(backend, multi_step=True)
 
     def create_draft_extend_backend(self):
         backend_map = {
@@ -97,10 +98,38 @@ class DraftBackendFactory:
             if self.server_args.speculative_attention_mode == "decode"
             else "prefill_attention_backend"
         )
-        return self._create_backend(
+        backend = self._create_backend(
             backend_name,
             backend_map,
             "EAGLE is not supported in attention backend {backend_type}",
+        )
+        return self._wrap_standalone_hybrid(backend, multi_step=False)
+
+    def _wrap_standalone_hybrid(self, backend, *, multi_step):
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPoolStateView
+
+        runner = self.draft_model_runner
+        if not isinstance(runner.req_to_token_pool, HybridReqToTokenPoolStateView):
+            return backend
+        if not runner.spec_algorithm.is_standalone() or self.topk != 1:
+            raise ValueError(
+                "Independent hybrid draft state requires STANDALONE top-k1"
+            )
+        if runner.hybrid_gdn_config is None:
+            raise ValueError(
+                "Independent hybrid draft state currently supports GDN only"
+            )
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+            HybridMultiStepDraftBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        wrapper = HybridMultiStepDraftBackend if multi_step else HybridLinearAttnBackend
+        return wrapper(
+            backend,
+            GDNAttnBackend(runner),
+            runner.mambaish_config.full_attention_layer_ids,
         )
 
     def _create_dsa_decode_backend(self):

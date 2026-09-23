@@ -301,8 +301,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             buffer_namespace = "spec-pdmux-draft"
             logger.info(
-                "[spec-pdmux] %s: graph statics in DEDICATED input-buffer "
-                "namespace",
+                "[spec-pdmux] %s: graph statics in DEDICATED input-buffer " "namespace",
                 type(self).__name__,
             )
         self.buffers.share_buffers(namespace=buffer_namespace)
@@ -678,6 +677,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
         fb_view = SimpleNamespace(
             batch_size=bs,
+            num_padding=bs - raw_bs,
             forward_mode=self.forward_mode,
             input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=buffers.req_pool_indices,

@@ -140,7 +140,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Assumes draft and target share the same per-layer KV size (head_dim,
         # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
         # reuse the target architecture's attention config.
-        if (
+        paired_draft = mr.__dict__.get("standalone_hybrid_draft_runner")
+        if paired_draft is not None:
+            # Hybrid STANDALONE uses a separate architecture, not an EAGLE
+            # next-token layer. Count its actual full-attention KV dimensions.
+            # The composition gate restricts this path to TP1.
+            self._cell_size += DefaultPoolConfigurator(paired_draft)._cell_size
+        elif (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
             eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)

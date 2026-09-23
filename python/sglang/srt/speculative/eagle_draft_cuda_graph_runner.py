@@ -290,8 +290,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             buffer_namespace = "spec-pdmux-draft"
             logger.info(
-                "[spec-pdmux] %s: graph statics in DEDICATED input-buffer "
-                "namespace",
+                "[spec-pdmux] %s: graph statics in DEDICATED input-buffer " "namespace",
                 type(self).__name__,
             )
         self.buffers.share_buffers(namespace=buffer_namespace)
@@ -664,7 +663,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
         # forward_batch.batch_size was overwritten to bs above when padding.
-        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+        old_num_padding = getattr(forward_batch, "num_padding", None)
+        forward_batch.num_padding = bs - raw_bs
+        try:
+            self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+        finally:
+            forward_batch.num_padding = old_num_padding
         self.raw_bs = raw_bs
         self.bs = bs
 

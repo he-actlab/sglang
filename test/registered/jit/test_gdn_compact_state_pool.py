@@ -49,7 +49,8 @@ def test_factor_accounting_preserves_fp32():
 
 
 @pytest.mark.parametrize("compact,hybrid", [(True, True), (True, False), (False, True)])
-def test_compact_target_does_not_admit_unimplemented_hybrid_draft(compact, hybrid):
+@CUDA
+def test_compact_target_alone_does_not_admit_hybrid_draft(compact, hybrid):
     from sglang.srt.speculative.standalone_worker_v2 import StandaloneDraftWorker
 
     worker = SimpleNamespace(
@@ -58,12 +59,13 @@ def test_compact_target_does_not_admit_unimplemented_hybrid_draft(compact, hybri
             spec_pdmux_draft_unsharded=lambda: False,
         ),
         draft_runner=SimpleNamespace(mambaish_config=object() if hybrid else None),
+        target_worker=SimpleNamespace(model_runner=SimpleNamespace()),
         draft_worker=SimpleNamespace(alloc_memory_pool=Mock()),
         init_token_map=Mock(),
         init_lm_head=Mock(),
     )
     pool = object()
-    if compact and hybrid:
+    if hybrid:
         with pytest.raises(ValueError, match="independent draft-state ownership"):
             StandaloneDraftWorker.alloc_memory_pool(worker, req_to_token_pool=pool)
         worker.draft_worker.alloc_memory_pool.assert_not_called()

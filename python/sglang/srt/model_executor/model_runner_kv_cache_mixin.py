@@ -160,6 +160,25 @@ class ModelRunnerKVCacheMixin:
         elif compact_spec:
             raise ValueError("Compact speculative state requires speculative decoding")
 
+        per_req = config.mamba2_cache_params.mamba_cache_per_req
+        paired_draft = self.__dict__.get("standalone_hybrid_draft_runner")
+        if paired_draft is not None:
+            # Both models keep independent committed/track/cache states at the
+            # owner's indices. Draft decode additionally needs one working state
+            # per admitted request. Charge those bytes without changing the
+            # existing cache snapshot ratio or reducing requested concurrency.
+            if not compact_spec or not has_spec_dec:
+                raise ValueError("Paired hybrid state requires compact rollback")
+            draft_params = paired_draft.mambaish_config.mamba2_cache_params
+            per_req += draft_params.mamba_cache_per_req
+            intermediate_per_req += (
+                draft_params.gdn_compact_spec_state_bytes(
+                    server_args.speculative_num_draft_tokens
+                )
+                + draft_params.mamba_cache_per_req
+                + 4  # static int32 working-row index (also reserve dummy row)
+            )
+
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
@@ -191,8 +210,7 @@ class ModelRunnerKVCacheMixin:
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            assert per_req > 0
 
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
             # The mamba budget (from the ratio split) must cover both:
@@ -250,9 +268,7 @@ class ModelRunnerKVCacheMixin:
             )
 
         mamba_state_memory = (
-            (server_args.max_mamba_cache_size + dummy_slots)
-            * config.mamba2_cache_params.mamba_cache_per_req
-            / (1 << 30)
+            (server_args.max_mamba_cache_size + dummy_slots) * per_req / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
 
@@ -1095,6 +1111,12 @@ class ModelRunnerKVCacheMixin:
                     f"(3) use GPUs with more memory."
                 )
         if requested_per_worker is not None and max_num_reqs < requested_per_worker:
+            if self.__dict__.get("standalone_hybrid_draft_runner") is not None:
+                raise RuntimeError(
+                    "Hybrid STANDALONE joint state/KV admission cannot preserve "
+                    f"requested concurrency: requested={requested_per_worker}, "
+                    f"admitted={max_num_reqs}. No request or cache policy was lowered."
+                )
             logger.warning(
                 "max_running_requests was reduced from the requested %d to %d "
                 "(per dp worker) due to the available KV cache capacity.",

@@ -432,6 +432,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        self.is_paired_mamba = (
+            getattr(self.req_to_token_pool, "paired_mamba_state_view", None) is not None
+        )
         self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
@@ -456,7 +459,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def reset(self) -> None:
         self.root_node = TreeNode()
-        self.root_node.key = RadixKey(array("q"), None)
+        self.root_node.key = RadixKey(array("q"), None, is_bigram=self.is_paired_mamba)
         self.root_node.value = []
         self.root_node.hash_value = []
         self.root_node.full_lock_ref = 1
@@ -506,6 +509,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba_value = params.mamba_value
         prev_prefix_len = params.prev_prefix_len
 
+        if self.is_paired_mamba and (
+            not key.is_bigram or value is None or len(key) != len(value)
+        ):
+            raise ValueError(
+                "Paired checkpoints require P+1 raw IDs for P cache values"
+            )
+
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
@@ -515,6 +525,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
+        paired_key = None
+        if self.is_paired_mamba and not self.disable and is_insert:
+            # Validate before popping ownership or freeing a non-cached suffix.
+            # Paired state cannot be donated with an unknown shifted lookahead.
+            paired_len = (
+                req.mamba_last_track_seqlen
+                if self.enable_mamba_extra_buffer
+                else req._cache_commit_len()
+            )
+            paired_key = self._paired_checkpoint_key(req, paired_len or 0)
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -597,7 +617,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             result = self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                    key=(
+                        paired_key
+                        if self.is_paired_mamba
+                        else RadixKey(token_ids[:page_aligned_len], req.extra_key)
+                    ),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
                     prev_prefix_len=req.cache_protected_len,
@@ -670,6 +694,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {self.mamba_cache_chunk_size=}"
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
+        checkpoint_key = (
+            self._paired_checkpoint_key(req, page_aligned_len)
+            if self.is_paired_mamba
+            else RadixKey(page_aligned_token_ids, req.extra_key)
+        )
 
         # Donate the mamba index to the radix cache instead of copying.
         # This avoids a data copy that would race with the forward stream.
@@ -694,13 +723,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             mamba_value_donated = self._alloc_mamba_slot()
-            self.req_to_token_pool.mamba_pool.copy_from(
+            self.req_to_token_pool.copy_mamba_states(
                 req.mamba_pool_idx.unsqueeze(0), mamba_value_donated
             )
 
         result = self.insert(
             InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                key=checkpoint_key,
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
                 prev_prefix_len=req.cache_protected_len,
@@ -712,9 +741,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._free_mamba_value(mamba_value_donated)
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
-        )
+        match_result = self.match_prefix(MatchPrefixParams(key=checkpoint_key))
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
@@ -983,6 +1010,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    def _paired_checkpoint_key(self, req: Req, cache_len: int) -> RadixKey:
+        # Target state is after x[:P]; the native shifted draft is after x[1:P+1].
+        # The lookahead is either the remaining prompt token or the target bonus.
+        raw = req.origin_input_ids + req.output_ids
+        if cache_len < 0 or len(raw) < cache_len + 1:
+            raise ValueError(
+                "Paired recurrent checkpoint is missing its lookahead token"
+            )
+        return RadixKey(raw[: cache_len + 1], req.extra_key, is_bigram=True)
+
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.req_to_token_pool.mamba_allocator.alloc(1)
@@ -1072,6 +1109,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
         key = params.key
+
+        if self.is_paired_mamba and not key.is_bigram:
+            # Req's raw cap describes logical target values. Add the known
+            # lookahead without permitting a complete input to be cached away.
+            key = RadixKey(
+                key.token_ids,
+                key.extra_key,
+                is_bigram=True,
+                limit=None if key.limit is None else key.limit + 1,
+            )
 
         if self.disable or len(key) == 0:
             return None

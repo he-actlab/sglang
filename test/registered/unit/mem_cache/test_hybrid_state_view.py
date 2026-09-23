@@ -81,6 +81,79 @@ def _req(rid="r"):
     )
 
 
+def test_working_state_reseeds_changed_request_rows_without_mutating_committed():
+    owner = _owner()
+    owner.alloc([_req("a"), _req("b")])
+    view = HybridReqToTokenPoolStateView(
+        owner,
+        cache_params=_params(True),
+        mamba_layer_ids=[1, 5],
+        enable_draft_working_state=True,
+    )
+    owner.register_paired_mamba_state_view(view)
+    assert view.draft_working_pool.size == owner.size
+    committed = view.mamba_pool.mamba_cache
+    for value, tensor in enumerate([*committed.conv, committed.temporal], 2):
+        tensor.copy_(torch.arange(tensor.numel()).reshape(tensor.shape) % value)
+    before = [t.clone() for t in [*committed.conv, committed.temporal]]
+    for rows in ([1, 2], [2], [2, 1]):
+        req_indices = torch.tensor(rows, dtype=torch.int64)
+        result = view.prepare_draft_working_state(req_indices)
+        assert torch.equal(result, torch.arange(1, len(rows) + 1, dtype=torch.int32))
+        working = view.draft_working_pool.mamba_cache
+        sources = owner.get_mamba_indices(req_indices).long()
+        for dst, src in zip([*working.conv, working.temporal], before):
+            assert torch.equal(dst[:, 1 : len(rows) + 1], src[:, sources])
+            dst.fill_(99)  # abandoned speculative suffix must not persist
+        for current, original in zip([*committed.conv, committed.temporal], before):
+            assert torch.equal(current, original)
+    with pytest.raises(ValueError, match="capacity"):
+        view.prepare_draft_working_state(torch.tensor([1, 2, 1]))
+
+
+def test_paired_registration_cow_clear_and_foreign_owner_guards():
+    owner = _owner()
+    view = _view(owner)
+    owner.register_paired_mamba_state_view(view)
+    with pytest.raises(ValueError):
+        owner.register_paired_mamba_state_view(_view(owner))
+    with pytest.raises(ValueError):
+        _owner().register_paired_mamba_state_view(view)
+    for value, pool in enumerate((owner.mamba_pool, view.mamba_pool), 2):
+        pool.mamba_cache.temporal[:, 1].fill_(value)
+        pool.mamba_cache.conv[0][:, 1].fill_(value + 3)
+    before = owner.mamba_allocator.free_slots.clone()
+    owner.copy_mamba_states(torch.tensor([1]), torch.tensor([2]))
+    for pool in (owner.mamba_pool, view.mamba_pool):
+        assert torch.equal(
+            pool.mamba_cache.temporal[:, 1], pool.mamba_cache.temporal[:, 2]
+        )
+        assert torch.equal(
+            pool.mamba_cache.conv[0][:, 1], pool.mamba_cache.conv[0][:, 2]
+        )
+    owner.clear_mamba_states(torch.tensor([2]))
+    for pool in (owner.mamba_pool, view.mamba_pool):
+        assert torch.count_nonzero(pool.mamba_cache.temporal[:, 2]) == 0
+        assert torch.count_nonzero(pool.mamba_cache.conv[0][:, 2]) == 0
+        assert torch.count_nonzero(pool.mamba_cache.temporal[:, 1]) > 0
+    assert torch.equal(owner.mamba_allocator.free_slots, before)
+
+
+def test_view_deferred_initialization_never_reinitializes_computed_target():
+    owner = _owner()
+    view = _view(owner)
+    owner.register_paired_mamba_state_view(view)
+    for pool in (owner.mamba_pool, view.mamba_pool):
+        pool.mamba_cache.temporal.fill_(7)
+        pool.mamba_cache.conv[0].fill_(5)
+    view.clear_mamba_states(torch.tensor([1]))
+    assert torch.all(owner.mamba_pool.mamba_cache.temporal == 7)
+    assert torch.all(owner.mamba_pool.mamba_cache.conv[0] == 5)
+    view.copy_mamba_states(torch.tensor([1]), torch.tensor([2]))
+    assert torch.all(owner.mamba_pool.mamba_cache.temporal == 7)
+    assert torch.count_nonzero(view.mamba_pool.mamba_cache.temporal[:, 2]) == 0
+
+
 def test_independent_model_shapes_and_tensors_over_shared_indices():
     owner = _owner()
     before = owner.mamba_allocator.available_size()

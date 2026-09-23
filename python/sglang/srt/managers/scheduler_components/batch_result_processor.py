@@ -185,6 +185,7 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            result.wait_for_standalone_mamba_state()
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -635,6 +636,7 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        result.wait_for_standalone_mamba_state()
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

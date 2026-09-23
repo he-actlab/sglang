@@ -75,6 +75,21 @@ class GenerationBatchResult:
     # until the deferred extend runs).
     spec_pdmux_relay_deferred: bool = False
 
+    # Hybrid STANDALONE: immutable target checkpoint metadata for shifted draft
+    # recovery, plus the completion fence required before paired cache publish.
+    standalone_mamba_track_indices: Optional[torch.Tensor] = None
+    standalone_mamba_steps_to_track: Optional[torch.Tensor] = None
+    standalone_mamba_ready_event: Optional[torch.cuda.Event] = None
+    standalone_mamba_pending: bool = False
+
+    def wait_for_standalone_mamba_state(self):
+        if self.standalone_mamba_pending:
+            raise RuntimeError(
+                "Paired recurrent state cannot publish before draft extend is launched"
+            )
+        if self.standalone_mamba_ready_event is not None:
+            self.standalone_mamba_ready_event.synchronize()
+
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).

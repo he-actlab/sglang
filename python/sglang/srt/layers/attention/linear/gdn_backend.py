@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPoolStateView, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
@@ -309,7 +309,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        if self._uses_standalone_working_state(forward_batch.forward_mode):
+            layer_cache = self.req_to_token_pool.draft_working_pool.mamba2_layer_cache(
+                self.req_to_token_pool.mamba_map[layer.layer_id]
+            )
+        else:
+            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -403,7 +408,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
-        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        is_draft_extend = forward_batch.forward_mode.is_draft_extend_v2()
+        is_target_verify = (
+            forward_batch.forward_mode.is_target_verify() or is_draft_extend
+        )
+        if is_draft_extend and not isinstance(
+            self.req_to_token_pool, HybridReqToTokenPoolStateView
+        ):
+            raise ValueError("Hybrid draft-extend requires independent committed state")
+        if is_target_verify:
+            draft_token_num = (
+                forward_batch.spec_info.num_tokens_per_req
+                if is_draft_extend
+                else forward_batch.spec_info.draft_token_num
+            )
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
@@ -450,8 +468,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
-            draft_token_num = forward_batch.spec_info.draft_token_num
+            batch_size = seq_len // draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
@@ -467,6 +484,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
+                **({"disable_state_update": True} if is_draft_extend else {}),
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
@@ -527,7 +545,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 intermediate_states_buffer=intermediate_state_cache,
                 intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
+                cache_steps=draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
                 **(
                     dict(

@@ -631,6 +631,7 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    DISABLE_STATE_UPDATE: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
@@ -749,7 +750,8 @@ def _causal_conv1d_update_kernel(
         conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
     )  # [BLOCK_M, BLOCK_N]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+    if not DISABLE_STATE_UPDATE:
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
@@ -1005,6 +1007,7 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    disable_state_update: bool = False,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1022,6 +1025,8 @@ def causal_conv1d_update(
         If not None, the conv_state is a larger tensor along the batch dim,
         and we are selecting the batch coords specified by conv_state_indices.
         Useful for a continuous batching scenario.
+    disable_state_update: preserve the input conv state while still producing
+        outputs and optional per-token windows for accepted-prefix recovery.
     pad_slot_id: int
             if cache_indices is passed, lets the kernel identify padded
             entries that will not be processed,
@@ -1194,6 +1199,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        DISABLE_STATE_UPDATE=disable_state_update,
         **pdl_kwargs,
     )
     if unsqueeze:
