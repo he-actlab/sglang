@@ -335,6 +335,7 @@ def repeat_order_observations(snapshots, schedule):
 def run(plan, members, output):
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.distributed import init_distributed_environment, initialize_model_parallel
+    from sglang.srt.distributed.parallel_state import destroy_model_parallel, destroy_distributed_environment
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
     if output.exists() or output.with_suffix(".pt").exists():
@@ -353,29 +354,37 @@ def run(plan, members, output):
         raise ValueError("unexpected native TF32 override")
     set_global_server_args_for_scheduler(args)
     with tempfile.TemporaryDirectory(prefix="b2-layer0-tp1-") as tmp:
-        init_distributed_environment(world_size=1, rank=0, local_rank=0,
-                                     distributed_init_method=f"file://{tmp}/init", backend="nccl")
-        initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
-        embedding, norm, attention = build_native(plan["snapshot"])
-        result, snapshots = collect_calls(embedding, norm, attention, members, schedule, cpu_limit)
-        free_after, _ = torch.cuda.mem_get_info()
-        memory = {"free_before": free, "free_after": free_after, "total": total,
-                  "peak_allocated": torch.cuda.max_memory_allocated(),
-                  "peak_reserved": torch.cuda.max_memory_reserved(),
-                  "headroom_gate": free_after >= DEVICE_HEADROOM}
-        tensor_path = output.with_suffix(".pt")
-        with tensor_path.open("xb") as f:
-            torch.save(snapshots, f)
-        report = {"status": "COMPONENT_OBSERVATION_NOT_SERVING_OR_PERFORMANCE", "members": result,
-                  "between_cohorts": {key: comparison(snapshots[0][key], snapshots[1][key]) for key in snapshots[0]},
-                  "tensor_sha256": sha(tensor_path), "memory": memory,
-                  "limitations": plan["limitations"], "runtime_revision": plan["runtime_revision"]}
-        if "repeat_order" in plan:
-            report["repeat_order"] = repeat_order_observations(snapshots, schedule)
-        with output.open("x") as f:
-            json.dump(report, f, indent=2); f.write("\n")
-        if not memory["headroom_gate"]:
-            raise ValueError("component physical headroom gate failed; observation retained")
+        try:
+            init_distributed_environment(world_size=1, rank=0, local_rank=0,
+                                         distributed_init_method=f"file://{tmp}/init", backend="nccl")
+            initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+            embedding, norm, attention = build_native(plan["snapshot"])
+            result, snapshots = collect_calls(embedding, norm, attention, members, schedule, cpu_limit)
+            free_after, _ = torch.cuda.mem_get_info()
+            memory = {"free_before": free, "free_after": free_after, "total": total,
+                      "peak_allocated": torch.cuda.max_memory_allocated(),
+                      "peak_reserved": torch.cuda.max_memory_reserved(),
+                      "headroom_gate": free_after >= DEVICE_HEADROOM}
+            tensor_path = output.with_suffix(".pt")
+            with tensor_path.open("xb") as f:
+                torch.save(snapshots, f)
+            report = {"status": "COMPONENT_OBSERVATION_NOT_SERVING_OR_PERFORMANCE", "members": result,
+                      "between_cohorts": {key: comparison(snapshots[0][key], snapshots[1][key]) for key in snapshots[0]},
+                      "tensor_sha256": sha(tensor_path), "memory": memory,
+                      "limitations": plan["limitations"], "runtime_revision": plan["runtime_revision"]}
+            if "repeat_order" in plan:
+                report["repeat_order"] = repeat_order_observations(snapshots, schedule)
+            with output.open("x") as f:
+                json.dump(report, f, indent=2); f.write("\n")
+            if not memory["headroom_gate"]:
+                raise ValueError("component physical headroom gate failed; observation retained")
+        finally:
+            # Release native groups before interpreter exit, including partial init.
+            # Numerical records and memory observations above precede teardown.
+            try:
+                destroy_model_parallel()
+            finally:
+                destroy_distributed_environment()
 
 
 def main():
