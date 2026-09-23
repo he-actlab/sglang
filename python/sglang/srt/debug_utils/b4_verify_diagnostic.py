@@ -169,7 +169,10 @@ def _validate_server(args):
         enable_dp_lm_head=False,
         disable_cuda_graph_padding=False,
         speculative_draft_attention_backend=None,
-        disable_chunked_prefix_cache=False,
+        # Native ModelRunner.model_specific_adjustment disables the MLA-only
+        # chunked-prefix path for this non-MLA model before this graph hook.
+        # This is distinct from the separately pinned radix-cache policy.
+        disable_chunked_prefix_cache=True,
         enable_hierarchical_cache=False,
         moe_runner_backend="auto",
         moe_a2a_backend="none",

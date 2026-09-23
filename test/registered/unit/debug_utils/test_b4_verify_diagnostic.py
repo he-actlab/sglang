@@ -582,6 +582,62 @@ def test_post_draft_guard_requires_native_target_context(monkeypatch):
     )
 
 
+def _native_model_specific_adjustment():
+    # Execute the complete unchanged native method without importing CUDA-only
+    # attention backends or constructing/loading a ModelRunner.
+    path = ROOT / "python/sglang/srt/model_executor/model_runner.py"
+    source = path.read_text()
+    tree = ast.parse(source)
+    owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ModelRunner")
+    method = next(n for n in owner.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "model_specific_adjustment")
+    constant = next(n for n in tree.body if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id ==
+                            "CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS" for t in n.targets))
+    namespace = {}
+    exec(compile(ast.Module(body=[constant, method], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["model_specific_adjustment"]
+
+
+def test_native_non_mla_adjustment_precedes_strict_graph_hook_guard(monkeypatch):
+    from sglang.srt.server_args import ServerArgs
+
+    monkeypatch.setenv(diag._KIND_ENV, "correctness-only")
+    monkeypatch.setenv("DUMPER_NON_INTRUSIVE_MODE", "off")
+    monkeypatch.setenv("DUMPER_ENABLE", "false")
+    args = ServerArgs(model_path="dummy")
+    assert args.disable_chunked_prefix_cache is False  # native launch default
+    for key, value in vars(server_args()).items():
+        if key != "disable_chunked_prefix_cache":
+            setattr(args, key, value)
+    args.chunked_prefill_size = 8192
+    # The pinned-config CPU preflight separately verifies these exact model
+    # properties. Here the complete native method reproduces their mutation.
+    runner = NS(server_args=args, use_mla_backend=False, is_multimodal=True,
+                is_multimodal_chunked_prefill_supported=True,
+                model_config=NS(hf_config=NS(model_type="qwen3_5_moe",
+                                            architectures=["Qwen3_5MoeForConditionalGeneration"])))
+    _native_model_specific_adjustment()(runner)
+    assert args.disable_chunked_prefix_cache is True
+    assert args.disable_radix_cache is True and args.chunked_prefill_size == 8192
+    diag._validate_server(args)
+    args.disable_chunked_prefix_cache = False
+    with pytest.raises(RuntimeError, match="disable_chunked_prefix_cache"):
+        diag._validate_server(args)
+
+
+def test_native_worker_initialization_precedes_diagnostic_graph_hook():
+    source = (ROOT / "python/sglang/srt/managers/scheduler.py").read_text()
+    owner = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "Scheduler")
+    method = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "init_model_worker")
+    calls = [ast.unparse(n.func) for n in ast.walk(method) if isinstance(n, ast.Call)]
+    assert calls.index("self.init_tp_model_worker") < calls.index("self.maybe_init_draft_worker")
+    assert calls.index("self.maybe_init_draft_worker") < calls.index("self.init_memory_pools")
+    assert calls.index("self.init_memory_pools") < calls.index("self.init_all_cuda_graphs")
+    runner = (ROOT / "python/sglang/srt/model_executor/model_runner.py").read_text()
+    assert "self.model_specific_adjustment()" in runner
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="native CUDA import gate requires a reserved GPU",
