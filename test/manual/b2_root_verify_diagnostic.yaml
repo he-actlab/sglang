@@ -29,8 +29,22 @@ patches:
               )
               capture_prefill(self, batch, forward_batch, batch_result, is_verify)
   - target: sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify
-    preamble: from sglang.srt.debug_utils.b2_root_verify_diagnostic import capture_verify, capture_compact, attach_result
+    preamble: from sglang.srt.debug_utils.b2_root_verify_diagnostic import capture_verify, capture_compact, attach_result, capture_prefix_verify
     edits:
+      - match: |
+          forward_batch_output = self.target_worker.forward_batch_generation(
+              batch=None,
+              forward_batch=verify_forward_batch,
+              is_verify=True,
+          )
+        replacement: |
+          capture_prefix_verify("P1", self, batch, verify_forward_batch, can_run_cuda_graph)
+          forward_batch_output = self.target_worker.forward_batch_generation(
+              batch=None,
+              forward_batch=verify_forward_batch,
+              is_verify=True,
+          )
+          capture_prefix_verify("P2", self, batch, verify_forward_batch, can_run_cuda_graph)
       - match: new_seq_lens = batch.seq_lens + accept_lens
         prepend: |
           diagnostic_capture = capture_verify(self, batch, verify_forward_batch, verify_input, logits_output, predict, accept_lens, accept_index, can_run_cuda_graph)
