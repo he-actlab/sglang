@@ -33,7 +33,7 @@ def fixture(tmp_path, repeat=1):
                tensors={f"input_{selected}": IDS[:],f"positions_{selected}":list(range(43))})
     value = torch.zeros((43,8,128),dtype=torch.bfloat16)
     tensor = tmp_path/"p0.pt"
-    torch.save([[(value,value) for _ in range(32)]],tensor)
+    torch.save([[(value,value)] for _ in range(32)],tensor)
     p0 = dict(phase="P0",idx=118,rid=rids[-1],input_ids_sha256=replay.SELECTED_SHA,
               tensor_file_sha256=replay.sha(tensor),snapshot_bytes=5636096)
     content = {"catalog":dict(rid_prefix=prefix,requests=rows),"prefill":cap,"p0_metadata":p0}
@@ -94,13 +94,15 @@ def test_missing_or_wrong_hashed_artifact(tmp_path):
     with pytest.raises(FileNotFoundError): replay.validated_member(tmp_path,member,1)
 
 
-@pytest.mark.parametrize("bad",["shape","dtype","layers"])
+@pytest.mark.parametrize("bad",["shape","dtype","layers","transposed_layers_chunks"])
 def test_p0_geometry_fail_closed(tmp_path,bad):
     member = fixture(tmp_path)
     value = torch.zeros((43,8,127) if bad=="shape" else (43,8,128),
                         dtype=torch.float32 if bad=="dtype" else torch.bfloat16)
     path=tmp_path/"p0.pt"
-    torch.save([[(value,value) for _ in range(31 if bad=="layers" else 32)]],path)
+    data=[[(value,value)] for _ in range(31 if bad=="layers" else 32)]
+    if bad=="transposed_layers_chunks": data=[[(value,value) for _ in range(32)]]
+    torch.save(data,path)
     member["p0_tensor"]["sha256"]=replay.sha(path)
     mutate(tmp_path,member,"p0_metadata",lambda x:x.update(tensor_file_sha256=replay.sha(path)))
     with pytest.raises(ValueError): replay.validated_member(tmp_path,member,1)

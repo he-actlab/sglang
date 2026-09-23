@@ -103,12 +103,12 @@ def validated_member(root, member, repeat):
     }.items()):
         raise ValueError("P0 identity/payload mismatch")
     data = torch.load(p0_path, map_location="cpu", weights_only=True)
-    if len(data) != 1 or len(data[0]) != 32:
+    if len(data) != 32 or any(len(layer) != 1 for layer in data):
         raise ValueError("P0 chunk/layer shape mismatch")
-    for layer in data[0]:
-        if len(layer) != 2 or any(
+    for layer in data:
+        if len(layer[0]) != 2 or any(
             t.dtype != torch.bfloat16 or tuple(t.shape) != (43, 8, 128)
-            or not torch.isfinite(t).all() for t in layer
+            or not torch.isfinite(t).all() for t in layer[0]
         ):
             raise ValueError("P0 tensor shape/dtype/finite mismatch")
     expected = [t.clone() for t in data[0][0]]
