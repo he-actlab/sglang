@@ -3,6 +3,7 @@
 import ast
 import copy
 import importlib.util
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -864,10 +865,36 @@ def test_cuda_component_native_patch_install_restore():
     raw = yaml.safe_load((ROOT / "test/manual/b4_verify_diagnostic.yaml").read_text())
     specs = PatchConfig(**raw).patches
     native = [_resolve_target(s.target) for s in specs]
-    codes = [f.__code__ for f in native]
+    underlying = [inspect.unwrap(f) for f in native]
+    codes = [f.__code__ for f in underlying]
+    wrappers = [(f, f.__code__, f.__closure__) for f,u in zip(native,underlying) if f is not u]
     with CodePatcher(patches=specs):
-        assert all(f.__code__ is not code for f, code in zip(native, codes))
-    assert all(f.__code__ is code for f, code in zip(native, codes))
+        assert all(f.__code__ is not code for f, code in zip(underlying, codes))
+        assert all(f.__code__ is code and f.__closure__ is closure for f,code,closure in wrappers)
+        # Invoke the actual decorated native forward with tiny CPU layer stubs:
+        # install alone cannot prove the wrapper reaches the edited body.
+        from contextlib import nullcontext
+        from sglang.srt.models import qwen3_5
+        from sglang.srt.debug_utils import b4_layer_boundary_diagnostic as boundary
+        order = []
+        def layer(**kw):
+            assert not torch.is_grad_enabled()
+            order.append("native_layer")
+            return kw["hidden_states"] + 1, kw["hidden_states"]
+        def norm(hidden,residual):
+            order.append("native_norm")
+            return hidden + residual, residual
+        model = NS(pp_group=NS(is_first_rank=True,is_last_rank=True), start_layer=0,end_layer=1,
+                   layers=[layer],norm=norm)
+        with patch.object(qwen3_5,"get_global_expert_distribution_recorder",return_value=NS(
+                with_current_layer=lambda i:nullcontext())), \
+             patch.object(boundary,"boundary",side_effect=lambda f,i,e,h,r:order.append(e)), \
+             patch.object(boundary,"final_hidden",side_effect=lambda f,h:order.append("final")):
+            output=qwen3_5.Qwen3_5ForCausalLM.forward(model,None,None,NS(),
+                input_embeds=torch.ones((5,2),requires_grad=True))
+        assert order == ["input","native_layer","output","native_norm","final"]
+        assert torch.equal(output,torch.full((5,2),3.0)) and not output.requires_grad
+    assert all(f.__code__ is code for f, code in zip(underlying, codes))
     assert len(codes) == 9
 
 

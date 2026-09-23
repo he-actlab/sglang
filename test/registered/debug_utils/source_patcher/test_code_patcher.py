@@ -1,6 +1,9 @@
 from types import ModuleType
+import functools
+import inspect
 
 import pytest
+import torch
 
 from sglang.srt.debug_utils.source_patcher.code_patcher import (
     CodePatcher,
@@ -14,9 +17,48 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 SAMPLE_MODULE_NAME = "_source_patcher_test_fixtures.sample_module"
+DECORATIONS = []
+BODY_GLOBAL = 3
+
+
+def counted_decorator(fn):
+    DECORATIONS.append(fn)
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapped
+
+
+@counted_decorator
+@torch.no_grad()
+def decorated_forward(value):
+    return value * BODY_GLOBAL
 
 
 class TestPatchFunction:
+    def test_decorated_native_globals_wrapper_semantics_and_restore(self):
+        outer = decorated_forward
+        middle = outer.__wrapped__
+        inner = inspect.unwrap(outer)
+        identities = (outer.__code__, outer.__closure__, middle.__code__, middle.__closure__, inner.__code__)
+        value = torch.tensor(2.0, requires_grad=True)
+        before = len(DECORATIONS)
+        state = patch_function(target=outer, edits=[EditSpec(
+            match="return value * BODY_GLOBAL", replacement="return value * (BODY_GLOBAL + 1)")])
+        try:
+            assert state.target_fn is inner
+            assert decorated_forward is outer and outer.__wrapped__ is middle
+            assert (outer.__code__, outer.__closure__, middle.__code__, middle.__closure__) == identities[:4]
+            result = outer(value)
+            assert result.item() == 8 and not result.requires_grad
+            assert len(DECORATIONS) == before  # Never re-evaluate decorators.
+        finally:
+            state.restore()
+        assert inner.__code__ is identities[4]
+        assert outer(value).item() == 6 and not outer(value).requires_grad
+
     def test_basic_patch_changes_behavior(self, sample_module: ModuleType) -> None:
         cls = sample_module.SampleClass
         obj = cls()
@@ -177,6 +219,18 @@ class TestResolveTarget:
 
 
 class TestCodePatcher:
+    def test_later_install_failure_restores_earlier_native_code(self, sample_module):
+        fn = sample_module.SampleClass.greet
+        original = fn.__code__
+        patches = [PatchSpec(target=f"{SAMPLE_MODULE_NAME}.SampleClass.greet", edits=[EditSpec(
+            match='greeting = f"hello {name}"', replacement='greeting = f"changed {name}"')]),
+            PatchSpec(target=f"{SAMPLE_MODULE_NAME}.does_not_exist", edits=[])]
+        with pytest.raises(AttributeError):
+            with CodePatcher(patches=patches):
+                pytest.fail("Installation must fail")
+        assert fn.__code__ is original
+        assert sample_module.SampleClass().greet("world") == "hello world"
+
     def test_context_manager_patches_and_restores(
         self, sample_module: ModuleType
     ) -> None:

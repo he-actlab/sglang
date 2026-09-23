@@ -236,6 +236,8 @@ def _runtime_identity():
         "test/registered/unit/debug_utils/test_b4_entry_state_diagnostic.py",
         "python/sglang/srt/debug_utils/b4_layer_boundary_diagnostic.py",
         "test/registered/unit/debug_utils/test_b4_layer_boundary_diagnostic.py",
+        "python/sglang/srt/debug_utils/source_patcher/code_patcher.py",
+        "test/registered/debug_utils/source_patcher/test_code_patcher.py",
     }
     _require(
         set(git("diff", "--name-only", _BASE, "HEAD").splitlines()) <= allowed,

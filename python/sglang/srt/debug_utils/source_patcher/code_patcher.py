@@ -1,5 +1,6 @@
 import __future__
 
+import ast
 import importlib
 import inspect
 import textwrap
@@ -78,9 +79,18 @@ def patch_function(
 
     Returns PatchState that can restore the original code.
     """
+    # getsource already follows __wrapped__; use that same function's globals
+    # and code, leaving decorator wrappers and their closure objects intact.
+    target = inspect.unwrap(target)
     original_code: types.CodeType = target.__code__
 
-    source: str = inspect.getsource(target)
+    source: str = textwrap.dedent(inspect.getsource(target))
+    definition = ast.parse(source).body[0]
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        raise TypeError("source patch target must be a Python function")
+    # Compile only the body definition: re-running decorators can create a new
+    # wrapper/closure or repeat registration side effects.
+    source = "\n".join(source.splitlines()[definition.lineno - 1 :])
     modified_source: str = apply_edits(source=source, edits=edits)
     modified_source = textwrap.dedent(modified_source)
 
@@ -107,13 +117,19 @@ def patch_function(
 
 def _apply_specs(specs: list[PatchSpec]) -> list[PatchState]:
     states: list[PatchState] = []
-    for spec in specs:
-        target_fn: Callable[..., Any] = _resolve_target(spec.target)
-        print(f"[source_patcher] patching {spec.target}")
-        state: PatchState = patch_function(
-            target=target_fn, edits=spec.edits, preamble=spec.preamble
-        )
-        states.append(state)
+    try:
+        for spec in specs:
+            target_fn: Callable[..., Any] = _resolve_target(spec.target)
+            print(f"[source_patcher] patching {spec.target}")
+            state: PatchState = patch_function(
+                target=target_fn, edits=spec.edits, preamble=spec.preamble
+            )
+            states.append(state)
+    except BaseException:
+        # __exit__ is not invoked when __enter__/installation fails.
+        for state in reversed(states):
+            state.restore()
+        raise
     return states
 
 
