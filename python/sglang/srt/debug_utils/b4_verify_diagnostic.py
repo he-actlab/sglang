@@ -234,6 +234,8 @@ def _runtime_identity():
         "test/registered/unit/debug_utils/test_b4_verify_diagnostic.py",
         "python/sglang/srt/debug_utils/b4_entry_state_diagnostic.py",
         "test/registered/unit/debug_utils/test_b4_entry_state_diagnostic.py",
+        "python/sglang/srt/debug_utils/b4_layer_boundary_diagnostic.py",
+        "test/registered/unit/debug_utils/test_b4_layer_boundary_diagnostic.py",
     }
     _require(
         set(git("diff", "--name-only", _BASE, "HEAD").splitlines()) <= allowed,
@@ -278,6 +280,7 @@ class _State:
         self.terminals = {}
         self.discarded_finished = 0
         self.entry = None
+        self.layers = None
 
     def request_row(self, req):
         row = self.rows.get(req.rid)
@@ -474,6 +477,10 @@ class _State:
         if self.entry is not None:
             entry_tensors, entry_meta = self.entry.take_verify(forward)
             tensors.update(entry_tensors)
+        boundary_meta = None
+        if self.layers is not None:
+            boundary_tensors, boundary_meta = self.layers.take(forward)
+            tensors.update(boundary_tensors)
         return self._make(
             "verify",
             batch,
@@ -485,6 +492,7 @@ class _State:
                 can_run_cuda_graph=can_graph,
                 graph_bucket=int(graph.bs) if can_graph else None,
                 **({"entry_state": entry_meta} if entry_meta is not None else {}),
+                **({"layer_boundary": boundary_meta} if boundary_meta is not None else {}),
             ),
         )
 
@@ -628,6 +636,12 @@ class _State:
         )
         if self.entry is not None:
             self.entry.publish(req, record)
+        if self.layers is not None:
+            try:
+                self.layers.publish(req, record)
+            except RuntimeError as exc:
+                # Preserve bounded result-owned flags before failing the gate.
+                problems.append(str(exc))
         path = self.directory / f'{row["idx"]:04d}-{cap.serial:06d}-{kind}.json'
         with path.open("x") as stream:
             json.dump(_json_finite(record), stream, indent=2, allow_nan=False)
@@ -684,6 +698,7 @@ class _State:
     def snapshot(self):
         return dict(
             **({"entry_state": self.entry.snapshot()} if self.entry is not None else {}),
+            **({"layer_boundary": self.layers.snapshot()} if self.layers is not None else {}),
             performance_eligible=False,
             registered_requests=len(self.rows),
             seen_requests=len(self.seen),
@@ -725,6 +740,13 @@ def initialize(runner):
         from sglang.srt.debug_utils.b4_entry_state_diagnostic import EntryObserver
 
         _state.entry = EntryObserver(runner, _state)
+    layer_opt_in = os.environ.get("SGLANG_B4_LAYER_BOUNDARY_DIAGNOSTIC", "0")
+    _require(layer_opt_in in ("0", "1"), "layer-boundary opt-in must be 0 or 1")
+    _require(("layer_boundary" in config) == (layer_opt_in == "1"), "layer-boundary declaration/opt-in")
+    if layer_opt_in == "1":
+        from sglang.srt.debug_utils.b4_layer_boundary_diagnostic import initialize as initialize_layers
+
+        _state.layers = initialize_layers(runner, _state)
     print("B4_VERIFY_DIAGNOSTIC correctness-only PERFORMANCE_INELIGIBLE", flush=True)
 
 
@@ -774,6 +796,8 @@ def publish(req, tokens, result, kind):
 
 
 def prepare_entry(worker, batch, forward, can_graph):
+    if _state is not None and _state.layers is not None:
+        _state.layers.before_verify()
     if _state is not None and _state.entry is not None:
         _state.entry.before_verify(batch, forward, can_graph)
 
@@ -781,6 +805,8 @@ def prepare_entry(worker, batch, forward, can_graph):
 def capture_graph_entry(graph, forward):
     if _state is not None and _state.entry is not None:
         _state.entry.graph_entry(graph, forward)
+    if _state is not None and _state.layers is not None:
+        _state.layers.graph_entry(graph, forward)
 
 
 def discard_finished(req, result, kind):

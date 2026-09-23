@@ -103,3 +103,12 @@ patches:
     edits:
       - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
         append: ret["b4_verify_diagnostic"] = snapshot()
+  - target: sglang.srt.models.qwen3_5.Qwen3_5ForCausalLM.forward
+    preamble: from sglang.srt.debug_utils.b4_layer_boundary_diagnostic import boundary, final_hidden
+    edits:
+      - match: with get_global_expert_distribution_recorder().with_current_layer(
+        prepend: boundary(forward_batch, layer_idx, "input", hidden_states, residual)
+      - match: "# Process deepstack embeddings if provided"
+        prepend: boundary(forward_batch, layer_idx, "output", hidden_states, residual)
+      - match: "if len(aux_hidden_states) == 0:"
+        prepend: final_hidden(forward_batch, hidden_states)

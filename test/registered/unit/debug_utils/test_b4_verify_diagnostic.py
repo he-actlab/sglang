@@ -649,7 +649,45 @@ def patched_functions():
 
 
 def test_yaml_matches_all_actual_native_methods_uniquely_and_compiles():
-    assert len(patched_functions()) == 8
+    assert len(patched_functions()) == 9
+
+
+def test_layer_boundary_hook_order_and_native_forward_unchanged():
+    original, modified = patched_functions()["forward"]
+    assert (modified.index('boundary(forward_batch, layer_idx, "input"')
+            < modified.index("hidden_states, residual = layer(")
+            < modified.index('boundary(forward_batch, layer_idx, "output"')
+            < modified.index("hidden_states, _ = self.norm(")
+            < modified.index("final_hidden(forward_batch, hidden_states)")
+            < modified.index("if len(aux_hidden_states) == 0:"))
+
+    class RemoveObservation(ast.NodeTransformer):
+        def visit_Expr(self, node):
+            if (isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in ("boundary", "final_hidden")):
+                return None
+            return self.generic_visit(node)
+
+    assert ast.dump(RemoveObservation().visit(ast.parse(modified))) == ast.dump(ast.parse(original))
+
+
+def test_layer_final_and_residual_counts_follow_result_owned_retirement(tmp_path):
+    state = diag._State(config(tmp_path))
+    req = request(state)
+    source = torch.zeros((161, 5), dtype=torch.int64)
+    source[5, 0], source[160, 1] = 2, 3
+    state.layers = NS(take=lambda forward: ({"boundary_counts": source}, None),
+                      publish=lambda request, record: None)
+    _, _, _, result, cap = verify(state, req)
+    source.fill_(999)
+    assert cap.tensors["boundary_counts"][5, 0] == 2
+    assert cap.tensors["boundary_counts"][160, 1] == 3
+    req.output_ids.extend([3, 4, 5])
+    state.publish(req, [3, 4, 5], result, "verify")
+    record = records(state)[0]
+    assert record["tensors"]["boundary_counts"][5][0] == 2
+    assert record["tensors"]["boundary_counts"][160][1] == 3
+    assert cap.tensors == {} and not state.pending and state.retained_bytes == 0
 
 
 def test_verify_hook_order_and_native_constructor_unchanged():
@@ -830,7 +868,7 @@ def test_cuda_component_native_patch_install_restore():
     with CodePatcher(patches=specs):
         assert all(f.__code__ is not code for f, code in zip(native, codes))
     assert all(f.__code__ is code for f, code in zip(native, codes))
-    assert len(codes) == 8
+    assert len(codes) == 9
 
 
 @pytest.mark.skipif(
