@@ -432,6 +432,7 @@ class PairedWatch:
             pairs=0,
             mismatches=0,
             slot_pairs=[0, 0],
+            slot_max_batch=[0, 0],
             watched_rows=[],
             watched_state_rows=[],
             generations=[],
@@ -538,6 +539,9 @@ class PairedWatch:
         self.free_mailboxes.append(ticket.mailbox)
         self.stats["pairs"] += 1
         self.stats["slot_pairs"][ticket.slot] += 1
+        self.stats["slot_max_batch"][ticket.slot] = max(
+            self.stats["slot_max_batch"][ticket.slot], len(ticket.rows)
+        )
         self.stats["prefix_histogram"][selected - 1] += 1
         self.stats["slot_prefix_histograms"][ticket.slot][selected - 1] += 1
         self.stats["continuity_pairs"] += int(bool(continuity[0]))
@@ -614,6 +618,10 @@ def selection(worker, batch, verify_input, predict, accepted, selected):
 
 def attach_result(batch, result):
     if not batch.forward_mode.is_idle():
+        if getattr(result, "can_run_cuda_graph", None) is not True:
+            raise AssertionError(
+                "watched target result requires actual CUDA graph replay"
+            )
         result._b3_watched_ticket = batch._b3_watched_ticket
 
 
@@ -639,6 +647,8 @@ def begin_draft(worker, batch, result):
 def draft_feed(worker, batch, forward_batch, result, graph):
     if batch.forward_mode.is_idle():
         return
+    if graph is not True:
+        raise AssertionError("watched draft extend requires actual CUDA graph replay")
     ticket = batch._b3_watched_ticket
     source = (
         worker.cuda_graph_runner_for_draft_extend.buffers if graph else forward_batch
