@@ -2081,6 +2081,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return False
         return bool(self._spec_pdmux_state["prefill_pending"])
 
+    def _snapshot_spec_pdmux_verify_hidden_states(self, batch_output) -> None:
+        hidden_states = batch_output.logits_output.hidden_states
+        if (
+            self.topk == 1
+            and self.speculative_algorithm.is_eagle()
+            and hidden_states is not None
+        ):
+            # Target graph replay returns borrowed output storage. The next
+            # slot can replay before SMALL consumes this deferred extend's
+            # input. Snapshot on LARGE before verify_done, without joining
+            # streams. Topk>1 already owns _finalize_accept_tree_path's copy;
+            # STANDALONE never consumes target hidden states.
+            batch_output.logits_output.hidden_states = hidden_states.clone()
+
     def flush_spec_pdmux_pending(
         self, slot: Optional[int] = None, decode_only: bool = False
     ) -> None:
@@ -2796,6 +2810,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
             if concurrent:
+                self._snapshot_spec_pdmux_verify_hidden_states(batch_output)
                 # Recorded on the large stream right after verify's work; the
                 # deferred extend(X) waits exactly this (its only cross-stream
                 # input dependency: predict / accept_lens / hidden_states).
