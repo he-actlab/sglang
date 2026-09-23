@@ -70,6 +70,41 @@ TRANSIENT_ALLOWANCE = 256 << 20  # Planning allowance, not measured graph overhe
 FREE_GUARD = 512 << 20
 
 
+def large_buffer_plan(layout):
+    """Disjoint views; explicit padding remains inside the unchanged bound."""
+    offsets, end = {}, 0
+    for name, (shape, dtype) in layout.specs().items():
+        size = prod(shape) * dtype.itemsize
+        if size > 1 << 20:
+            offset = (end + 511) // 512 * 512
+            offsets[name] = (offset, size)
+            end = offset + size
+    alignment = 2 << 20
+    return offsets, (end + alignment - 1) // alignment * alignment
+
+
+def check_allocation_bound(before, after, storage, device_meta):
+    inventory = {name: value.numel() * value.element_size()
+                 for name, value in storage.buffers.items()}
+    metadata = {name: value.numel() * value.element_size() for name, value in (
+        ("raw_epochs", storage.raw_epochs), ("state_owners", storage.state_owners),
+        ("device_meta", device_meta))}
+    arena_bytes = storage.large_arena.numel() if storage.large_arena is not None else 0
+    small_bytes = sum(size for name, size in inventory.items()
+                      if name not in storage.large_offsets)
+    limit = storage.layout.nbytes() + STATIC_METADATA_ALLOWANCE
+    increment = after - before
+    require(increment <= limit,
+        "allocator-rounded persistent allocation exceeded declaration: " + json.dumps(dict(
+            before_bytes=before, after_bytes=after, increment_bytes=increment,
+            limit_bytes=limit, logical_tensor_bytes=storage.layout.nbytes(),
+            tensor_requested_bytes=inventory, metadata_requested_bytes=metadata,
+            arena_requested_bytes=arena_bytes, small_tensor_requested_bytes=small_bytes,
+            persistent_requested_bytes=arena_bytes+small_bytes+sum(metadata.values()),
+        ), sort_keys=True))
+    return increment
+
+
 def graph_copy_rows(bucket, actual_rows):
     """Only native leading rows are live; graph padding is never a carry index."""
     require(type(bucket) is int and 1 <= bucket <= 64, "graph bucket bound")
@@ -256,8 +291,20 @@ class CarriedBuffers:
     def __init__(self, device, layer_map, layout=Layout()):
         self.device, self.layout, self.layer_map = device, layout, dict(layer_map)
         require(sorted(self.layer_map.values()) == list(range(layout.layers)), "all recurrent layers")
-        self.buffers = {name: torch.empty(shape, dtype=dtype, device=device)
-                        for name, (shape, dtype) in layout.specs().items()}
+        self.large_offsets, arena_bytes = large_buffer_plan(layout)
+        # Each large tensor keeps its own non-overlapping range and native
+        # contiguous layout. The one persistent owner outlives every replay.
+        # Small allocations and the observer's numerical work are unchanged.
+        self.large_arena = (torch.empty(arena_bytes, dtype=torch.uint8, device=device)
+                            if arena_bytes else None)
+        self.buffers = {}
+        for name, (shape, dtype) in layout.specs().items():
+            if name in self.large_offsets:
+                offset, size = self.large_offsets[name]
+                value = self.large_arena.narrow(0, offset, size).view(dtype).view(shape)
+            else:
+                value = torch.empty(shape, dtype=dtype, device=device)
+            self.buffers[name] = value
         # Part of the separately declared 64KiB numeric metadata allowance.
         self.raw_epochs = torch.zeros((layout.slots,layout.layers), dtype=torch.int64, device=device)
         self.state_owners = torch.zeros(layout.slots*layout.rows+1,dtype=torch.int64,device=device)
@@ -551,11 +598,10 @@ class Observer:
         self.host_flags = torch.empty(self.storage.buffers["result_flags"].shape,dtype=torch.int64,pin_memory=True)
         self.device_meta = torch.empty((4,32,3),dtype=torch.int64,device=runner.device)
         self.host_meta = torch.empty((4,32,3),dtype=torch.int64,pin_memory=True)
-        self.allocator_increment = torch.cuda.memory_allocated(runner.device)-before
+        after = torch.cuda.memory_allocated(runner.device)
         require((self.storage.raw_epochs.numel()+self.storage.state_owners.numel()+self.device_meta.numel())*8 < STATIC_METADATA_ALLOWANCE,
                 "numeric metadata allocation bound")
-        require(self.allocator_increment <= Layout().nbytes()+STATIC_METADATA_ALLOWANCE,
-                "allocator-rounded persistent allocation exceeded declaration")
+        self.allocator_increment = check_allocation_bound(before, after, self.storage, self.device_meta)
         require(torch.cuda.mem_get_info(runner.device)[0] >= TRANSIENT_ALLOWANCE+FREE_GUARD,
                 "postallocation physical memory guard")
         self.preallocation_free = free

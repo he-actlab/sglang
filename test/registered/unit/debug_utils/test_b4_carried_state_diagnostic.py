@@ -1,12 +1,14 @@
 from types import SimpleNamespace
 import ast
 import inspect
+import json
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 import yaml
 import sglang.srt.debug_utils.b4_carried_state_diagnostic as diag
 
@@ -19,6 +21,8 @@ from sglang.srt.debug_utils.b4_carried_state_diagnostic import (
     CarriedBuffers,
     accepted_conv_window,
     graph_copy_rows,
+    large_buffer_plan,
+    check_allocation_bound,
 )
 
 
@@ -54,6 +58,85 @@ def test_exact_planned_tensor_inventory_without_allocating_gpu():
     assert layout.specs()["carry"][0] == (2, 30, 33, 32, 128, 128)
     assert layout.specs()["dense"][0] == (2, 33, 5, 32, 128, 128)
     assert layout.specs()["result_flags"][0] == (4, 30, 32, 8)
+
+
+def test_default_large_arena_stays_inside_original_static_bound():
+    layout = Layout()
+    offsets, arena_bytes = large_buffer_plan(layout)
+    assert len(offsets) == 13
+    assert sum(size for _, size in offsets.values()) == 5639208960
+    assert arena_bytes == 5639241728
+    end = 0
+    for offset, size in offsets.values():
+        assert offset % 512 == 0 and offset >= end
+        end = offset + size
+    assert arena_bytes - end == 32768
+    rounded = lambda n: (n + 511) // 512 * 512
+    small = sum(rounded(diag.prod(shape)*dtype.itemsize)
+                for name, (shape, dtype) in layout.specs().items() if name not in offsets)
+    metadata = sum(rounded(n) for n in (60*8, 65*8, 4*32*3*8))
+    # Conditional fresh-block arithmetic, NOT a measured allocator/model fit.
+    assert arena_bytes + small + metadata == 5640830464
+    assert layout.nbytes() + STATIC_METADATA_ALLOWANCE - (arena_bytes + small + metadata) == 26304
+
+
+def test_default_meta_views_preserve_every_native_shape_dtype_and_stride():
+    layout = Layout()
+    storage = CarriedBuffers(torch.device("meta"), {i:i for i in range(30)}, layout)
+    for name, (shape, dtype) in layout.specs().items():
+        value = storage.buffers[name]
+        reference = torch.empty(shape, dtype=dtype, device="meta")
+        assert value.shape == reference.shape and value.dtype == reference.dtype
+        assert value.stride() == reference.stride() and value.is_contiguous()
+        if name in storage.large_offsets:
+            offset, size = storage.large_offsets[name]
+            assert value.untyped_storage()._cdata == storage.large_arena.untyped_storage()._cdata
+            assert value.storage_offset()*value.element_size() == offset
+            assert value.numel()*value.element_size() == size
+        else:
+            assert value.untyped_storage()._cdata != storage.large_arena.untyped_storage()._cdata
+
+
+def test_cpu_large_views_are_disjoint_and_keep_their_owner_alive():
+    layout = Layout(layers=2, rows=3, steps=2, heads=2, value_heads=4, dim=128, conv_channels=512)
+    storage = CarriedBuffers(torch.device("cpu"), {0:0, 1:1}, layout)
+    assert len(storage.large_offsets) == 4
+    owner = StorageWeakRef(storage.large_arena.untyped_storage())
+    for i, (name, value) in enumerate(storage.buffers.items()):
+        value.fill_(i+1)
+    views = dict(storage.buffers)
+    del storage
+    assert not owner.expired()
+    for i, value in enumerate(views.values()):
+        assert bool((value == i+1).all())
+    del views
+    del value
+    assert owner.expired()
+
+
+def test_tiny_layout_keeps_original_independent_small_allocations():
+    storage, *_ = tiny_engine()
+    assert storage.large_arena is None and storage.large_offsets == {}
+    handles = [v.untyped_storage()._cdata for v in storage.buffers.values()]
+    assert len(handles) == len(set(handles))
+
+
+def test_allocation_failure_retains_actual_numbers_inventory_and_old_ceiling():
+    layout = Layout()
+    storage = CarriedBuffers(torch.device("meta"), {i:i for i in range(30)}, layout)
+    device_meta = torch.empty((4,32,3),dtype=torch.int64,device="meta")
+    before, limit = 123456, 5640856768
+    assert check_allocation_bound(before, before+limit, storage, device_meta) == limit
+    with pytest.raises(RuntimeError, match="allocator-rounded persistent allocation exceeded declaration") as error:
+        check_allocation_bound(before, before+limit+1, storage, device_meta)
+    details = json.loads(str(error.value).split("declaration: ",1)[1])
+    assert details["before_bytes"] == before and details["after_bytes"] == before+limit+1
+    assert details["increment_bytes"] == limit+1 and details["limit_bytes"] == limit
+    assert details["logical_tensor_bytes"] == 5640791232
+    assert len(details["tensor_requested_bytes"]) == 22
+    assert details["arena_requested_bytes"] == 5639241728
+    assert details["metadata_requested_bytes"] == {"raw_epochs":480,"state_owners":520,"device_meta":3072}
+    assert details["persistent_requested_bytes"] == 5640828072
 
 
 @pytest.mark.parametrize("bucket,live,expected", [(64,32,32),(64,1,32),(32,32,32),(8,3,8),(1,1,1)])
