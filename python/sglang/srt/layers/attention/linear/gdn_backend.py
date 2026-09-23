@@ -545,6 +545,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
             key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            if (
+                is_cuda()
+                and not is_target_verify
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and not get_is_capture_mode()
+                and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+                and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            ):
+                # FLA's input_guard makes these exact contiguous copies.
+                # Do them here so outer views do not retain the conv backing
+                # throughout FLA. The downstream guard then makes no copies.
+                query = query.contiguous()
+                key = key.contiguous()
+                value = value.contiguous()
+                del mixed_qkv
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(

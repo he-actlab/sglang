@@ -25,9 +25,21 @@ def body(path, owner, name):
 
 
 def compile_body(node, namespace, retain=False):
-    # The retain control differs only by removing the two new del statements.
+    # Restore the late native copies, then retain the earlier fused temporaries.
     if retain:
         class Retain(ast.NodeTransformer):
+            def visit_If(self, node):
+                if any(isinstance(c,ast.Delete) and len(c.targets)==5 for c in node.body):
+                    return ast.copy_location(ast.Pass(),node)
+                if any(isinstance(c,ast.Assign) and len(c.targets)==1
+                    and isinstance(c.targets[0],ast.Name) and c.targets[0].id=="query"
+                    and isinstance(c.value,ast.Call)
+                    and isinstance(c.value.func,ast.Attribute)
+                    and c.value.func.attr=="contiguous"
+                    and isinstance(c.value.func.value,ast.Name)
+                    and c.value.func.value.id=="query" for c in node.body):
+                    return ast.copy_location(ast.Pass(),node)
+                return self.generic_visit(node)
             def visit_Delete(self, node):
                 return ast.copy_location(ast.Pass(), node)
         node = Retain().visit(node)
@@ -46,7 +58,8 @@ Mode = mode_globals["ForwardMode"]
 
 def settings(capture=False, eager=True):
     return dict(torch=torch, ForwardBatch=object, RadixLinearAttention=object,
-        Union=Union, Tuple=Tuple, _is_cpu=False, _is_npu=False,
+        Union=Union, Tuple=Tuple, _is_cpu=False, _is_npu=False, _is_cuda=True,
+        TritonGDNKernel=type("TritonGDNKernel", (), {}),
         is_cuda=lambda: True, is_hip=lambda: False, is_npu=lambda: False,
         get_is_capture_mode=lambda: capture,
         check_cuda_graph_backend=lambda phase, backend: eager,
@@ -68,7 +81,7 @@ def split_projection(qkvz, ba, hk, hv, dk, dv):
     (Mode.TARGET_VERIFY,False,True,False,4,False),
     (Mode.DRAFT_EXTEND_V2,False,True,False,4,False),
     (Mode.DECODE,False,True,False,4,False),
-    (Mode.EXTEND,False,True,False,6,False),
+    (Mode.EXTEND,False,True,False,6,True),
 ])
 def test_projection_native_body_lifetime(mode,capture,eager,retain,heads,released):
     refs = []
@@ -119,7 +132,7 @@ def test_conv_native_body_lifetime(capture,eager,retain,fresh,inference):
         fused_gdn_gating=lambda *args:(None,None))
     cache=NS(conv=[torch.zeros(2,32,3)],temporal=torch.zeros(2,hv,dv,dk))
     backend=NS(req_to_token_pool=NS(mamba2_layer_cache=lambda _:cache),
-        kernel_dispatcher=NS(extend=extend),
+        kernel_dispatcher=NS(extend=extend,extend_kernel=object()),
         forward_metadata=NS(query_start_loc=torch.tensor([0,t]),mamba_cache_indices=torch.tensor([0]),
             retrieve_next_token=None,retrieve_next_sibling=None,retrieve_parent_token=None,
             has_mamba_track_mask=False))
@@ -169,9 +182,10 @@ def test_projection_split_fresh_output_contract_source():
     assert fresh=={"mixed_qkv","z","b","a"}
 
 
+@pytest.mark.parametrize("heads",[32,48])
 @pytest.mark.parametrize("capture",[False,True])
 @pytest.mark.skipif(not torch.cuda.is_available(),reason="native CUDA component")
-def test_cuda_component_native_prefill_stream_and_graph(capture):
+def test_cuda_component_native_prefill_stream_and_graph(capture,heads):
     # Imported only in CUDA-selected tests: no CPU mock of native kernels.
     from unittest import mock
     from sglang.srt.models import qwen3_5 as qm
@@ -181,7 +195,7 @@ def test_cuda_component_native_prefill_stream_and_graph(capture):
     import contextlib
 
     torch.manual_seed(19)
-    device="cuda";dtype=torch.bfloat16;t=129;hk=16;hv=32;d=128;hidden=16
+    device="cuda";dtype=torch.bfloat16;t=129;hk=16;hv=heads;d=128;hidden=16
     x=torch.randn(t,hidden,device=device,dtype=dtype)*.1
     wq=torch.randn(2*hk*d+2*hv*d,hidden,device=device,dtype=dtype)*.03
     wb=torch.randn(2*hv,hidden,device=device,dtype=dtype)*.03
@@ -218,7 +232,7 @@ def test_cuda_component_native_prefill_stream_and_graph(capture):
         del pressure
         return result
     backend=NS(req_to_token_pool=NS(mamba2_layer_cache=lambda _:cache),
-        forward_metadata=metadata,kernel_dispatcher=NS(extend=extend))
+        forward_metadata=metadata,kernel_dispatcher=NS(extend=extend,extend_kernel=kernel))
     backend._track_mamba_state_extend=lambda *a:gm.MambaAttnBackendBase._track_mamba_state_extend(backend,*a)
     native_q=qm.Qwen3_5GatedDeltaNet.forward
     native_g=gm.GDNAttnBackend.forward_extend
@@ -226,17 +240,20 @@ def test_cuda_component_native_prefill_stream_and_graph(capture):
     old_g=compile_body(body(GDN,"GDNAttnBackend","forward_extend"),dict(native_g.__globals__),True)
     def project(input):
         q=torch.nn.functional.linear(input,wq);b=torch.nn.functional.linear(input,wb)
-        refs["qkvz"]=weakref.ref(q);refs["ba"]=weakref.ref(b)
+        refs["qkvz"]=StorageWeakRef(q.untyped_storage());refs["ba"]=StorageWeakRef(b.untyped_storage())
         return q,b
     def attention(fb,**kw):
-        assert all(r() is None for k,r in refs.items() if k in ("qkvz","ba")) is (not capture and not retain)
+        assert all(r.expired() for k,r in refs.items() if k in ("qkvz","ba")) is (not capture and not retain)
         pressure=torch.empty(t,wq.shape[0],device=device,dtype=dtype).fill_(19)
         result=(old_g if retain else native_g)(backend,layer,fb,**kw)
         del pressure
         return result
     model=NS(num_v_heads=hv,num_k_heads=hk,attn_tp_size=1,head_k_dim=d,head_v_dim=d,
-        _forward_input_proj=project,attn=attention,norm=lambda y,z:y*torch.sigmoid(z),
+        key_dim=hk*d,value_dim=hv*d,
+        _forward_input_proj=project,attn=attention,
+        norm=qm.RMSNormGated(d,eps=1e-6,group_size=None,norm_before_gate=True,device=device,dtype=dtype),
         out_proj=lambda y:(torch.nn.functional.linear(y,wo),None))
+    model.fix_query_key_value_ordering=lambda q,b:qm.Qwen3_5GatedDeltaNet.fix_query_key_value_ordering(model,q,b)
     producer=torch.cuda.Stream();consumer=torch.cuda.Stream()
     producer.wait_stream(torch.cuda.current_stream())
     outputs=[]

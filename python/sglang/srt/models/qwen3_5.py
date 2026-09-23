@@ -538,7 +538,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ):
                 # The fused split owns fresh outputs. Eager prefill can reuse
                 # these dead projection buffers on its current stream.
-                # Keep capture/warmup and the view-based fallback unchanged.
+                # Keep capture/warmup unchanged.
                 del projected_states_qkvz, projected_states_ba
         elif _is_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
@@ -562,6 +562,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
+            if (
+                _is_cuda
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and not get_is_capture_mode()
+                and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+            ):
+                # Move the native pre-norm reshape before attention. For
+                # multi-token strided Z this already-required copy releases
+                # the projection backing; restore only its logical shape.
+                z = z.reshape(-1, z.shape[-1]).view(z.shape)
+                del query, key, value, projected_states_qkvz, projected_states_ba
 
         core_attn_out = self.attn(
             forward_batch,
