@@ -15,83 +15,55 @@ IDS = [
     128000,
     14924,
     25,
-    30397,
-    374,
-    48114,
-    264,
-    30564,
-    5021,
-    13,
-    578,
-    5021,
-    690,
-    2853,
-    400,
-    1954,
-    311,
-    6136,
-    13,
-    9062,
-    1060,
-    433,
-    690,
-    3139,
+    46991,
+    5829,
     220,
-    22,
-    514,
-    24483,
-    11,
-    902,
-    568,
-    649,
-    4662,
-    369,
-    400,
-    16,
-    13,
-    20,
-    1855,
-    13,
-    1102,
-    7194,
-    400,
-    18,
+    17,
+    37095,
+    315,
+    5684,
     264,
-    1060,
-    311,
-    3090,
-    323,
-    5510,
-    279,
-    5021,
+    2046,
+    369,
+    813,
+    13633,
     13,
-    2650,
-    1690,
-    1667,
-    690,
-    433,
-    1935,
-    1603,
-    568,
-    8638,
-    28744,
-    3300,
+    1442,
+    1070,
+    527,
+    220,
+    966,
+    25112,
+    315,
+    5684,
     389,
-    279,
-    30564,
-    5021,
+    264,
+    11262,
+    315,
+    5684,
+    11,
+    1268,
+    1690,
+    25112,
+    315,
+    5684,
+    1587,
+    568,
+    1005,
+    1475,
+    2305,
     5380,
     16533,
-    25,
+    25
 ]
 
 
 def configuration(tmp_path):
     config = HELPERS["config"](tmp_path)
     config.update(
-        prefix_kv=copy.deepcopy(diag._PREFIX_CONTRACT), rid_prefix="b2-prefix-kv-r0"
+        prefix_kv=copy.deepcopy(diag._PREFIX_CONTRACT), rid_prefix="b2-prefix118-r0"
     )
-    next(r for r in config["requests"] if r["phase"] == "measure" and r["idx"] == 10)[
+    next(r for r in config["requests"] if r["phase"] == "measure" and r["idx"] == 118)[
         "input_ids"
     ] = IDS[:]
     return config
@@ -120,11 +92,11 @@ class Pool:
 
 def setup(tmp_path, monkeypatch):
     state = diag._State(configuration(tmp_path), runtime={"test": "CPU_ONLY"})
-    req = HELPERS["request"](state)
+    req = HELPERS["request"](state, idx=118)
     pool = Pool()
-    indices = torch.arange(1, 72)
+    indices = torch.arange(1, 44)
     mapping = torch.zeros(8, 128, dtype=torch.int32)
-    mapping[7, :71] = indices
+    mapping[7, :43] = indices
     runner = NS(
         token_to_kv_pool=pool,
         req_to_token_pool=NS(req_to_token=mapping),
@@ -133,10 +105,10 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(diag, "prefix_pool", lambda r: r.token_to_kv_pool)
     forward = NS(
         input_ids=torch.tensor(IDS),
-        positions=torch.arange(71),
+        positions=torch.arange(43),
         out_cache_loc=indices.clone(),
         req_pool_indices=torch.tensor([7]),
-        extend_seq_lens_cpu=[71],
+        extend_seq_lens_cpu=[43],
         extend_prefix_lens_cpu=[0],
     )
     batch = NS(reqs=[req])
@@ -146,12 +118,12 @@ def setup(tmp_path, monkeypatch):
 
 def prepare_verify(runner, forward):
     forward.input_ids = torch.tensor([999] + [100] * 15)
-    forward.positions = torch.tensor([71] + [72] * 15)
-    forward.seq_lens = torch.tensor([71])
-    forward.out_cache_loc = torch.arange(72, 88)
+    forward.positions = torch.tensor([43] + [44] * 15)
+    forward.seq_lens = torch.tensor([43])
+    forward.out_cache_loc = torch.arange(44, 60)
     wrapper = NS(
-        _paged_kv_indptr_buf=torch.tensor([0, 87]),
-        _paged_kv_indices_buf=torch.arange(1, 88),
+        _paged_kv_indptr_buf=torch.tensor([0, 59]),
+        _paged_kv_indices_buf=torch.arange(1, 60),
         _paged_kv_last_page_len_buf=torch.tensor([1]),
     )
     runner.decode_cuda_graph_runner = NS(
@@ -166,12 +138,24 @@ def test_exact_optional_contract_and_old_path(tmp_path):
     old = HELPERS["config"](tmp_path)
     assert len(diag._validate_config(old)) == 194
     assert len(diag._validate_config(configuration(tmp_path))) == 194
+    assert len(IDS) == 43
+    assert diag._digest(IDS) == diag._PREFIX_CONTRACT["input_ids_sha256"]
+    assert 32 * 2 * 43 * 8 * 128 * 2 == 5636096
+    for rid in ("b2-prefix-kv-r0", "b2-prefix-kv-r1"):
+        bad = configuration(tmp_path)
+        bad["rid_prefix"] = rid
+        with pytest.raises(RuntimeError, match="fresh prefix RID"):
+            diag._validate_config(bad)
     bad = configuration(tmp_path)
-    bad["prefix_kv"]["tokens"] = 72
+    bad["prefix_kv"]["index"] = 10
     with pytest.raises(RuntimeError, match="contract"):
         diag._validate_config(bad)
     bad = configuration(tmp_path)
-    bad["requests"][12]["input_ids"][1] += 1
+    bad["prefix_kv"]["tokens"] = 44
+    with pytest.raises(RuntimeError, match="contract"):
+        diag._validate_config(bad)
+    bad = configuration(tmp_path)
+    bad["requests"][120]["input_ids"][1] += 1
     with pytest.raises(RuntimeError, match="token identity"):
         diag._validate_config(bad)
     bad = configuration(tmp_path)
@@ -219,9 +203,13 @@ def test_physical_indices_fail_closed(values, dtype):
 def test_three_owned_phases_capture_bytes_and_bitwise_mutation(tmp_path, monkeypatch):
     state, req, pool, runner, f, batch, result = setup(tmp_path, monkeypatch)
     p = state.prefix_kv
+    # The formerly observed request remains in the full frozen workload, but
+    # must not consume any of this exact118 contract's three snapshots.
+    p.prefill(runner, NS(reqs=[HELPERS["request"](state, idx=10)]), f, result)
+    assert not pool.copied_indices
     p.prefill(runner, batch, f, result)
     assert p.samples[0][0][0][0].data_ptr() != pool.k_buffer[0].data_ptr()
-    assert p.cpu_bytes == 9306112 and p.records[0]["indices"] == list(range(1, 72))
+    assert p.cpu_bytes == 5636096 and p.records[0]["indices"] == list(range(1, 44))
     pool.k_buffer[0][1, 0, 0] = -0.0
     assert p.samples[0][0][0][0][0, 0, 0].item() == 1.0
     worker = prepare_verify(runner, f)
@@ -232,7 +220,7 @@ def test_three_owned_phases_capture_bytes_and_bitwise_mutation(tmp_path, monkeyp
     assert p.snapshot() == dict(
         enabled=True,
         completed_phases=3,
-        retained_cpu_tensor_bytes=27918336,
+        retained_cpu_tensor_bytes=16908288,
         cpu_tensor_limit_bytes=32 << 20,
         prefix_mutations=1,
     )
@@ -240,8 +228,8 @@ def test_three_owned_phases_capture_bytes_and_bitwise_mutation(tmp_path, monkeyp
     p.verify("P1", worker, batch, f, True)
     assert len(pool.copied_indices) == 3
     for phase in ("P0", "P1", "P2"):
-        record = json.loads((p.directory / f"0010-prefix-{phase}.json").read_text())
-        assert record["phase"] == phase and record["snapshot_bytes"] == 9306112
+        record = json.loads((p.directory / f"0118-prefix-{phase}.json").read_text())
+        assert record["phase"] == phase and record["snapshot_bytes"] == 5636096
         payload = torch.load(p.directory / record["tensor_file"], weights_only=True)
         assert diag.compare_prefix(payload, p.samples[("P0", "P1", "P2").index(phase)])[
             "bitwise_equal"
@@ -294,7 +282,7 @@ def test_preverify_ownership_and_write_disjointness(tmp_path, monkeypatch, corru
     elif corruption == "root":
         f.input_ids[0] = 0
     elif corruption == "sequence":
-        f.seq_lens[0] = 72
+        f.seq_lens[0] = 44
     with pytest.raises(RuntimeError):
         p.verify("P1", worker, batch, f, corruption != "graph")
     assert len(pool.copied_indices) == 1
@@ -314,7 +302,7 @@ def test_size_bound_and_initial_partial_prefill_fail_before_copy(tmp_path, monke
 
 
 def test_bitwise_signed_zero_and_nan_payloads():
-    a = torch.zeros(71, 8, 128, dtype=torch.bfloat16)
+    a = torch.zeros(43, 8, 128, dtype=torch.bfloat16)
     b = a.clone()
     b[0, 0, 0] = -0.0
     left = [[[a, a]]] * 32
@@ -366,7 +354,7 @@ def test_cuda_component_native_prefix_copy_without_offload(tmp_path):
     )
     runner = NS(token_to_kv_pool=pool, is_draft_worker=False)
     assert diag.prefix_pool(runner) is pool
-    indices = torch.arange(1, 72, device="cuda", dtype=torch.int64)
+    indices = torch.arange(1, 44, device="cuda", dtype=torch.int64)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):

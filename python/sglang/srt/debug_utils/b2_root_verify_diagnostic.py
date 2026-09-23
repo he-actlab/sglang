@@ -1,7 +1,7 @@
 """Opt-in native verify/publication observation; never a serving or timing path.
 
 Normally only top-two logits and the actual argmax are retained. The separately
-bounded prefix_kv option reads three target-prefix CPU snapshots for request10;
+bounded prefix_kv option reads three target-prefix CPU snapshots for request118;
 it never reloads/evicts model state. This distinguishes prediction from publication,
 but cannot by itself attribute changed predictions to arithmetic or state.
 Every CUDA snapshot owns copies and an event on its producing stream. No
@@ -42,17 +42,17 @@ _TRANSIENT_GUARD = 64 << 20
 _CONFIG_ENV = "SGLANG_B2_ROOT_VERIFY_DIAGNOSTIC_CONFIG"
 _KIND_ENV = "SGLANG_B2_ROOT_VERIFY_DIAGNOSTIC_KIND"
 _PREFIX_CONTRACT = dict(
-    index=10,
-    prompt_sha="88196431254fe155",
-    tokens=71,
+    index=118,
+    prompt_sha="26a348c99525d0a1",
+    tokens=43,
     layers=32,
     kv_heads=8,
     head_dim=128,
     dtype="torch.bfloat16",
     phases=["P0", "P1", "P2"],
     cpu_tensor_limit_bytes=32 << 20,
-    snapshot_bytes=9306112,
-    input_ids_sha256="dfc4793c9199c8c5f7fb0d2ec456be72b20c2cd3cbfe32f4a8d147c0db24ed69",
+    snapshot_bytes=5636096,
+    input_ids_sha256="48fe8385fbb26aa35fed4cf0902b6f33b16167897c1429856172274e70ebf8b9",
 )
 _state = None
 
@@ -103,7 +103,7 @@ def _validate_config(config):
     prefix_kv = config.get("prefix_kv")
     if prefix_kv is not None:
         _require(prefix_kv == _PREFIX_CONTRACT, "prefix KV capture contract")
-        _require(prefix in ("b2-prefix-kv-r0", "b2-prefix-kv-r1"), "fresh prefix RID")
+        _require(prefix in ("b2-prefix118-r0", "b2-prefix118-r1"), "fresh prefix RID")
     else:
         _require(
             prefix in ("b2-root-verify-r0", "b2-root-verify-r1"), "fresh-server RID"
@@ -130,9 +130,9 @@ def _validate_config(config):
             _require(
                 row["prompt_sha"] == _PROMPT_SHAS[row["idx"]], "selected prompt hash"
             )
-        if prefix_kv is not None and row["phase"] == "measure" and row["idx"] == 10:
+        if prefix_kv is not None and row["phase"] == "measure" and row["idx"] == 118:
             _require(
-                len(row["input_ids"]) == 71
+                len(row["input_ids"]) == 43
                 and _digest(row["input_ids"]) == _PREFIX_CONTRACT["input_ids_sha256"],
                 "prefix token identity",
             )
@@ -362,13 +362,13 @@ def compare_prefix(left, right):
                 _require(
                     tensor.device.type == "cpu"
                     and tensor.dtype == torch.bfloat16
-                    and tuple(tensor.shape) == (71, 8, 128)
+                    and tuple(tensor.shape) == (43, 8, 128)
                     and tensor.is_contiguous(),
                     "prefix compare shape/dtype",
                 )
             different = x.view(torch.uint8) != y.view(torch.uint8)
             if different.any():
-                token_counts = different.reshape(71, -1).sum(1)
+                token_counts = different.reshape(43, -1).sum(1)
                 changes.append(
                     dict(
                         layer=layer,
@@ -398,7 +398,7 @@ class _PrefixKV:
             i
             for i, req in enumerate(batch.reqs)
             if self.state.rows.get(req.rid, {}).get("phase") == "measure"
-            and self.state.rows[req.rid]["idx"] == 10
+            and self.state.rows[req.rid]["idx"] == 118
         ]
         _require(len(matches) <= 1, "duplicate selected prefix request")
         return matches[0] if matches else None
@@ -413,16 +413,16 @@ class _PrefixKV:
             _digest(list(req.origin_input_ids)) == _PREFIX_CONTRACT["input_ids_sha256"],
             "prefix origin changed",
         )
-        mapped = runner.req_to_token_pool.req_to_token[self.pool_row, :71]
+        mapped = runner.req_to_token_pool.req_to_token[self.pool_row, :43]
         _require(
-            prefix_indices(mapped, self.pool.size, count=71) == self.indices,
+            prefix_indices(mapped, self.pool.size, count=43) == self.indices,
             "prefix request-table mapping changed",
         )
 
     def _copy(self, phase, runner, metadata):
         _require(phase == ("P0", "P1", "P2")[len(self.samples)], "prefix phase order")
         _require(
-            self.cpu_bytes + 9306112 <= _PREFIX_CONTRACT["cpu_tensor_limit_bytes"],
+            self.cpu_bytes + 5636096 <= _PREFIX_CONTRACT["cpu_tensor_limit_bytes"],
             "prefix CPU capture bound",
         )
         if self.pool.k_buffer[0].device.type == "cuda":
@@ -443,13 +443,13 @@ class _PrefixKV:
             for pair in chunks
             for t in pair
         )
-        _require(nbytes == 9306112, "prefix copied byte count")
+        _require(nbytes == 5636096, "prefix copied byte count")
         self.cpu_bytes += nbytes
         self.samples.append(payload)
         comparison = (
             None if phase == "P0" else compare_prefix(self.samples[-2], payload)
         )
-        tensor_file = self.directory / ("0010-prefix-" + phase + ".pt")
+        tensor_file = self.directory / ("0118-prefix-" + phase + ".pt")
         with tensor_file.open("xb") as stream:
             torch.save(payload, stream)
         digest = hashlib.sha256()
@@ -467,8 +467,8 @@ class _PrefixKV:
             phase=phase,
             runtime=self.state.runtime,
             rid=self.owner.rid,
-            idx=10,
-            prompt_sha="88196431254fe155",
+            idx=118,
+            prompt_sha="26a348c99525d0a1",
             input_ids_sha256=_PREFIX_CONTRACT["input_ids_sha256"],
             req_pool_idx=self.pool_row,
             indices=list(self.indices),
@@ -482,7 +482,7 @@ class _PrefixKV:
             metadata=metadata,
             performance_eligible=False,
         )
-        with (self.directory / ("0010-prefix-" + phase + ".json")).open("x") as stream:
+        with (self.directory / ("0118-prefix-" + phase + ".json")).open("x") as stream:
             json.dump(record, stream, indent=2)
         self.records.append(record)
 
@@ -494,17 +494,17 @@ class _PrefixKV:
         self.state.request_row(req)
         lengths, prefixes = forward.extend_seq_lens_cpu, forward.extend_prefix_lens_cpu
         _require(
-            prefixes[i] == 0 and lengths[i] == 71 and not req.output_ids,
+            prefixes[i] == 0 and lengths[i] == 43 and not req.output_ids,
             "prefix requires complete initial native prefill",
         )
         start = sum(lengths[:i])
         _require(
-            forward.input_ids[start : start + 71].cpu().tolist()
+            forward.input_ids[start : start + 43].cpu().tolist()
             == list(req.origin_input_ids),
             "prefix actual prefill tokens",
         )
         _require(
-            forward.positions[start : start + 71].cpu().tolist() == list(range(71)),
+            forward.positions[start : start + 43].cpu().tolist() == list(range(43)),
             "prefix actual prefill positions",
         )
         self.pool, self.owner, self.pool_row = (
@@ -516,10 +516,10 @@ class _PrefixKV:
             int(forward.req_pool_indices[i]) == self.pool_row, "prefix prefill row"
         )
         self.indices = prefix_indices(
-            forward.out_cache_loc[start : start + 71], self.pool.size, count=71
+            forward.out_cache_loc[start : start + 43], self.pool.size, count=43
         )
         other = torch.cat(
-            (forward.out_cache_loc[:start], forward.out_cache_loc[start + 71 :])
+            (forward.out_cache_loc[:start], forward.out_cache_loc[start + 43 :])
         )
         _require(
             not set(self.indices).intersection(other.cpu().tolist()),
@@ -554,9 +554,9 @@ class _PrefixKV:
         n = len(batch.reqs)
         _require(n <= graph.bs <= 32, "prefix graph bucket")
         _require(
-            int(forward.seq_lens[i]) == 71
+            int(forward.seq_lens[i]) == 43
             and int(forward.input_ids[i * 16]) == self.first_token
-            and int(forward.positions[i * 16]) == 71
+            and int(forward.positions[i * 16]) == 43
             and int(forward.req_pool_indices[i]) == self.pool_row,
             "not first native verify root",
         )
@@ -565,11 +565,11 @@ class _PrefixKV:
         wrapper = wrappers[0]
         start, end = map(int, wrapper._paged_kv_indptr_buf[i : i + 2].cpu().tolist())
         _require(
-            end - start == 71 + 16 and int(wrapper._paged_kv_last_page_len_buf[i]) == 1,
+            end - start == 43 + 16 and int(wrapper._paged_kv_last_page_len_buf[i]) == 1,
             "prefix active wrapper extent",
         )
         actual = prefix_indices(
-            wrapper._paged_kv_indices_buf[start : start + 71], self.pool.size, count=71
+            wrapper._paged_kv_indices_buf[start : start + 43], self.pool.size, count=43
         )
         _require(actual == self.indices, "active wrapper prefix mapping changed")
         graph_writes = (
