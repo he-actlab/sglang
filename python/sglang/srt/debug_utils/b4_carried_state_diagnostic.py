@@ -502,7 +502,7 @@ class CarriedBuffers:
 
 def validate_server(args, arm):
     from sglang.srt.debug_utils.b4_verify_diagnostic import _TARGET, _DRAFT, _TARGET_REV, _DRAFT_REV
-    require(arm in ("stock", "prior"), "frozen baseline identity")
+    require(arm in ("stock", "prior", "candidate"), "frozen baseline identity")
     capacity = 32 if arm == "stock" else 64
     expected = dict(
         model_path=_TARGET, speculative_draft_model_path=_DRAFT,
@@ -515,7 +515,7 @@ def validate_server(args, arm):
         disable_cuda_graph=False, disable_decode_cuda_graph=False,
         enable_deterministic_inference=False, attention_backend="flashinfer",
         speculative_use_rejection_sampling=False, random_seed=260792947,
-        enable_spec_pdmux=arm == "prior", enable_spec_sm_partition=False,
+        enable_spec_pdmux=arm != "stock", enable_spec_sm_partition=False,
         enable_custom_logit_processor=False, skip_server_warmup=False,
         enable_two_batch_overlap=False, enable_single_batch_overlap=False,
         quantization=None, mem_fraction_static=0.8017717968749999,
@@ -528,7 +528,7 @@ def validate_server(args, arm):
         moe_runner_backend="auto", moe_a2a_backend="none", json_model_override_args="{}",
         context_length=262144, load_format="auto", speculative_draft_load_format=None,
         tokenizer_path=_TARGET, trust_remote_code=False,
-        spec_pdmux_slots=2, spec_pdmux_sm_split="132,56" if arm == "prior" else None,
+        spec_pdmux_slots=2, spec_pdmux_sm_split="132,56" if arm != "stock" else None,
     )
     for name, value in expected.items():
         require(getattr(args,name,None) == value, "server setting " + name)
@@ -537,19 +537,21 @@ def validate_server(args, arm):
     require(os.environ.get("SGLANG_B4_CARRIED_STATE_KIND") == "correctness-only", "explicit opt-in")
     require(os.environ.get("DUMPER_ENABLE", "false").lower() in ("false","0")
             and os.environ.get("DUMPER_NON_INTRUSIVE_MODE") == "off", "no tensor dumper/hooks")
-    require(os.environ.get("SGLANG_SPEC_PDMUX_SM_HINT", "0") == ("2" if arm == "prior" else "0"),
+    require(os.environ.get("SGLANG_SPEC_PDMUX_SM_HINT", "0") == ("2" if arm != "stock" else "0"),
             "native width hint")
     for name in ("SGLANG_PHASE_EVENTS", "SGLANG_NVTX_PROFILE", "SGLANG_ACCEPT_HIST",
                  "SGLANG_SPEC_PDMUX_SERIALIZE", "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM",
-                 "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP",
-                 "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD",
                  "SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED",
                  "SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION", "SGLANG_ENABLE_QWEN3_DRAFTER_TMA",
                  "SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO", "SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO",
                  "SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH", "SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH",
                  "SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16", "SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION"):
         require(os.environ.get(name,"0") == "0", "diagnostic excludes " + name)
-    require(os.environ.get("SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT","auto") == "auto", "native QKV placement")
+    for name in ("SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP",
+                 "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD"):
+        require(os.environ.get(name,"0") == ("1" if arm == "candidate" else "0"), "native placement " + name)
+    require(os.environ.get("SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT","auto")
+            == ("full" if arm == "candidate" else "auto"), "native QKV placement")
     return capacity
 
 

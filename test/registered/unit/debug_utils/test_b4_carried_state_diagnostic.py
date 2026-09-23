@@ -464,8 +464,7 @@ def test_native_source_patches_exact_and_ordered_without_extra_fence():
     assert ".synchronize(" not in source and ".wait_stream(" not in source and ".cpu(" not in source
 
 
-@pytest.mark.parametrize("arm", ["stock","prior"])
-def test_strict_post_init_baseline_guards(arm,monkeypatch):
+def guarded_server(arm,monkeypatch):
     from sglang.srt.debug_utils import b4_verify_diagnostic as old
     tree = ast.parse(inspect.getsource(old._validate_server))
     fn = tree.body[0]
@@ -474,21 +473,65 @@ def test_strict_post_init_baseline_guards(arm,monkeypatch):
     fields = eval(compile(ast.Expression(expr),"expected","eval"),vars(old))
     capacity = 32 if arm == "stock" else 64
     fields.update(max_running_requests=capacity,max_mamba_cache_size=capacity,
-        enable_spec_pdmux=arm == "prior",spec_pdmux_slots=2,
-        spec_pdmux_sm_split="132,56" if arm == "prior" else None)
+        enable_spec_pdmux=arm != "stock",spec_pdmux_slots=2,
+        spec_pdmux_sm_split="132,56" if arm != "stock" else None)
     args = SimpleNamespace(**fields,cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=capacity,backend="full")))
     monkeypatch.setenv("SGLANG_B4_CARRIED_STATE_KIND","correctness-only")
     monkeypatch.setenv("DUMPER_NON_INTRUSIVE_MODE","off")
-    monkeypatch.setenv("SGLANG_SPEC_PDMUX_SM_HINT","2" if arm == "prior" else "0")
+    monkeypatch.setenv("SGLANG_SPEC_PDMUX_SM_HINT","2" if arm != "stock" else "0")
+    monkeypatch.setenv("SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT","full" if arm == "candidate" else "auto")
+    for name in ("SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP",
+                 "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD"):
+        monkeypatch.setenv(name,"1" if arm == "candidate" else "0")
+    return args,capacity
+
+
+@pytest.mark.parametrize("arm", ["stock","prior","candidate"])
+def test_strict_post_init_baseline_guards(arm,monkeypatch):
+    args,capacity = guarded_server(arm,monkeypatch)
     assert diag.validate_server(args,arm) == capacity
     for key,value in (("disable_radix_cache",False),("disable_chunked_prefix_cache",False),
                       ("speculative_num_draft_tokens",7),("mem_fraction_static",0.90),
-                      ("max_mamba_cache_size",None),("enable_deterministic_inference",True)):
+                      ("max_mamba_cache_size",None),("enable_deterministic_inference",True),
+                      ("spec_pdmux_slots",1),("spec_pdmux_sm_split","136,52"),
+                      ("enable_spec_pdmux",arm == "stock"),("enable_spec_sm_partition",True),
+                      ("speculative_eagle_topk",4),("dtype","float16")):
         prior = getattr(args,key)
         setattr(args,key,value)
         with pytest.raises(RuntimeError,match=key):
             diag.validate_server(args,arm)
         setattr(args,key,prior)
+
+
+@pytest.mark.parametrize("arm", ["stock","prior","candidate"])
+def test_placement_bundle_is_arm_specific_and_native_only(arm,monkeypatch):
+    args,_ = guarded_server(arm,monkeypatch)
+    values = {
+        "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT": ("auto","full","full-device","1"),
+        "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP": ("0","1","2"),
+        "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD": ("0","1","2"),
+        "SGLANG_SPEC_PDMUX_SM_HINT": ("0","1","2"),
+        "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM": ("1",),
+        "SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED": ("1",),
+        "SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH": ("1",),
+    }
+    for name,alternatives in values.items():
+        original = diag.os.environ.get(name)
+        for value in alternatives:
+            if value == original: continue
+            with monkeypatch.context() as env:
+                env.setenv(name,value)
+                with pytest.raises(RuntimeError): diag.validate_server(args,arm)
+    args.cuda_graph_config.decode.max_bs = 32 if arm != "stock" else 64
+    with pytest.raises(RuntimeError,match="graph capacity"):
+        diag.validate_server(args,arm)
+
+
+def test_unknown_arm_cannot_inherit_candidate_allowance(monkeypatch):
+    args,_ = guarded_server("candidate",monkeypatch)
+    for arm in ("", "three-stream", "candidate-full"):
+        with pytest.raises(RuntimeError,match="baseline identity"):
+            diag.validate_server(args,arm)
 
 
 def test_runtime_guard_rejects_changed_native_production():
