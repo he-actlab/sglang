@@ -181,7 +181,10 @@ def test_cuda_component_native_modules_hook_no_feedback(tmp_path):
             embedding.weight.uniform_(-.1,.1)
             attention.qkv_proj.weight.uniform_(-.1,.1)
     member=dict(ids=list(range(50)),positions=list(range(50)),selected_start=7,selected_count=43)
-    with torch.cuda.stream(torch.cuda.Stream()):
+    initializing_stream = torch.cuda.current_stream()
+    test_stream = torch.cuda.Stream()
+    test_stream.wait_stream(initializing_stream)
+    with torch.cuda.stream(test_stream):
         original=replay.native_chain(embedding,norm,attention,member,capture=False)
         observed=replay.native_chain(embedding,norm,attention,member)
         assert set(observed)=={"embedding","input_norm","raw_qkv","post_rope_k","v"}
@@ -191,3 +194,4 @@ def test_cuda_component_native_modules_hook_no_feedback(tmp_path):
         again=replay.native_chain(embedding,norm,attention,member,capture=False)
         for key in original: assert torch.equal(original[key],again[key])
         assert not embedding._forward_hooks and not norm._forward_hooks and not attention.qkv_proj._forward_hooks
+    initializing_stream.wait_stream(test_stream)
