@@ -2,9 +2,10 @@
 
 import ast
 import copy
+import functools
 from pathlib import Path
 from types import SimpleNamespace as NS
-from typing import Optional
+from typing import Optional, Tuple
 import weakref
 
 import pytest
@@ -233,6 +234,46 @@ def test_native_python_lifetimes_and_return_contract(consume, suppress):
         result = fn(**args)
         assert (result[3] is not None) == (suppress >= 3)
         assert torch.equal(result[1], torch.ones(4) * 2)
+
+
+def test_validated_selection_marker_once_per_geometry():
+    messages = []
+    common = ROOT / "python/sglang/srt/utils/common.py"
+    logger_node = node(common, "print_info_once")
+    logger_ns = dict(functools=functools, logger=NS(info=messages.append))
+    exec(compile(ast.Module(body=[logger_node], type_ignores=[]), str(common), "exec"), logger_ns)
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def run(**kwargs):
+                if kwargs["v_new"] is kwargs["v"]:
+                    assert messages, "marker follows validated alias selection"
+            return run
+
+    ns = dict(torch=torch, Optional=Optional, Tuple=Tuple, CHUNK_SIZE=64,
+              triton=NS(cdiv=lambda a, b: (a + b - 1) // b),
+              print_info_once=logger_ns["print_info_once"],
+              chunk_gated_delta_rule_fwd_kernel_h_blockdim64=Kernel())
+    ns["_validate_consumed_u"] = load_node(node(H, "_validate_consumed_u"), dict(torch=torch))
+    fn = load_node(node(H, "chunk_gated_delta_rule_fwd_h"), ns)
+    with torch.no_grad():
+        for hv in (32, 48):
+            _, k, u, g, _, state = metadata(hv)
+            w = torch.zeros_like(u)
+            fn(k=k, w=w, u=u, g=g, initial_state=state)
+            assert len(messages) == (hv == 48), "default must not arm"
+            for _ in range(2):
+                _, result = fn(k=k, w=w, u=u, g=g, initial_state=state, consume_u=True)
+                assert result is u
+            before = list(messages)
+            with pytest.raises(ValueError):
+                fn(k=k, w=u, u=u, g=g, initial_state=state, consume_u=True)
+            assert messages == before, "failed validation must not arm"
+    assert messages == [
+        f"GDN eager consumed-u workspace selected: Hk=16 Hv={hv} K=128 V=128 BF16/FP32 v_new=u"
+        for hv in (32, 48)
+    ]
+    assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.parametrize(

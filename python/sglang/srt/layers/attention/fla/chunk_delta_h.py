@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.utils.common import print_info_once
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
@@ -372,6 +373,10 @@ def chunk_gated_delta_rule_fwd_h(
         # that same v_new chunk, then uses register b_v for the recurrence.
         # No cross-CTA or subsequent-chunk read targets the overwritten data.
         v_new = u
+        print_info_once(
+            f"GDN eager consumed-u workspace selected: Hk={Hg} Hv={H} "
+            f"K={K} V={V} BF16/FP32 v_new=u"
+        )
     else:
         v_new = torch.empty_like(u) if save_new_value else None
 
