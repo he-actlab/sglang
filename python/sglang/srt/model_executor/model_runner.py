@@ -432,6 +432,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         self.eagle_draft_num_layers = None
+        self.eagle_draft_model_config = None
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
@@ -459,6 +460,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
             if self.spec_algorithm.is_eagle3():
+                if draft_model_config.hf_config.architectures == [
+                    "LlamaForCausalLMEagle3"
+                ]:
+                    # Native EAGLE3 may have different KV heads/head dimensions
+                    # from the target. Retain the config already loaded above.
+                    self.eagle_draft_model_config = draft_model_config
                 self.eagle_use_aux_hidden_state = True
                 try:
                     eagle_config = getattr(

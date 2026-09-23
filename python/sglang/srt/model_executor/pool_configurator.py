@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -137,14 +138,52 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
-        # Assumes draft and target share the same per-layer KV size (head_dim,
-        # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
-        # reuse the target architecture's attention config.
+        # Native Llama EAGLE3 uses its actual draft geometry. Other existing
+        # EAGLE/MTP paths retain the target per-layer geometry assumption.
         if (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
             eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
-            if (
+            draft_config = mr.__dict__.get("eagle_draft_model_config")
+            if draft_config is not None:
+                layer_types = getattr(draft_config.hf_text_config, "layer_types", None)
+                if (
+                    not mr.spec_algorithm.is_eagle3()
+                    or draft_config.hf_config.architectures
+                    != ["LlamaForCausalLMEagle3"]
+                    or draft_config.attention_arch != AttentionArch.MHA
+                    or draft_config.is_hybrid_swa
+                    or getattr(draft_config.hf_text_config, "sliding_window", None)
+                    is not None
+                    or draft_config.num_hidden_layers != eagle_draft_num_layers
+                    or draft_config.num_attention_layers != eagle_draft_num_layers
+                    or eagle_draft_num_layers is None
+                    or eagle_draft_num_layers <= 0
+                    or (
+                        layer_types is not None
+                        and layer_types != ["full_attention"] * eagle_draft_num_layers
+                    )
+                    or mr.server_args.pp_size != 1
+                    or mr.kv_cache_dtype
+                    not in (torch.bfloat16, torch.float16, torch.float32)
+                ):
+                    raise ValueError(
+                        "Unsupported native EAGLE3 draft KV geometry: requires "
+                        "dense MHA, PP1, and unquantized KV storage"
+                    )
+                draft_tp_size = (
+                    1
+                    if mr.server_args.spec_pdmux_draft_unsharded()
+                    else get_attention_tp_size()
+                )
+                self._cell_size += self._compute_cell_size(
+                    mr,
+                    eagle_draft_num_layers,
+                    model_config=draft_config,
+                    tp_size=draft_tp_size,
+                    use_mla_backend=False,
+                )
+            elif (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
@@ -176,16 +215,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_num_layers=int(draft_num_layers),
                 )
 
-    def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
+    def _compute_cell_size(
+        self,
+        mr: ModelRunner,
+        num_layers: int,
+        *,
+        model_config=None,
+        tp_size=None,
+        use_mla_backend=None,
+    ) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
-        model_config = mr.model_config
+        model_config = mr.model_config if model_config is None else model_config
         kv_cache_dtype = mr.kv_cache_dtype
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
-        tp_size = get_attention_tp_size()
+        tp_size = get_attention_tp_size() if tp_size is None else tp_size
+        use_mla_backend = (
+            mr.use_mla_backend if use_mla_backend is None else use_mla_backend
+        )
 
-        if mr.use_mla_backend:
+        if use_mla_backend:
             cell_size = (
                 (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                 * num_layers

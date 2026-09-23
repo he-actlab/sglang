@@ -113,6 +113,7 @@ def _make_model_runner(
     sa.speculative_algorithm = speculative_algorithm
     sa.speculative_num_steps = speculative_num_steps
     sa.speculative_eagle_topk = speculative_eagle_topk
+    sa.spec_pdmux_draft_unsharded = lambda: False
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
