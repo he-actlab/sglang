@@ -244,12 +244,14 @@ class ModelConfig:
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
+        is_standalone_draft: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.is_standalone_draft = is_draft_model and is_standalone_draft
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -515,12 +517,20 @@ class ModelConfig:
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
+            is_standalone_draft=(
+                is_draft_model and server_args.speculative_algorithm == "STANDALONE"
+            ),
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
             **kwargs,
         )
 
     def _config_draft_model(self):
+        # STANDALONE loads the independent checkpoint's full native model.
+        # is_draft_model still owns draft revision/quantization/context policy;
+        # it must not implicitly select that checkpoint's MTP/NextN head.
+        if self.is_standalone_draft:
+            return
         is_draft_model = self.is_draft_model
 
         if is_draft_model and self.hf_config.architectures[0] in [
