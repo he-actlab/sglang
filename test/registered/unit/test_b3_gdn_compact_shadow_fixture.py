@@ -10,6 +10,7 @@ import torch
 import yaml
 
 import sglang.srt.debug_utils.b3_gdn_compact_shadow as fixture
+from sglang.srt.configs.qwen3_5 import Qwen3_5TextConfig
 from sglang.srt.debug_utils.gdn_compact_shadow import ShadowShape, TRANSIENT_GUARD_BYTES
 from sglang.srt.debug_utils.source_patcher.code_patcher import _insert_preamble
 from sglang.srt.debug_utils.source_patcher.source_editor import apply_edits
@@ -113,11 +114,9 @@ def test_graph_and_instrumentation_controls(monkeypatch):
 def _runner(role):
     s = fixture.SHAPES[role]
     count = 64 if role == "target" else 32
-    config = NS(
+    config = Qwen3_5TextConfig(
         num_hidden_layers=count,
-        layer_types=[
-            "full_attention" if i % 4 == 3 else "linear_attention" for i in range(count)
-        ],
+        full_attention_interval=4,
         linear_num_key_heads=16,
         linear_num_value_heads=s.value_heads,
         linear_key_head_dim=128,
@@ -148,12 +147,42 @@ def _runner(role):
 @pytest.mark.parametrize("role", ["target", "draft"])
 def test_exact_native_role_layout_and_no_mtp_substitution(role):
     runner = _runner(role)
+    assert not hasattr(runner.model_config.hf_text_config, "layer_types")
+    assert runner.model_config.hf_text_config.linear_layer_ids == list(
+        runner.req_to_token_pool.mamba_map
+    )
     assert fixture._layout(runner, role)[0] is runner.req_to_token_pool
     runner.model_config.hf_config.architectures = ["Qwen3_5ForCausalLMMTP"]
     with pytest.raises(ValueError, match="architecture/state layout"):
         fixture._layout(runner, role)
     with pytest.raises(ValueError, match="architecture/state layout"):
         fixture._layout(_runner(role), "draft" if role == "target" else "target")
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize("interval", [2, 3, 8])
+def test_native_attention_interval_change_is_rejected(role, interval):
+    runner = _runner(role)
+    runner.model_config.hf_text_config.full_attention_interval = interval
+    with pytest.raises(ValueError, match="architecture/state layout"):
+        fixture._layout(runner, role)
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize("mutation", ["indices", "capacity", "backend", "dense"])
+def test_native_role_state_ownership_and_layout_remain_guarded(role, mutation):
+    runner = _runner(role)
+    pool = runner.req_to_token_pool
+    if mutation == "indices":
+        pool.mamba_map = {key + 1: value for key, value in pool.mamba_map.items()}
+    elif mutation == "capacity":
+        pool.size = 64
+    elif mutation == "backend":
+        runner.attn_backend.linear_attn_backend.req_to_token_pool = object()
+    else:
+        pool.get_speculative_mamba2_params_all_layers().intermediate_ssm = object()
+    with pytest.raises(ValueError, match="architecture/state layout"):
+        fixture._layout(runner, role)
 
 
 @pytest.mark.parametrize(

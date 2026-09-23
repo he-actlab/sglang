@@ -73,9 +73,7 @@ def _layout(runner, role):
     backend = runner.attn_backend.linear_attn_backend
     state = pool.get_speculative_mamba2_params_all_layers()
     config = runner.model_config.hf_text_config
-    layer_ids = [
-        i for i, kind in enumerate(config.layer_types) if kind == "linear_attention"
-    ]
+    layer_ids = config.linear_layer_ids
     if (
         runner.model_config.hf_config.architectures
         != ["Qwen3_5ForConditionalGeneration"]
