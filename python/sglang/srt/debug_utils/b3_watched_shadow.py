@@ -53,7 +53,7 @@ def _validate_args(args):
         != (6, 1, 7)
         or args.max_running_requests != 64
         or args.cuda_graph_config.decode.max_bs != 64
-        or args.mem_fraction_static != 0.90
+        or args.mem_fraction_static != 0.895
         or not args.enable_spec_pdmux
         or args.spec_pdmux_slots != 2
         or args.spec_pdmux_sm_split != "132,56"
@@ -72,7 +72,7 @@ def _validate_args(args):
         or args.device != "cuda"
     ):
         raise ValueError(
-            "B3 watched oracle requires native K6/1/D7 two-slot32/graph64 BF16/FP32, .90 cache-off CUDA TP1"
+            "B3 watched oracle requires native K6/1/D7 two-slot32/graph64 BF16/FP32, .895 cache-off CUDA TP1"
         )
     if any(
         os.environ.get(name, "0") != "0"
