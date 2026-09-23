@@ -335,6 +335,7 @@ def test_cuda_component_delayed_result_survives_later_scratch_reuse():
     bits = state.temporal[0, 27].view(torch.int32).flatten()
     bits[:3].copy_(torch.tensor([1, -2147483648, 0x7FC01234], device="cuda", dtype=torch.int32))
     producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+    producer.wait_stream(torch.cuda.current_stream())  # Order test setup writes.
     with torch.cuda.stream(producer):
         store.capture(0, True, state, owner, pool, [3], ids)
         warm = store.capture(0, False, state, owner, pool, [3], ids)
