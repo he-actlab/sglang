@@ -10,6 +10,7 @@ import weakref
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -97,20 +98,21 @@ def test_projection_native_body_lifetime(mode,capture,eager,retain,heads,release
     (True,True,False,True),(False,False,False,True),
     (False,True,False,False),
 ])
-def test_conv_native_body_lifetime(capture,eager,retain,fresh):
+@pytest.mark.parametrize("inference", [False, True])
+def test_conv_native_body_lifetime(capture,eager,retain,fresh,inference):
     ns=settings(capture,eager)
     refs=[]
     hk,hv,dk,dv,t=2,4,4,4,3
     def conv(x,*args,**kwargs):
         result=x.clone()
-        refs.append(weakref.ref(result))
-        return result
+        refs.append(StorageWeakRef(result.untyped_storage()))
+        return result.view_as(result)
     def split(x,*args):
         q,k,v=x.split([hk*dk,hk*dk,hv*dv],dim=-1)
         return q.reshape(1,t,hk,dk).clone(),k.reshape(1,t,hk,dk).clone(),v.reshape(1,t,hv,dv).clone()
     released=fresh and eager and not capture and not retain
     def extend(**kwargs):
-        assert (refs[0]() is None) is released
+        assert refs[0].expired() is released
         return kwargs["v"],None,None
     ns.update(causal_conv1d_fn=conv,MAX_FUSED_QKV_SPLIT_DIM=8192 if fresh else 0,
         fused_qkv_split_gdn_prefill=split,
@@ -126,8 +128,24 @@ def test_conv_native_body_lifetime(capture,eager,retain,fresh):
         conv_weights=None,bias=None,activation=None,A_log=None,dt_bias=None)
     batch=NS(forward_mode=Mode.EXTEND,extend_prefix_lens=torch.tensor([0]),extend_seq_lens_cpu=[t])
     fn=compile_body(body(GDN,"GDNAttnBackend","forward_extend"),ns,retain)
-    fn(backend,layer,batch,torch.ones(t,2*hk*dk+hv*dv),torch.ones(t,hv),torch.ones(t,hv))
-    assert refs[0]() is None
+    with torch.inference_mode(inference):
+        fn(backend,layer,batch,torch.ones(t,2*hk*dk+hv*dv),torch.ones(t,hv),torch.ones(t,hv))
+    assert refs[0].expired()
+
+
+def test_inference_view_wrapper_death_is_not_storage_release():
+    # Inference views do not retain the original Python Tensor wrapper. Native
+    # conv output is rebound through transpose/slice before the fresh Q/K/V copy.
+    with torch.inference_mode():
+        original=torch.ones(4,8)
+        wrapper=weakref.ref(original)
+        storage=StorageWeakRef(original.untyped_storage())
+        view=original.transpose(0,1)[:7]
+        del original
+        assert wrapper() is None
+        assert not storage.expired()
+        del view
+        assert storage.expired()
 
 
 @pytest.mark.parametrize("mode",[Mode.TARGET_VERIFY,Mode.DRAFT_EXTEND_V2,Mode.DECODE,Mode.IDLE])
@@ -188,10 +206,12 @@ def test_cuda_component_native_prefill_stream_and_graph(capture):
     refs={}
     native_conv=gm.causal_conv1d_fn
     def observed_conv(*a,**kw):
-        y=native_conv(*a,**kw);refs["conv"]=weakref.ref(y);return y
+        y=native_conv(*a,**kw)
+        refs["conv"]=StorageWeakRef(y.untyped_storage())
+        return y
     kernel=TritonGDNKernel()
     def extend(**kw):
-        assert (refs["conv"]() is None) is (not capture and not retain)
+        assert refs["conv"].expired() is (not capture and not retain)
         # Same-stream overwrite pressure catches accidental aliases after del.
         pressure=torch.empty(t,2*hk*d+hv*d,device=device,dtype=dtype).fill_(17)
         result=kernel.extend(**kw)
