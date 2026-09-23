@@ -2,6 +2,8 @@
 
 import ast
 import importlib.util
+import hashlib
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -105,6 +107,243 @@ def record(tensors, metadata, snapshot=1):
 def test_exact_declared_private_bytes():
     assert entry.Layout().nbytes() == entry.PRIVATE_BYTES == 274661916
     assert entry.GUARD_BYTES == 512 << 20
+
+
+def test_payload_byte_contract_preserves_original_anchors():
+    assert entry.ANCHORS == (0, 1, 3, 7) and entry.PAYLOAD_ANCHORS == (1, 3, 7)
+    assert entry.Layout().comparison_nbytes() == entry.PAYLOAD_EXTRA_BYTES == 202690560
+    assert entry.PRIVATE_BYTES + entry.PAYLOAD_EXTRA_BYTES == 477352476
+    logical = sum(30 * 32 * 128 * 128 * 4 + 30 * 8192 * 3 * 2 + 20 * n * 2 * 256 * 2
+                  for n in entry.LENGTHS[1:]) * 2
+    assert logical == entry.PAYLOAD_LOGICAL_BYTES == 404971520
+    assert entry.PAYLOAD_STAGING_BYTES == 2097152
+    assert entry.payload_contract()["cpu_tensor_staging_limit_bytes"] == 4259848
+    assert entry.PAYLOAD_FILE_OVERHEAD == 65536 and entry.PAYLOAD_MANIFEST_LIMIT == 1048576
+    assert not any(name.startswith("actual_") for name in fixture()[0].buffers)
+
+
+def payload_observer(tmp_path, different=False):
+    observer, mapping, _ = fake_observer()
+    observer.storage = entry.EntryBuffers("cpu", observer.storage.layout, retain_comparisons=True)
+    observer.payload_enabled = True
+    observer.payload_events = {}
+    observer.payload_status = dict(enabled=True, status="not_started")
+    observer.observer.directory = tmp_path
+    observer.observer.runtime = dict(base="base", revision="revision")
+    observer.observer.config = dict(entry_state_payload=entry.payload_contract())
+    serial = 0
+    for idx in (107, 187):
+        if idx == 187 and different:
+            observer.state.temporal[0, 27].view(torch.int32).flatten()[0].bitwise_xor_(1)
+        request = req(observer, idx)
+        for a, length in enumerate(entry.LENGTHS):
+            if a:
+                request, tensors, metadata, _, _ = capture(observer, mapping, idx, length)
+            else:
+                source = NS(batch_size=1, req_pool_indices=torch.tensor([23]), seq_lens=torch.tensor([149]),
+                    input_ids=torch.arange(149), positions=torch.arange(149),
+                    extend_prefix_lens_cpu=[0], extend_seq_lens_cpu=[149])
+                observer.runner.attn_backend = NS(linear_attn_backend=NS(forward_metadata=NS(
+                    mamba_cache_indices=torch.tensor([27], dtype=torch.int32), query_start_loc=torch.tensor([0, 149]))),
+                    full_attn_backend=NS())
+                tensors, metadata = observer.post_prefill(NS(reqs=[request]), source)
+            serial += 1
+            out = record(tensors, metadata, serial)
+            out["runtime"] = observer.observer.runtime
+            observer.publish(request, out, completion=NS(query=lambda: True))
+            assert not out["problems"]
+            if a:
+                (tmp_path / f'{idx:04d}-{serial:06d}-verify.json').write_text(json.dumps(out))
+    s = observer.storage.layout
+    logical = 2 * sum(s.layers * (torch.tensor(s.temporal).prod().item() * 4
+                                  + torch.tensor(s.conv).prod().item() * 2)
+                      + 2 * s.kv_layers * n * torch.tensor(s.kv_shape).prod().item() * 2
+                      for n in entry.LENGTHS[1:])
+    return observer, logical
+
+
+def export_context(logical):
+    # CPU unit fixture substitutes only hardware readings/native tensor dimensions.
+    return patch.multiple(entry, PAYLOAD_LOGICAL_BYTES=logical)
+
+
+def test_payload_export_is_exact_and_never_reads_recycled_scratch(tmp_path):
+    observer, logical = payload_observer(tmp_path)
+    for name in ("temporal_work", "conv_work", "kv_work", "differences"):
+        observer.storage.buffers[name].fill_(17)
+    observer.state.temporal.zero_()
+    with export_context(logical), patch.object(torch.cuda, "mem_get_info", return_value=(1 << 30, 2 << 30)), \
+         patch.object(torch.cuda, "is_current_stream_capturing", return_value=False), \
+         patch.object(torch.cuda, "synchronize", side_effect=AssertionError("no device fence")):
+        observer.export_payloads(True)
+        observer.export_payloads(True)  # Completed export is immutable/idempotent.
+    path = tmp_path / "entry-state-payloads/manifest.json"
+    manifest = json.loads(path.read_text())
+    assert manifest["status"] == "complete" and manifest["logical_tensor_bytes"] == logical
+    assert len(manifest["entries"]) == 6 and len(manifest["files"]) == 36
+    for item in manifest["files"]:
+        tensor_path = path.parent / item["path"]
+        tensor = torch.load(tensor_path, weights_only=True)
+        assert tensor.shape == torch.Size(item["shape"]) and str(tensor.dtype) == item["dtype"]
+        assert hashlib.sha256(tensor.view(torch.uint8).numpy()).hexdigest() == item["tensor_sha256"]
+        assert entry.file_sha256(tensor_path) == item["file_sha256"]
+    assert observer.payload_status["manifest_sha256"] == entry.file_sha256(path)
+
+
+@pytest.mark.parametrize("missing", ["publication", "event", "bank"])
+def test_payload_partial_coverage_blocks_before_host_copy(tmp_path, missing):
+    observer, _ = payload_observer(tmp_path)
+    if missing == "publication":
+        observer.published.remove((187, 3))
+    elif missing == "event":
+        observer.payload_events.pop((187, 3))
+    else:
+        observer.storage.comparisons.remove(3)
+    with patch.object(torch.Tensor, "to", side_effect=AssertionError("no incomplete D2H")):
+        with pytest.raises(RuntimeError, match="coverage|ownership"):
+            observer.export_payloads(True)
+    assert not (tmp_path / "entry-state-payloads").exists()
+
+
+def test_payload_not_eligible_or_event_not_completed_never_copies(tmp_path):
+    observer, _ = payload_observer(tmp_path)
+    observer.payload_events[187, 3] = NS(query=lambda: False)
+    with patch.object(torch.Tensor, "to", side_effect=AssertionError("no D2H")):
+        observer.export_payloads(False)
+        with pytest.raises(RuntimeError, match="ownership"):
+            observer.export_payloads(True)
+
+
+def test_payload_comparison_bank_cannot_be_overwritten(tmp_path):
+    observer, _ = payload_observer(tmp_path)
+    observer.enqueued.remove((187, 1))  # Storage itself still rejects an erroneous repeated gather.
+    with pytest.raises(RuntimeError, match="comparison bank overwrite"):
+        observer.storage.capture(1, False, observer.state, torch.tensor([27]), observer.kv_pool,
+                                 observer.full_layers, torch.arange(1, 150))
+
+
+@pytest.mark.parametrize("corrupt_after_capture", [False, True])
+def test_payload_nonzero_record_requires_exact_byte_count(tmp_path, corrupt_after_capture):
+    observer, logical = payload_observer(tmp_path, different=True)
+    assert observer.records[187, 1]["byte_differences"][0] == 1
+    if corrupt_after_capture:
+        observer.storage.buffers["actual_temporal"][0, 0].view(torch.uint8).flatten()[1].bitwise_xor_(1)
+    with export_context(logical), patch.object(torch.cuda, "mem_get_info", return_value=(1 << 30, 2 << 30)), \
+         patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
+        if corrupt_after_capture:
+            with pytest.raises(RuntimeError, match="contradict captured comparison"):
+                observer.export_payloads(True)
+        else:
+            observer.export_payloads(True)
+    directory = tmp_path / "entry-state-payloads"
+    assert (directory / "manifest.json").exists() is not corrupt_after_capture
+    assert (directory / "failed.json").exists() is corrupt_after_capture
+
+
+@pytest.mark.parametrize("failure", ["bank_corruption", "save_failure", "record_corruption", "file_bound"])
+def test_payload_failure_retains_partial_evidence_not_complete(tmp_path, failure):
+    observer, logical = payload_observer(tmp_path)
+    if failure == "bank_corruption":
+        observer.storage.buffers["actual_temporal"][0, 0, 0, 0, 0] += 1
+    if failure == "record_corruption":
+        path = tmp_path / "0187-000006-verify.json"
+        saved = json.loads(path.read_text()); saved["runtime"]["revision"] = "wrong"
+        path.write_text(json.dumps(saved))
+    original = torch.save
+    calls = 0
+    def save(value, stream):
+        nonlocal calls
+        calls += 1
+        if failure == "save_failure" and calls == 2:
+            stream.write(b"partial")
+            raise OSError("injected disk failure")
+        original(value, stream)
+        if failure == "file_bound":
+            stream.write(b"x" * entry.PAYLOAD_FILE_OVERHEAD)
+    with export_context(logical), patch.object(torch, "save", save), \
+         patch.object(torch.cuda, "mem_get_info", return_value=(1 << 30, 2 << 30)), \
+         patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
+        with pytest.raises((RuntimeError, OSError)):
+            observer.export_payloads(True)
+        with pytest.raises(RuntimeError, match="previous payload export failed"):
+            observer.export_payloads(True)
+    directory = tmp_path / "entry-state-payloads"
+    assert not (directory / "manifest.json").exists()
+    assert json.loads((directory / "failed.json").read_text())["status"] == "failed"
+    assert list(directory.glob("*.pt"))  # Preserve even an interrupted/invalid file.
+
+
+def test_payload_existing_export_directory_is_not_overwritten(tmp_path):
+    observer, _ = payload_observer(tmp_path)
+    directory = tmp_path / "entry-state-payloads"
+    directory.mkdir(); (directory / "owned-by-earlier-attempt").write_text("keep")
+    with patch.object(torch.cuda, "mem_get_info", return_value=(1 << 30, 2 << 30)), \
+         patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
+        with pytest.raises(FileExistsError):
+            observer.export_payloads(True)
+    assert (directory / "owned-by-earlier-attempt").read_text() == "keep"
+
+
+def test_payload_declaration_rejects_wrong_budget_before_hardware_read():
+    with pytest.raises(RuntimeError, match="exact payload declaration"):
+        entry.EntryObserver(NS(), NS(config=dict(entry_state_payload={})))
+
+
+def test_payload_guard_refuses_capture_or_low_free_before_copy(tmp_path):
+    observer, _ = payload_observer(tmp_path)
+    with patch.object(torch.Tensor, "to", side_effect=AssertionError("no D2H")):
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            with pytest.raises(RuntimeError, match="during capture"):
+                observer.export_payloads(True)
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False), \
+             patch.object(torch.cuda, "mem_get_info", return_value=(entry.GUARD_BYTES, 2 << 30)):
+            with pytest.raises(RuntimeError, match="physical headroom"):
+                observer.export_payloads(True)
+    assert not (tmp_path / "entry-state-payloads").exists()
+
+
+def test_payload_publish_cannot_assert_uncompleted_event():
+    observer, mapping, _ = fake_observer()
+    observer.storage = entry.EntryBuffers("cpu", observer.storage.layout, retain_comparisons=True)
+    observer.payload_enabled = True
+    observer.payload_events = {}
+    request, tensors, metadata, _, _ = capture(observer, mapping, 107)
+    with pytest.raises(RuntimeError, match="published completion event"):
+        observer.publish(request, record(tensors, metadata), completion=NS(query=lambda: False))
+    assert observer.payload_events == {}
+
+
+@pytest.mark.parametrize("can_graph,native_count", [(False, 32), (True, 31), (False, 31)])
+def test_failed_match_has_cpu_context_and_retains_gate(can_graph, native_count):
+    observer, mapping, _ = fake_observer()
+    request = req(observer, 187)
+    batch, forward, _, _ = graph_case(observer, mapping, request, length=155)
+    if native_count == 31:
+        batch.reqs.pop(0)
+    observer.observer.serial = 675
+    observer.observer.pending = {674, 675}
+    with patch.object(torch.cuda, "synchronize", side_effect=AssertionError("no GPU fence")), \
+         patch.object(torch.Tensor, "cpu", side_effect=AssertionError("no device copy")), \
+         pytest.raises(RuntimeError, match="matched entry requires native batch/graph32") as exc:
+        observer.before_verify(batch, forward, can_graph)
+    context = json.loads(str(exc.value).split("; context=", 1)[1])
+    assert context == dict(rid=request.rid, idx=187, anchor=7, native_seq_len=155,
+                          selected_row=native_count - 1, native_batch_size=native_count,
+                          forward_batch_size=32, can_graph=can_graph,
+                          forward_metadata_ready=True, req_pool_index=23,
+                          last_snapshot=675, pending_count=2)
+    assert not hasattr(forward, "_b4_entry_selection")
+    assert observer.enqueued == observer.published == set()
+    assert observer.observer.serial == 675 and observer.observer.pending == {674, 675}
+
+
+def test_matching_entry_does_not_construct_failure_context():
+    observer, mapping, _ = fake_observer()
+    request = req(observer, 107)
+    batch, forward, _, _ = graph_case(observer, mapping, request, length=155)
+    with patch.object(json, "dumps", side_effect=AssertionError("failure path only")):
+        observer.before_verify(batch, forward, True)
+    assert forward._b4_entry_selection == (31, request, 107, 3)
 
 
 def test_reference_is_immutable_and_comparison_never_writes_native_state():
@@ -327,8 +566,12 @@ def test_native_graph_replan_leaves_eager_metadata_and_observer_uses_graph_wrapp
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires explicitly reserved CUDA")
-def test_cuda_component_graph_entry_precedes_mutation_and_resolves_reused_owner():
+@pytest.mark.parametrize("retain_payload", [False, True])
+def test_cuda_component_graph_entry_precedes_mutation_and_resolves_reused_owner(retain_payload):
     observer, mapping, _ = fake_observer("cuda")
+    if retain_payload:
+        observer.storage = entry.EntryBuffers("cuda", observer.storage.layout, retain_comparisons=True)
+        observer.payload_enabled, observer.payload_events = True, {}
     observer._stream_guard = entry.EntryObserver._stream_guard.__get__(observer)
     baseline = observer.state.temporal.clone()
     graph = torch.cuda.CUDAGraph()
@@ -338,8 +581,10 @@ def test_cuda_component_graph_entry_precedes_mutation_and_resolves_reused_owner(
     torch.cuda.synchronize()  # Test setup only; production enqueue has no fence.
     r1, t1, m1, _, _ = capture(observer, mapping, 107)
     graph.replay()
-    torch.cuda.synchronize()
-    observer.publish(r1, record(t1, m1))
+    first_done = torch.cuda.Event()
+    first_done.record()
+    first_done.synchronize()
+    observer.publish(r1, record(t1, m1), completion=first_done)
     assert torch.equal(observer.storage.buffers["temporal"][1], baseline[:, 27])
     observer.state.temporal.copy_(baseline)
     # A later request generation may legitimately reuse request23 but own state19.
@@ -348,12 +593,19 @@ def test_cuda_component_graph_entry_precedes_mutation_and_resolves_reused_owner(
     mapping[23], mapping[19] = 19, 27
     r2, t2, m2, _, _ = capture(observer, mapping, 187)
     graph.replay()
-    torch.cuda.synchronize()
+    second_done = torch.cuda.Event()
+    second_done.record()
+    second_done.synchronize()
     out = record(t2, m2)
-    observer.publish(r2, out)
+    observer.publish(r2, out, completion=second_done)
     assert out["tensors"]["entry_resolved_state_indices"][-1] == 19
     assert out["entry_state"]["byte_differences"] == [0] * 6
     assert not out["problems"]
+    if retain_payload:
+        assert observer.payload_events == {(107, 1): first_done, (187, 1): second_done}
+        assert torch.equal(observer.storage.buffers["actual_temporal"][0], baseline[:, 27])
+        observer.storage.buffers["temporal_work"].fill_(777)
+        assert torch.equal(observer.storage.buffers["actual_temporal"][0], baseline[:, 27])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires explicitly reserved CUDA")

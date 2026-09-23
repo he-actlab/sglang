@@ -627,7 +627,7 @@ class _State:
             limitations="No full logits or KV/recurrent state; changed prediction is not root-cause attribution. Native accepted block retained; visible publication follows native stop/cap clipping.",
         )
         if self.entry is not None:
-            self.entry.publish(req, record)
+            self.entry.publish(req, record, completion=cap.completion)
         path = self.directory / f'{row["idx"]:04d}-{cap.serial:06d}-{kind}.json'
         with path.open("x") as stream:
             json.dump(_json_finite(record), stream, indent=2, allow_nan=False)
@@ -681,7 +681,12 @@ class _State:
         self.discarded_finished += 1
         self._retire(req.rid, cap)
 
-    def snapshot(self):
+    def snapshot(self, fully_idle=False):
+        if self.entry is not None:
+            self.entry.export_payloads(eligible=fully_idle and not self.pending and self.mismatches == 0
+                and len(self.seen) == len(self.rows) and all(
+                    rid in self.terminals and values == set(range(self.terminals[rid]["length"]))
+                    for rid, values in self.coverage.items()))
         return dict(
             **({"entry_state": self.entry.snapshot()} if self.entry is not None else {}),
             performance_eligible=False,
@@ -788,5 +793,5 @@ def discard_finished(req, result, kind):
         _state.discard_finished(req, result, kind)
 
 
-def snapshot():
-    return _state.snapshot() if _state is not None else None
+def snapshot(fully_idle=False):
+    return _state.snapshot(fully_idle=fully_idle) if _state is not None else None

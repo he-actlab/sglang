@@ -102,4 +102,4 @@ patches:
     preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import snapshot
     edits:
       - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
-        append: ret["b4_verify_diagnostic"] = snapshot()
+        append: ret["b4_verify_diagnostic"] = snapshot(fully_idle=self.is_fully_idle())

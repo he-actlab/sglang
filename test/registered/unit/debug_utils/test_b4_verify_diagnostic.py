@@ -3,6 +3,7 @@
 import ast
 import copy
 import importlib.util
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -717,6 +718,33 @@ def test_snapshot_never_confuses_partial_coverage_with_complete_pair(tmp_path):
     final = s.snapshot()
     assert final["selected_windows_complete"] and final["all_registered_requests_seen"]
     assert final["mismatches"] == final["pending_snapshots"] == 0
+
+
+@pytest.mark.parametrize("missing", ["idle", "requests", "post1", "coverage", "pending", "mismatch", None])
+def test_payload_export_only_after_both_clients_idle_and_result_fences(tmp_path, missing):
+    s = diag._State(config(tmp_path))
+    calls = []
+    s.entry = NS(export_payloads=lambda eligible: calls.append(eligible), snapshot=lambda: {})
+    s.seen = set(s.rows)
+    for rid in s.coverage:
+        s.coverage[rid] = {0, 1}
+        s.terminals[rid] = dict(length=2)
+    if missing == "requests": s.seen.pop()
+    if missing == "post1": s.seen = {rid for rid in s.rows if s.rows[rid]["repetition"] == 1}
+    if missing == "coverage": s.coverage[next(iter(s.coverage))].remove(1)
+    if missing == "pending": s.pending.add(1)
+    if missing == "mismatch": s.mismatches = 1
+    s.snapshot(fully_idle=missing != "idle")
+    assert calls == [missing is None]
+
+
+def test_payload_idle_hook_reuses_native_idle_and_keeps_snapshot_envelope():
+    functions = patched_functions()
+    _, source = functions["get_internal_state"]
+    assert "snapshot(fully_idle=self.is_fully_idle())" in source
+    assert diag._MAX_BYTES == 512 << 10 and diag._MAX_PENDING == 8
+    source = inspect.getsource(diag._State.publish)
+    assert source.index("cap.completion.synchronize()") < source.index("completion=cap.completion")
 
 
 def test_post_pool_guard_requires_resolved_native_cacheoff_capacity(monkeypatch):
