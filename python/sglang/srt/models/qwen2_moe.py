@@ -93,7 +93,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.multiplex.pdmux_context import get_spec_pdmux_auxiliary_stream
+from sglang.srt.multiplex.b3_draft_placement import (
+    use_b3_draft_full_device_projection,
+)
+from sglang.srt.multiplex.pdmux_context import (
+    get_spec_pdmux_auxiliary_stream,
+    spec_pdmux_full_device_operator_region,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -214,8 +220,24 @@ class Qwen2MoeMLP(nn.Module):
         x,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        *,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
-        gate_up, _ = self.gate_up_proj(x)
+        use_full_device = use_b3_draft_full_device_projection(
+            "gate_up",
+            x,
+            self.gate_up_proj,
+            forward_batch,
+            getattr(self, "_b3_draft_model_config", None),
+        )
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_device_stream:
+            if full_device_stream is not None:
+                x.record_stream(full_device_stream)
+            gate_up, _ = self.gate_up_proj(x)
+        if full_device_stream is not None:
+            gate_up.record_stream(torch.cuda.current_stream())
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter

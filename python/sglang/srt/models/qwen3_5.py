@@ -91,9 +91,13 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
+from sglang.srt.multiplex.b3_draft_placement import (
+    use_b3_draft_full_device_projection,
+)
 from sglang.srt.multiplex.pdmux_context import (
     get_spec_pdmux_auxiliary_stream,
     register_spec_pdmux_auxiliary_stream,
+    spec_pdmux_full_device_operator_region,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -702,7 +706,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                forward_batch=forward_batch,
             )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -901,9 +908,23 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def forward_prepare_cuda_fused(self, positions, hidden_states):
+    def forward_prepare_cuda_fused(self, positions, hidden_states, forward_batch=None):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
-        qkv, _ = self.qkv_proj(hidden_states)
+        use_full_device = use_b3_draft_full_device_projection(
+            "qkv",
+            hidden_states,
+            self.qkv_proj,
+            forward_batch,
+            getattr(self, "_b3_draft_model_config", None),
+        )
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_device_stream:
+            if full_device_stream is not None:
+                hidden_states.record_stream(full_device_stream)
+            qkv, _ = self.qkv_proj(hidden_states)
+        if full_device_stream is not None:
+            qkv.record_stream(torch.cuda.current_stream())
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -1007,6 +1028,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         elif (_is_hip or _is_xpu) and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_fused_gate(
@@ -1088,7 +1110,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                forward_batch=forward_batch,
             )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True

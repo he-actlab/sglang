@@ -753,6 +753,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
+            from sglang.srt.multiplex.b3_draft_placement import (
+                mark_b3_draft_projection_modules,
+            )
+
+            mark_b3_draft_projection_modules(self.model, self.server_args)
 
         # Load the expert backup client
         self.expert_backup_client = (
