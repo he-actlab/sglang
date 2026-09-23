@@ -485,6 +485,71 @@ def server_args():
     return NS(**expected, cuda_graph_config=NS(decode=NS(max_bs=32, backend="full")))
 
 
+def native_adjustment():
+    path = ROOT / "python/sglang/srt/model_executor/model_runner.py"
+    source = ast.parse(path.read_text())
+    owner = next(
+        n
+        for n in source.body
+        if isinstance(n, ast.ClassDef) and n.name == "ModelRunner"
+    )
+    method = next(
+        n
+        for n in owner.body
+        if isinstance(n, ast.FunctionDef) and n.name == "model_specific_adjustment"
+    )
+    constant = next(
+        n
+        for n in source.body
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Name)
+            and t.id == "CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS"
+            for t in n.targets
+        )
+    )
+    namespace = {}
+    exec(
+        compile(
+            ast.Module(body=[constant, method], type_ignores=[]), str(path), "exec"
+        ),
+        namespace,
+    )
+    return namespace["model_specific_adjustment"]
+
+
+def test_native_llama_lifecycle_strict_graph_hook_guard(monkeypatch):
+    from transformers import LlamaConfig
+    from sglang.srt.server_args import ServerArgs
+
+    monkeypatch.setenv(diag._KIND_ENV, "correctness-only")
+    monkeypatch.setenv("DUMPER_NON_INTRUSIVE_MODE", "off")
+    args = ServerArgs(model_path="dummy")
+    assert args.disable_chunked_prefix_cache is False
+    for key, value in vars(server_args()).items():
+        if key != "disable_chunked_prefix_cache":
+            setattr(args, key, value)
+    args.chunked_prefill_size = 8192
+    native_adjustment()(
+        NS(
+            server_args=args,
+            use_mla_backend=False,
+            is_multimodal=False,
+            model_config=NS(hf_config=LlamaConfig(architectures=["LlamaForCausalLM"])),
+        )
+    )
+    assert args.disable_chunked_prefix_cache is True
+    diag._validate_server(args)
+    args.disable_chunked_prefix_cache = False
+    with pytest.raises(RuntimeError, match="disable_chunked_prefix_cache"):
+        diag._validate_server(args)
+
+
+def test_guard_fields_exist_in_actual_native_server_args():
+    from sglang.srt.server_args import ServerArgs
+    assert set(vars(server_args())) <= set(ServerArgs.__dataclass_fields__)
+
+
 @pytest.mark.parametrize(
     "key,value",
     [

@@ -133,7 +133,6 @@ def _validate_server(args):
         page_size=1,
         max_running_requests=32,
         disable_radix_cache=True,
-        enable_gdn_compact_spec_state=False,
         disable_overlap_schedule=False,
         disable_cuda_graph=False,
         disable_decode_cuda_graph=False,
@@ -162,7 +161,8 @@ def _validate_server(args):
         enable_dp_lm_head=False,
         disable_cuda_graph_padding=False,
         speculative_draft_attention_backend=None,
-        disable_chunked_prefix_cache=False,
+        # Native non-MLA model adjustment precedes this graph-init hook.
+        disable_chunked_prefix_cache=True,
         enable_hierarchical_cache=False,
         moe_runner_backend="auto",
         moe_a2a_backend="none",
