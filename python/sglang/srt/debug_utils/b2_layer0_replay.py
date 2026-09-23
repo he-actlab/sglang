@@ -28,6 +28,8 @@ WEIGHTS = {
     "model.layers.0.self_attn.v_proj.weight": [1024, 4096],
 }
 CPU_LIMIT = 8 * 1024**2
+ORDER_SCHEDULE = (0, 1, 1, 0, 0, 1, 1, 0)
+ORDER_CPU_LIMIT = 16 * 1024**2
 DEVICE_HEADROOM = 512 * 1024**2
 DEVICE_ADMISSION = 2 * 1024**3
 
@@ -158,6 +160,7 @@ def validated_plan(path):
         REPO, PIN, BASE, "bfloat16", 1, False, False
     ) or len(plan["members"]) != 2:
         raise ValueError("component contract mismatch")
+    execution_contract(plan)
     runtime = Path(__file__).resolve().parents[4]
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=runtime, text=True).strip()
     subprocess.run(["git", "merge-base", "--is-ancestor", BASE, actual], cwd=runtime, check=True)
@@ -172,6 +175,19 @@ def validated_plan(path):
     members = [validated_member(root, m, i) for i, m in enumerate(plan["members"])]
     checkpoint_headers(plan["snapshot"])
     return plan, members
+
+
+def execution_contract(plan):
+    if "repeat_order" not in plan:
+        return (0, 1), CPU_LIMIT
+    order = plan["repeat_order"]
+    expected = dict(schedule=list(ORDER_SCHEDULE), repetitions_per_order=2,
+                    cpu_snapshot_limit_bytes=ORDER_CPU_LIMIT)
+    if not isinstance(order, dict) or order != expected or any(
+        type(i) is not int for i in order["schedule"]
+    ) or type(order["repetitions_per_order"]) is not int or type(order["cpu_snapshot_limit_bytes"]) is not int:
+        raise ValueError("repeat/order component contract mismatch")
+    return ORDER_SCHEDULE, ORDER_CPU_LIMIT
 
 
 def comparison(a, b):
@@ -272,6 +288,50 @@ def build_native(snapshot):
     return embedding, norm, attention
 
 
+def collect_calls(embedding, norm, attention, members, schedule, cpu_limit):
+    result, snapshots = [], []
+    for index in schedule:
+        member = members[index]
+        captured = native_chain(embedding, norm, attention, member)
+        captured = {key: value.cpu() for key, value in captured.items()}
+        if sum(t.numel() * t.element_size() for s in snapshots + [captured] for t in s.values()) > cpu_limit:
+            raise ValueError("component CPU snapshot bound exceeded")
+        result.append({
+            "rows": len(member["ids"]), "cohort_indices": member["cohort_indices"],
+            "input_basis": member["cohort_input_basis"],
+            "against_preserved_P0": {
+                part: comparison(captured[key].reshape(43, 8, 128), expected)
+                for part, key, expected in zip(("K", "V"), ("post_rope_k", "v"), member["expected_kv"])
+            },
+        })
+        snapshots.append(captured)
+    return result, snapshots
+
+
+def repeat_order_observations(snapshots, schedule):
+    if tuple(schedule) != ORDER_SCHEDULE or len(snapshots) != len(ORDER_SCHEDULE):
+        raise ValueError("incomplete or reordered component calls")
+    stages = {"embedding", "input_norm", "raw_qkv", "post_rope_k", "v"}
+    if any(set(snapshot) != stages for snapshot in snapshots):
+        raise ValueError("missing or extra component stage")
+    same, pairs = [], []
+    for call in range(2, len(schedule)):
+        baseline = schedule[call]  # First A/B are calls0/1, not mutable last-wins.
+        same.append(dict(call=call, cohort=schedule[call], first_call=baseline,
+                         stages={key: comparison(snapshots[baseline][key], snapshots[call][key])
+                                 for key in snapshots[baseline]}))
+    for start in range(0, len(schedule), 2):
+        a, b = (start, start + 1) if schedule[start] == 0 else (start + 1, start)
+        pairs.append(dict(calls=[start, start + 1], order=list(schedule[start:start + 2]),
+                          canonical_A_call=a, canonical_B_call=b,
+                          stages={key: comparison(snapshots[a][key], snapshots[b][key])
+                                  for key in snapshots[a]}))
+    return dict(schedule=list(schedule), same_cohort_to_first=same, ordered_pairs=pairs,
+                same_cohort_bitwise_repeatable=all(
+                    stage["bitwise_equal"] for row in same for stage in row["stages"].values()),
+                scope="Observed same-cohort repeatability/order only; not shape-only causality, serving or performance")
+
+
 def run(plan, members, output):
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.distributed import init_distributed_environment, initialize_model_parallel
@@ -279,6 +339,7 @@ def run(plan, members, output):
 
     if output.exists() or output.with_suffix(".pt").exists():
         raise FileExistsError("component output already exists")
+    schedule, cpu_limit = execution_contract(plan)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         raise ValueError("component requires the reserved native SM120 device")
     if is_batch_invariant_mode_enabled() or torch.are_deterministic_algorithms_enabled():
@@ -296,21 +357,7 @@ def run(plan, members, output):
                                      distributed_init_method=f"file://{tmp}/init", backend="nccl")
         initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
         embedding, norm, attention = build_native(plan["snapshot"])
-        result, snapshots = [], []
-        for member in members:
-            captured = native_chain(embedding, norm, attention, member)
-            captured = {key: value.cpu() for key, value in captured.items()}
-            if sum(t.numel() * t.element_size() for s in snapshots + [captured] for t in s.values()) > CPU_LIMIT:
-                raise ValueError("component CPU snapshot bound exceeded")
-            result.append({
-                "rows": len(member["ids"]), "cohort_indices": member["cohort_indices"],
-                "input_basis": member["cohort_input_basis"],
-                "against_preserved_P0": {
-                    part: comparison(captured[key].reshape(43, 8, 128), expected)
-                    for part, key, expected in zip(("K", "V"), ("post_rope_k", "v"), member["expected_kv"])
-                },
-            })
-            snapshots.append(captured)
+        result, snapshots = collect_calls(embedding, norm, attention, members, schedule, cpu_limit)
         free_after, _ = torch.cuda.mem_get_info()
         memory = {"free_before": free, "free_after": free_after, "total": total,
                   "peak_allocated": torch.cuda.max_memory_allocated(),
@@ -323,6 +370,8 @@ def run(plan, members, output):
                   "between_cohorts": {key: comparison(snapshots[0][key], snapshots[1][key]) for key in snapshots[0]},
                   "tensor_sha256": sha(tensor_path), "memory": memory,
                   "limitations": plan["limitations"], "runtime_revision": plan["runtime_revision"]}
+        if "repeat_order" in plan:
+            report["repeat_order"] = repeat_order_observations(snapshots, schedule)
         with output.open("x") as f:
             json.dump(report, f, indent=2); f.write("\n")
         if not memory["headroom_gate"]:
