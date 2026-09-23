@@ -1,0 +1,52 @@
+# CPU-tested fixture only. GPU admission and full-model execution are separate gates.
+# DUMPER_ENABLE=false DUMPER_SERVER_PORT=reuse DUMPER_NON_INTRUSIVE_MODE=off
+# SGLANG_NVTX_PROFILE=0 SGLANG_PHASE_EVENTS=0; no tensor dumps or performance claims.
+patches:
+  - target: sglang.srt.debug_utils.dumper._Dumper.apply_source_patches
+    edits:
+      - match: config_path = self._config.source_patcher_config
+        replacement: return
+  - target: sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs
+    preamble: from sglang.srt.debug_utils.b3_gdn_compact_shadow import initialize
+    edits:
+      - match: self.eager_runner = EagerRunner(self)
+        prepend: initialize(self)
+  - target: sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend.forward_extend
+    preamble: from sglang.srt.debug_utils.b3_gdn_compact_shadow import capture, output
+    edits:
+      - match: core_attn_out = self.kernel_dispatcher.target_verify(
+        prepend: capture(self, layer, query, key, value, a, b, ssm_states, cache_indices, query_start_loc, retrieve_parent_token, forward_batch)
+      - match: return core_attn_out
+        prepend: |
+          if is_target_verify:
+              output(self, layer.layer_id, core_attn_out)
+  - target: sglang.srt.layers.attention.hybrid_linear_attn_backend.HybridLinearAttnBackend.update_mamba_state_after_mtp_verify
+    preamble: from sglang.srt.debug_utils.b3_gdn_compact_shadow import check
+    edits:
+      - match: "# Track indices used for tracking mamba states for prefix cache"
+        prepend: check(self.linear_attn_backend, last_correct_step_indices, mamba_track_indices, mamba_steps_to_track)
+  - target: sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify
+    preamble: from sglang.srt.debug_utils.b3_gdn_compact_shadow import record_selection
+    edits:
+      - match: new_seq_lens = batch.seq_lens + accept_lens
+        prepend: record_selection(self, batch, verify_input, predict, accept_lens, accept_index)
+  - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker._draft_extend_for_decode_impl
+    preamble: from sglang.srt.debug_utils.b3_gdn_compact_shadow import check_extend_feed
+    edits:
+      - match: maybe_detect_nan(
+        prepend: check_extend_feed(self, batch, forward_batch, batch_result, can_cuda_graph)
+  - target: sglang.srt.mem_cache.memory_pool.HybridReqToTokenPoolStateView.prepare_draft_working_state
+    preamble: from sglang.srt.debug_utils.b3_gdn_compact_shadow import capture_working
+    edits:
+      - match: return self.draft_working_indices[:bs]
+        prepend: capture_working(self, req_pool_indices)
+  - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker._draft_one
+    preamble: from sglang.srt.debug_utils.b3_gdn_compact_shadow import check_working
+    edits:
+      - match: raw = self._draft_raw(batch)
+        append: check_working(self, batch)
+  - target: sglang.srt.managers.scheduler.Scheduler.get_internal_state
+    preamble: from sglang.srt.debug_utils.b3_gdn_compact_shadow import snapshot
+    edits:
+      - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        append: ret["b3_gdn_compact_shadow"] = snapshot()
