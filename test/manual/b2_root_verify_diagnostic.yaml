@@ -82,4 +82,3 @@ patches:
     edits:
       - match: target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         append: capture_native_argmax(verify_input, batch, target_predict)
-
