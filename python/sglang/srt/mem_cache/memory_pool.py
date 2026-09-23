@@ -953,6 +953,17 @@ class MambaPool:
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
+    def get_gdn_prefill_workspace(self):
+        # Host-only typed views. Neither pool accounting nor captured storage
+        # addresses change; the explicit eager-call guard owns eligibility.
+        if not hasattr(self, "_gdn_prefill_workspace"):
+            from sglang.srt.model_executor.gdn_draft_workspace import (
+                create_gdn_prefill_workspace,
+            )
+
+            self._gdn_prefill_workspace = create_gdn_prefill_workspace(self)
+        return self._gdn_prefill_workspace
+
     def __init__(
         self,
         *,

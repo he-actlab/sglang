@@ -463,12 +463,26 @@ class ColumnParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, *, out=None):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        if out is None:
+            output_parallel = self.quant_method.apply(self, input_, bias)
+        else:
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+            if (
+                type(self.quant_method) is not UnquantizedLinearMethod
+                or self.tp_size != 1
+                or self.gather_output
+                or bias is not None
+            ):
+                raise ValueError(
+                    "Native prefill linear output requires unquantized TP1"
+                )
+            output_parallel = self.quant_method.apply(self, input_, bias, out=out)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)

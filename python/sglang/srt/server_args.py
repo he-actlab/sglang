@@ -1879,6 +1879,12 @@ class ServerArgs:
         "unallocated workspace budget instead of increasing KV capacity. "
         "Requires the supported Qwen3.5-27B/4B compact K6 cache-off configuration.",
     ] = False
+    enable_gdn_prefill_workspace_reuse: A[
+        bool,
+        "Reuse phase-exclusive model-local compact/working scratch for native "
+        "eager GDN and dense MLP outputs. Requires the supported draft workspace "
+        "alias configuration; unsupported calls keep native allocations.",
+    ] = False
     linear_replayssm_cache_len: A[
         int,
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
@@ -2702,7 +2708,10 @@ class ServerArgs:
         self._handle_dcp_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
-            if self.enable_gdn_draft_workspace_alias:
+            if (
+                self.enable_gdn_draft_workspace_alias
+                or self.enable_gdn_prefill_workspace_reuse
+            ):
                 raise ValueError("Draft workspace alias requires native Qwen3.5 models")
             # Skip for dummy models
             return
@@ -2847,6 +2856,12 @@ class ServerArgs:
             )
 
             validate_gdn_draft_workspace_args(self)
+        if self.enable_gdn_prefill_workspace_reuse:
+            from sglang.srt.model_executor.gdn_draft_workspace import (
+                validate_gdn_prefill_workspace_args,
+            )
+
+            validate_gdn_prefill_workspace_args(self)
 
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):

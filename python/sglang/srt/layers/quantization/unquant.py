@@ -134,7 +134,35 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if out is not None:
+            from sglang.srt.model_executor.gdn_draft_workspace import (
+                select_gdn_prefill_output,
+            )
+
+            if (
+                not x.is_cuda
+                or x.dtype != torch.bfloat16
+                or x.ndim != 2
+                or not x.is_contiguous()
+                or torch.is_autocast_enabled()
+                or layer.weight.dtype != x.dtype
+                or layer.weight.device != x.device
+                or layer.weight.ndim != 2
+                or not layer.weight.is_contiguous()
+                or layer.weight.shape[1] != x.shape[1]
+                or bias is not None
+                or tuple(out.shape) != (x.shape[0], layer.weight.shape[0])
+                or not out.is_contiguous()
+            ):
+                raise ValueError("Native prefill linear output layout is unsupported")
+            selected = select_gdn_prefill_output(
+                out.view(-1), tuple(out.shape), x, inputs=(x, layer.weight)
+            )
+            assert selected is not None
+            return F.linear(x, layer.weight, bias, out=out)
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

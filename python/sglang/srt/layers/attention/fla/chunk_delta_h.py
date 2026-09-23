@@ -343,6 +343,8 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
     consume_u: bool = False,
+    *,
+    out_buffer: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -361,7 +363,30 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    h = None
+    if out_buffer is not None:
+        from sglang.srt.model_executor.gdn_draft_workspace import (
+            select_gdn_prefill_output,
+        )
+
+        h = select_gdn_prefill_output(
+            out_buffer,
+            (B, NT, H, V, K),
+            k,
+            inputs=(
+                k,
+                w,
+                u,
+                g,
+                gk,
+                initial_state,
+                initial_state_indices,
+                cu_seqlens,
+                chunk_indices,
+            ),
+        )
+    if h is None:
+        h = k.new_empty(B, NT, H, V, K)
 
     if consume_u:
         if not save_new_value:

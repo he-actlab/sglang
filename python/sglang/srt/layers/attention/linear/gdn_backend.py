@@ -589,6 +589,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            prefill_workspace = None
+            if (
+                is_cuda()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and not get_is_capture_mode()
+                and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+                and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                and not torch.is_grad_enabled()
+                and not needs_state_gather
+                and not forward_metadata.has_mamba_track_mask
+            ):
+                from sglang.srt.model_executor.gdn_draft_workspace import (
+                    get_gdn_prefill_workspace,
+                )
+
+                prefill_workspace = get_gdn_prefill_workspace(
+                    self.req_to_token_pool, forward_batch
+                )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -598,6 +616,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                **(
+                    {
+                        "prefill_workspace": (
+                            prefill_workspace.h_buffer,
+                            prefill_workspace.o_buffer,
+                        )
+                    }
+                    if prefill_workspace is not None
+                    else {}
+                ),
                 **(
                     {"consume_u": True}
                     if is_cuda()
@@ -611,6 +639,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     else {}
                 ),
             )
+            if prefill_workspace is not None:
+                prefill_workspace.record_output("h", h)
+                prefill_workspace.record_output("o", core_attn_out)
 
             if is_npu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(

@@ -223,6 +223,64 @@ class Qwen2MoeMLP(nn.Module):
         *,
         forward_batch: Optional[ForwardBatch] = None,
     ):
+        from sglang.srt.model_executor.gdn_draft_workspace import (
+            get_gdn_prefill_workspace,
+            select_gdn_prefill_output,
+        )
+
+        workspace = get_gdn_prefill_workspace(None, forward_batch)
+        gate_up_out = activation_out = None
+        native_outputs = False
+        if workspace is not None:
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+            expected = (9216, 2560) if workspace.role == "draft" else (17408, 5120)
+            # Do not bypass custom modules, dispatch, or hooks that can retain
+            # activation storage. The default branch below is unchanged.
+            native_outputs = (
+                type(self) is Qwen2MoeMLP
+                and type(self.gate_up_proj) is MergedColumnParallelLinear
+                and type(self.down_proj) is RowParallelLinear
+                and type(self.gate_up_proj.quant_method) is UnquantizedLinearMethod
+                and type(self.down_proj.quant_method) is UnquantizedLinearMethod
+                and type(self.act_fn) is SiluAndMul
+                and getattr(self.act_fn._forward_method, "__func__", None)
+                is SiluAndMul.forward_cuda
+                and not self.act_fn.is_torch_compile
+                and self.gate_up_proj.tp_size == self.down_proj.tp_size == 1
+                and not self.gate_up_proj.gather_output
+                and self.gate_up_proj.bias is None
+                and self.down_proj.bias is None
+                and self.gate_up_proj.output_sizes == [expected[0]] * 2
+                and tuple(self.gate_up_proj.weight.shape)
+                == (2 * expected[0], expected[1])
+                and self.gate_up_proj.weight.is_contiguous()
+                and self.gate_up_proj.weight.dtype == torch.bfloat16
+                and not self.gate_up_proj.weight.requires_grad
+                and tuple(self.down_proj.weight.shape) == (expected[1], expected[0])
+                and self.down_proj.weight.is_contiguous()
+                and self.down_proj.weight.dtype == torch.bfloat16
+                and not self.down_proj.weight.requires_grad
+                and x.is_cuda
+                and x.dtype == torch.bfloat16
+                and x.ndim == 2
+                and x.shape[1] == expected[1]
+                and x.is_contiguous()
+                and not x.requires_grad
+                and not any(
+                    m._forward_hooks or m._forward_pre_hooks or m._backward_hooks
+                    for m in (self, self.gate_up_proj, self.act_fn, self.down_proj)
+                )
+                and not torch.nn.modules.module._global_forward_hooks
+                and not torch.nn.modules.module._global_forward_pre_hooks
+            )
+            if native_outputs:
+                gate_up_out = select_gdn_prefill_output(
+                    workspace.h_buffer,
+                    (x.shape[0], 2 * expected[0]),
+                    x,
+                    inputs=(x, self.gate_up_proj.weight, self.down_proj.weight),
+                )
         use_full_device = use_b3_draft_full_device_projection(
             "gate_up",
             x,
@@ -235,10 +293,40 @@ class Qwen2MoeMLP(nn.Module):
         ) as full_device_stream:
             if full_device_stream is not None:
                 x.record_stream(full_device_stream)
-            gate_up, _ = self.gate_up_proj(x)
+            gate_up, _ = (
+                self.gate_up_proj(x, out=gate_up_out)
+                if gate_up_out is not None
+                else self.gate_up_proj(x)
+            )
         if full_device_stream is not None:
             gate_up.record_stream(torch.cuda.current_stream())
-        x = self.act_fn(gate_up)
+        if workspace is not None:
+            workspace.record_output("gate_up", gate_up)
+            if native_outputs:
+                activation_out = select_gdn_prefill_output(
+                    workspace.o_buffer,
+                    (gate_up.shape[0], gate_up.shape[1] // 2),
+                    gate_up,
+                    inputs=(
+                        x,
+                        gate_up,
+                        self.gate_up_proj.weight,
+                        self.down_proj.weight,
+                    ),
+                )
+        if activation_out is None:
+            x = self.act_fn(gate_up)
+        else:
+            # Same native CUDA activation and initialization contract, with an
+            # explicit caller-owned output. Do not change MultiPlatformOp.
+            from sglang.jit_kernel.activation import silu_and_mul
+
+            silu_and_mul(gate_up, activation_out)
+            x = activation_out
+        if workspace is not None:
+            workspace.record_output("activation", x)
+            if native_outputs:
+                del gate_up  # Last use; no retained-input path is admitted above.
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )

@@ -4797,6 +4797,22 @@ class Scheduler(
                 },
             }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if getattr(
+            get_global_server_args(), "enable_gdn_prefill_workspace_reuse", False
+        ):
+            # Host counters only: no GPU read, allocator reset, or stream fence.
+            pool = self.tp_worker.model_runner.req_to_token_pool
+            ret["gdn_prefill_workspace"] = {}
+            for role, local in (
+                ("target", pool),
+                ("draft", getattr(pool, "paired_mamba_state_view", None)),
+            ):
+                workspace = getattr(local, "_gdn_prefill_workspace", None)
+                ret["gdn_prefill_workspace"][role] = (
+                    workspace.snapshot()
+                    if workspace is not None
+                    else {"role": role, "activated": False}
+                )
 
         if (
             not self.spec_algorithm.is_none()

@@ -77,6 +77,8 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     consume_u: bool = False,
+    *,
+    prefill_workspace: Optional[tuple] = None,
 ):
     if consume_u and SUPPRESS_LEVEL >= 3:
         raise ValueError(
@@ -106,6 +108,11 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         **({"consume_u": True} if consume_u else {}),
+        **(
+            {"out_buffer": prefill_workspace[0]}
+            if prefill_workspace is not None
+            else {}
+        ),
     )
     if consume_u:
         # u is now owned by v_new; w has no consumer after the h kernel and
@@ -119,6 +126,11 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        **(
+            {"out_buffer": prefill_workspace[1]}
+            if prefill_workspace is not None
+            else {}
+        ),
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
@@ -144,6 +156,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         consume_u: bool = False,
+        prefill_workspace: Optional[tuple] = None,
     ):
         q_orig = q
         k_orig = k
@@ -169,6 +182,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             consume_u=consume_u,
+            **(
+                {"prefill_workspace": prefill_workspace}
+                if prefill_workspace is not None
+                else {}
+            ),
         )
         return o.to(q.dtype), h
 
@@ -187,6 +205,8 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     consume_u: bool = False,
+    *,
+    prefill_workspace: Optional[tuple] = None,
 ):
     r"""
     Args:
@@ -291,6 +311,38 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     consume_u = consume_u and _can_consume_prefill_u(q, k, v, g, beta, initial_state)
+    if prefill_workspace is not None:
+        if not _can_consume_prefill_u(q, k, v, g, beta, initial_state):
+            prefill_workspace = None
+        else:
+            from sglang.srt.model_executor.gdn_draft_workspace import (
+                select_gdn_prefill_output,
+            )
+
+            if (
+                not isinstance(prefill_workspace, tuple)
+                or len(prefill_workspace) != 2
+                or any(not isinstance(t, torch.Tensor) for t in prefill_workspace)
+            ):
+                raise ValueError(
+                    "GDN prefill workspace requires two disjoint output planes"
+                )
+            operands = (
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                initial_state_indices,
+                cu_seqlens,
+            )
+            for i, buffer in enumerate(prefill_workspace):
+                # Validate whole spans before any kernel writes, even if a
+                # particular native H/O shape will exceed its plane capacity.
+                select_gdn_prefill_output(
+                    buffer, (1,), q, inputs=(*operands, prefill_workspace[1 - i])
+                )
     o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -303,6 +355,7 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         consume_u,
+        *((prefill_workspace,) if prefill_workspace is not None else ()),
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

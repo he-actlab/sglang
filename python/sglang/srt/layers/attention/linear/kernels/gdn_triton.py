@@ -180,6 +180,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         consume_u: bool = False,
+        prefill_workspace: Optional[tuple] = None,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
@@ -199,6 +200,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
             head_first=False,
             use_qk_l2norm_in_kernel=True,
             **({"consume_u": True} if consume_u else {}),
+            **(
+                {"prefill_workspace": prefill_workspace}
+                if prefill_workspace is not None
+                else {}
+            ),
             **recurrent_state_indices_args,
         )
 
