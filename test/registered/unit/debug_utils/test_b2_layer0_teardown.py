@@ -44,6 +44,8 @@ def test_cleanup_order_records_and_exception_propagation(tmp_path, monkeypatch, 
     import sglang.srt.distributed.parallel_state as state
     import sglang.srt.server_args as server_args
 
+    cuda_initialized = torch.cuda.is_initialized()
+    distributed_initialized = torch.distributed.is_initialized()
     events = []
     output = tmp_path / "result.json"
     marker = RuntimeError("injected " + str(failure))
@@ -98,5 +100,5 @@ def test_cleanup_order_records_and_exception_propagation(tmp_path, monkeypatch, 
         assert caught.value is marker
     assert events[-2:] == ["destroy_model", "destroy_env"]
     assert events.count("destroy_model") == events.count("destroy_env") == 1
-    assert not torch.cuda.is_initialized()
-    assert not torch.distributed.is_initialized()
+    assert torch.cuda.is_initialized() is cuda_initialized
+    assert torch.distributed.is_initialized() is distributed_initialized
