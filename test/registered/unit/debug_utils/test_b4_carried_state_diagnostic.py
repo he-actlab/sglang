@@ -500,6 +500,55 @@ def test_native_fence_drain_includes_finished_rows_and_retains_failure(failure):
         assert ticket.result is None and not ticket.refs and not hasattr(ticket,"flags")
 
 
+def assert_component_intermediate_routes(source):
+    assert "intermediate = torch.arange(64, device=device, dtype=torch.int32)" in ast.unparse(ast.parse(source))
+    calls = {node.func.id: node for node in ast.walk(ast.parse(source))
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+             and node.func.id in ("causal_conv1d_update", "fused_sigmoid_gating_delta_rule_update",
+                                  "fused_gdn_compact_state_commit")}
+    for name, expected in (("causal_conv1d_update", "intermediate"),
+                           ("fused_sigmoid_gating_delta_rule_update", "intermediate"),
+                           ("fused_gdn_compact_state_commit", "intermediate[:32]")):
+        value = next(kw.value for kw in calls[name].keywords if kw.arg == "intermediate_state_indices")
+        assert ast.unparse(value) == expected, name
+
+
+def test_native_batch_position_scratch_mapping_binds_component():
+    attention = ROOT / "python/sglang/srt/layers/attention"
+    backend = ast.parse((attention / "linear/gdn_backend.py").read_text())
+    cls = next(n for n in backend.body if isinstance(n, ast.ClassDef) and n.name == "GDNAttnBackend")
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    assignment = next(n for n in init.body if isinstance(n, ast.Assign)
+                      and ast.unparse(n.targets[0]) == "self.verify_intermediate_state_indices")
+    owner = SimpleNamespace(req_to_token_pool=SimpleNamespace(size=64))
+    runner = SimpleNamespace(device="cpu")
+    exec(compile(ast.Module(body=[assignment],type_ignores=[]),"native-index-assignment","exec"),
+         dict(torch=torch,self=owner,model_runner=runner))
+    assert torch.equal(owner.verify_intermediate_state_indices,torch.arange(64,dtype=torch.int32))
+    forward = ast.unparse(next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward_extend"))
+    assert "intermediate_state_indices = self.verify_intermediate_state_indices" in forward
+    assert "intermediate_state_indices=intermediate_state_indices[:batch_size]" in forward
+    assert "intermediate_state_indices=intermediate_state_indices," in forward
+    hybrid = ast.unparse(ast.parse((attention / "hybrid_linear_attn_backend.py").read_text()))
+    assert "intermediate_state_indices=self.linear_attn_backend.verify_intermediate_state_indices[:request_number]" in hybrid
+    scatter = ast.unparse(ast.parse((attention / "mamba/mamba_state_scatter_triton.py").read_text()))
+    assert "src_idx = pid_req" in scatter
+    assert_component_intermediate_routes(inspect.getsource(
+        test_cuda_component_native_full32_two_slots_graph64_carry_and_recovery))
+
+
+@pytest.mark.parametrize("name", ["causal_conv1d_update", "fused_sigmoid_gating_delta_rule_update",
+                                  "fused_gdn_compact_state_commit"])
+def test_component_rejects_persistent_cache_indices_as_scratch_rows(name):
+    tree = ast.parse(inspect.getsource(test_cuda_component_native_full32_two_slots_graph64_carry_and_recovery))
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name) and n.func.id == name)
+    argument = next(kw for kw in call.keywords if kw.arg == "intermediate_state_indices")
+    argument.value = ast.parse("indices[:32]" if name == "fused_gdn_compact_state_commit" else "indices",mode="eval").body
+    with pytest.raises(AssertionError,match=name):
+        assert_component_intermediate_routes(ast.unparse(tree))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(),reason="root-owned CUDA component gate")
 def test_cuda_component_native_full32_two_slots_graph64_carry_and_recovery():
     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
@@ -523,6 +572,9 @@ def test_cuda_component_native_full32_two_slots_graph64_carry_and_recovery():
     a = torch.randn((1,320,32),device=device,dtype=torch.bfloat16)
     beta = torch.randn_like(a)
     indices = torch.full((64,),-1,device=device,dtype=torch.int32)
+    # Native verify scratch is batch-position indexed; persistent state rows
+    # remain independent and may be reordered or belong to the other slot.
+    intermediate = torch.arange(64,device=device,dtype=torch.int32)
     cu = torch.arange(0,321,5,device=device,dtype=torch.int32)
     factor_k = torch.empty((1,65,5,32,128),device=device)
     factor_d = torch.empty_like(factor_k)
@@ -534,7 +586,7 @@ def test_cuda_component_native_full32_two_slots_graph64_carry_and_recovery():
         engine.capture_raw(0,raw)
         convolved = causal_conv1d_update(raw,conv[0],weights,activation="silu",
             conv_state_indices=indices,intermediate_conv_window=windows[0],
-            intermediate_state_indices=indices)
+            intermediate_state_indices=intermediate)
         packed = convolved.transpose(1,2).reshape(320,8192)
         q,k,v = packed.split((2048,2048,4096),dim=-1)
         q,k,v = q.reshape(1,320,16,128),k.reshape(1,320,16,128),v.reshape(1,320,32,128)
@@ -543,7 +595,7 @@ def test_cuda_component_native_full32_two_slots_graph64_carry_and_recovery():
             q=q,k=k,v=v,a=a,b=beta,softplus_beta=1.0,softplus_threshold=20.0,
             initial_state_source=temporal[0],initial_state_indices=indices,
             cu_seqlens=cu,cache_steps=5,disable_state_update=True,use_qk_l2norm_in_kernel=True,
-            intermediate_state_indices=indices,compact_ssm_k=factor_k[0],
+            intermediate_state_indices=intermediate,compact_ssm_k=factor_k[0],
             compact_ssm_d=factor_d[0],compact_ssm_alpha=factor_alpha[0])
         engine.capture_output(0,out)
     producer = torch.cuda.Stream()
@@ -576,7 +628,7 @@ def test_cuda_component_native_full32_two_slots_graph64_carry_and_recovery():
                 engine.select(ticket,torch.full((160,),9,device=device,dtype=torch.int64),accepted,
                               torch.arange(160,device=device).reshape(32,5))
                 fused_gdn_compact_state_commit(temporal,factor_k,factor_d,factor_alpha,
-                    indices[:32],accepted-1,intermediate_state_indices=indices[:32])
+                    indices[:32],accepted-1,intermediate_state_indices=intermediate[:32])
                 fused_conv_window_scatter_with_mask(conv,windows,indices[:32],accepted-1)
                 engine.commit(ticket,temporal,conv,indices[:32],accepted-1)
                 # The component checks under one owned terminal event, rather
