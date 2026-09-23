@@ -580,3 +580,69 @@ def test_post_draft_guard_requires_native_target_context(monkeypatch):
         "server_args.context_length = target_worker.model_runner.model_config.context_len"
         in native
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="native CUDA import gate requires a reserved GPU",
+)
+def test_cuda_component_native_patch_install_restore():
+    from sglang.srt.debug_utils.source_patcher.code_patcher import (
+        CodePatcher,
+        _resolve_target,
+    )
+    from sglang.srt.debug_utils.source_patcher.types import PatchConfig
+
+    diag._runtime_identity()  # Clean descendant with only the three fixture files.
+    raw = yaml.safe_load((ROOT / "test/manual/b4_verify_diagnostic.yaml").read_text())
+    specs = PatchConfig(**raw).patches
+    native = [_resolve_target(s.target) for s in specs]
+    codes = [f.__code__ for f in native]
+    with CodePatcher(patches=specs):
+        assert all(f.__code__ is not code for f, code in zip(native, codes))
+    assert all(f.__code__ is code for f, code in zip(native, codes))
+    assert len(codes) == 7
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="event/clone gate requires a reserved GPU"
+)
+def test_cuda_component_native_result_copy_owned_snapshot(tmp_path):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.utils import GenerationBatchResult
+
+    diag._runtime_identity()
+    s = diag._State(config(tmp_path))
+    req = request(s)
+    f = forward(req)
+    producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+    assert producer.cuda_stream != consumer.cuda_stream
+    with torch.cuda.stream(producer):
+        f.input_ids = f.input_ids.cuda()
+        req.mamba_pool_idx = req.mamba_pool_idx.cuda()
+        logits = torch.tensor([[0.0, 1.0, 3.0, -1.0]], device="cuda")
+        sampled = torch.argmax(logits, dim=-1)
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=logits),
+            next_token_ids=sampled,
+            copy_done=torch.cuda.Event(),
+            extra_keep_alive_refs=["native-sentinel"],
+        )
+        cap = s.prefill(NS(reqs=[req]), f, result)
+        diag.attach_result(result, cap)
+        assert isinstance(cap.completion, torch.cuda.Event)
+        result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
+        result.copy_done.synchronize()
+        f.input_ids.fill_(999)
+        logits.fill_(999)
+        sampled.fill_(999)
+    with torch.cuda.stream(consumer):
+        tokens = result.next_token_ids.tolist()
+        req.output_ids.extend(tokens)
+        s.publish(req, tokens, result, "prefill")
+    actual = records(s)[0]
+    assert actual["tensors"]["input_0"] == [100, 200, 300]
+    assert actual["tensors"]["argmax_0"] == 2
+    assert actual["top_two_margins"] == 2.0
+    assert result.extra_keep_alive_refs[0] == "native-sentinel"
+    assert not actual["problems"] and not s.pending and not cap.tensors
