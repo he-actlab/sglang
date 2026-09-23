@@ -988,9 +988,11 @@ class HybridMultiStepDraftBackend:
             HybridLinearAttnBackend(backend, linear_attn_backend, full_attn_layers)
             for backend in full_attn_backend.attn_backends
         ]
-        self.needs_cpu_seq_lens = (
-            full_attn_backend.needs_cpu_seq_lens
-            or linear_attn_backend.needs_cpu_seq_lens
+        # Native multistep planners (including FlashInfer) need not expose an
+        # aggregate capability. Each composed step already combines its full
+        # and linear backend requirements; preserve every step's requirement.
+        self.needs_cpu_seq_lens = any(
+            backend.needs_cpu_seq_lens for backend in self.attn_backends
         )
 
     def init_forward_metadata(self, forward_batch):

@@ -1,5 +1,6 @@
 """Native shifted-prefix metadata/recovery gates; no serving guard is relaxed."""
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -142,30 +143,93 @@ def test_draft_working_state_never_tracks_speculative_suffix():
     tracker.assert_not_called()
 
 
+def _real_flashinfer_multistep_shell():
+    from sglang.srt.layers.attention.flashinfer_backend import (
+        FlashInferAttnBackend,
+        FlashInferMultiStepDraftBackend,
+    )
+    from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+    # Skip GPU allocation, not the native classes/protocol. In particular, the
+    # native aggregate has no needs_cpu_seq_lens; its individual steps do.
+    full = FlashInferMultiStepDraftBackend.__new__(FlashInferMultiStepDraftBackend)
+    full.attn_backends = []
+    for _ in range(5):
+        step = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+        step.req_to_token_pool = object()
+        step.token_to_kv_pool = object()
+        step.max_context_len = 64
+        full.attn_backends.append(step)
+    linear = GDNAttnBackend.__new__(GDNAttnBackend)
+    assert not hasattr(full, "needs_cpu_seq_lens")
+    assert all(step.needs_cpu_seq_lens for step in full.attn_backends)
+    assert linear.needs_cpu_seq_lens is False
+    return full, linear
+
+
+@CUDA
+@pytest.mark.parametrize(
+    "step_needs_cpu,linear_needs_cpu,expected",
+    [
+        (None, False, True),  # Real FlashInfer inherited capability.
+        ([False] * 5, False, False),
+        ([False, False, False, False, True], False, True),
+        ([True, False, False, False, False], False, True),
+        ([False] * 5, True, True),
+    ],
+)
+def test_multistep_capability_comes_from_real_steps(
+    step_needs_cpu, linear_needs_cpu, expected
+):
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridMultiStepDraftBackend,
+    )
+
+    full, linear = _real_flashinfer_multistep_shell()
+    if step_needs_cpu is not None:
+        for step, needs_cpu in zip(full.attn_backends, step_needs_cpu):
+            step.needs_cpu_seq_lens = needs_cpu
+    linear.needs_cpu_seq_lens = linear_needs_cpu
+    wrapper = HybridMultiStepDraftBackend(full, linear, [3, 7])
+    assert wrapper.needs_cpu_seq_lens is expected
+
+
+@CUDA
 def test_multistep_wrapper_preserves_full_attention_planner():
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridMultiStepDraftBackend,
     )
 
-    full = Mock(needs_cpu_seq_lens=False)
-    full.attn_backends = [Mock(needs_cpu_seq_lens=False) for _ in range(5)]
-    linear = Mock(needs_cpu_seq_lens=False)
+    full, linear = _real_flashinfer_multistep_shell()
     wrapper = HybridMultiStepDraftBackend(full, linear, [3, 7])
-    wrapper.init_cuda_graph_state(4, 4)
     batch = object()
-    wrapper.init_forward_metadata_out_graph(batch, in_capture=True)
-    wrapper.init_forward_metadata_in_graph(batch)
-    full.init_cuda_graph_state.assert_called_once_with(4, 4)
-    linear.init_cuda_graph_state.assert_called_once_with(4, 4)
-    full.init_forward_metadata_out_graph.assert_called_once_with(batch, in_capture=True)
-    linear.init_forward_metadata_out_graph.assert_called_once_with(
-        batch, in_capture=True
+    # Autospec only existing native methods: a missing method or incompatible
+    # signature fails instead of an unrestricted Mock inventing the protocol.
+    calls = (
+        ("init_cuda_graph_state", (4, 4), {}),
+        ("init_forward_metadata", (batch,), {}),
+        ("init_forward_metadata_out_graph", (batch,), {"in_capture": True}),
+        ("init_forward_metadata_in_graph", (batch,), {}),
     )
-    full.init_forward_metadata_in_graph.assert_called_once_with(batch)
+    with ExitStack() as stack:
+        spies = {
+            (id(backend), name): stack.enter_context(
+                patch.object(backend, name, autospec=True)
+            )
+            for backend in (full, linear)
+            for name, _, _ in calls
+        }
+        for name, args, kwargs in calls:
+            getattr(wrapper, name)(*args, **kwargs)
+            for backend in (full, linear):
+                spies[id(backend), name].assert_called_once_with(*args, **kwargs)
     assert len(wrapper.attn_backends) == 5
     for i, backend in enumerate(wrapper.attn_backends):
         assert backend.full_attn_backend is full.attn_backends[i]
         assert backend.linear_attn_backend is linear
+        assert backend.req_to_token_pool is full.attn_backends[i].req_to_token_pool
+        assert backend.token_to_kv_pool is full.attn_backends[i].token_to_kv_pool
+        assert backend.get_cuda_graph_seq_len_fill_value() == 1
         assert backend._is_full_attn(None, 3)
         assert not backend._is_full_attn(None, 2)
 
