@@ -1,0 +1,91 @@
+# Correctness-only. No standard serving runner installs this fixture.
+patches:
+  - target: sglang.srt.debug_utils.dumper._Dumper.apply_source_patches
+    edits:
+      - match: config_path = self._config.source_patcher_config
+        replacement: return
+  - target: sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import initialize
+    edits:
+      - match: self.eager_runner = EagerRunner(self)
+        prepend: initialize(self)
+  - target: sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import prepare, select, attach
+    edits:
+      - match: "# Run target verify batch in the main compute stream (GPU compute)."
+        prepend: carried_ticket = prepare(self, batch, verify_forward_batch, can_run_cuda_graph)
+      - match: new_seq_lens = batch.seq_lens + accept_lens
+        prepend: select(carried_ticket, predict, accept_lens, accept_index)
+      - match: |
+          return GenerationBatchResult(
+              logits_output=logits_output,
+              next_token_ids=predict,
+              can_run_cuda_graph=can_run_cuda_graph,
+              speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+              next_draft_input=next_draft_input,
+              accept_lens=accept_lens,
+              new_seq_lens=new_seq_lens,
+              routed_experts_output=forward_batch_output.routed_experts_output,
+              indexer_topk_output=forward_batch_output.indexer_topk_output,
+              extra_keep_alive_refs=[verify_forward_batch],
+          )
+        replacement: |
+          return attach(GenerationBatchResult(
+              logits_output=logits_output,
+              next_token_ids=predict,
+              can_run_cuda_graph=can_run_cuda_graph,
+              speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+              next_draft_input=next_draft_input,
+              accept_lens=accept_lens,
+              new_seq_lens=new_seq_lens,
+              routed_experts_output=forward_batch_output.routed_experts_output,
+              indexer_topk_output=forward_batch_output.indexer_topk_output,
+              extra_keep_alive_refs=[verify_forward_batch],
+          ), carried_ticket)
+  - target: sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import prefill
+    edits:
+      - match: "# For normal requests, sample the next token ids."
+        prepend: prefill(self, batch, is_verify)
+  - target: sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend.forward_extend
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import raw, operands, output
+    edits:
+      - match: mixed_qkv_processed = causal_conv1d_update(
+        prepend: raw(self, layer, mixed_qkv_reshaped)
+      - match: core_attn_out = self.kernel_dispatcher.target_verify(
+        prepend: operands(self, layer, query, key, value, a, b, retrieve_parent_token)
+      - match: return core_attn_out
+        prepend: |
+          if is_target_verify:
+              output(self, layer, core_attn_out)
+  - target: sglang.srt.model_executor.runner.decode_cuda_graph_runner.DecodeCudaGraphRunner.execute
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import graph_entry
+    edits:
+      - match: self.load_batch(forward_batch, pp_proxy_tensors)
+        append: graph_entry(self, forward_batch)
+  - target: sglang.srt.layers.attention.hybrid_linear_attn_backend.HybridLinearAttnBackend.update_mamba_state_after_mtp_verify
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import commit
+    edits:
+      - match: "# Track indices used for tracking mamba states for prefix cache"
+        prepend: commit(self, last_correct_step_indices, mamba_track_indices, mamba_steps_to_track)
+  - target: sglang.srt.managers.utils.GenerationBatchResult.copy_to_cpu.__wrapped__
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import copy
+    edits:
+      # Mutate the inner callable retained by the native profiling wrapper.
+      # Do not re-decorate the temporary compiled function or replace a closure.
+      - match: '@torch.profiler.record_function("copy_result_to_cpu")'
+        replacement: ''
+      - match: self.copy_done.record()
+        prepend: copy(self)
+  - target: sglang.srt.managers.scheduler_components.batch_result_processor.SchedulerBatchResultProcessor.process_batch_result_decode
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import drain
+    edits:
+      - match: |
+          if result.copy_done is not None:
+              result.copy_done.synchronize()
+        append: drain(result, batch)
+  - target: sglang.srt.managers.scheduler.Scheduler.get_internal_state
+    preamble: from sglang.srt.debug_utils.b4_carried_state_diagnostic import snapshot
+    edits:
+      - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        append: ret["b4_carried_state_diagnostic"] = snapshot()

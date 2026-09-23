@@ -6,6 +6,10 @@ is the first native verify entry after prefill, not an independent prefill check
 
 from dataclasses import dataclass, field
 from math import prod
+import json
+import os
+from pathlib import Path
+import subprocess
 
 import torch
 
@@ -119,11 +123,13 @@ class OwnershipLedger:
         self.serial = 0
         self.max_live = [0, 0]
         self.retired = set()
+        self.newly_retired_generations = []
 
     def _retire(self):
         for rid, member in self.generations.items():
             if rid not in self.retired and member.request.finished() and member.pending == 0:
                 self.retired.add(rid)
+                self.newly_retired_generations.append(member.generation)
                 require(self.pool.pop(member.pool_row) is member, "retired pool owner")
                 require(self.private.pop((member.slot, member.private_row)) is member,
                         "retired private owner")
@@ -199,6 +205,7 @@ class OwnershipLedger:
         self.max_live[ticket.slot] = max(self.max_live[ticket.slot], len(ticket.members))
         ticket.phase = "drained"
         del self.pending[ticket.serial]
+        ticket.result = None  # Break result->ticket->result after its native fence.
 
     def require_complete(self):
         require(not self.pending, "undrained result mailboxes")
@@ -253,12 +260,21 @@ class CarriedBuffers:
                         for name, (shape, dtype) in layout.specs().items()}
         # Part of the separately declared 64KiB numeric metadata allowance.
         self.raw_epochs = torch.zeros((layout.slots,layout.layers), dtype=torch.int64, device=device)
+        self.state_owners = torch.zeros(layout.slots*layout.rows+1,dtype=torch.int64,device=device)
         self.parameters = {}
         for name in ("control", "capture_epochs", "generation_epoch_length", "result_flags"):
             self.buffers[name].zero_()
         for slot in range(layout.slots):
             self.buffers["identity"][slot].copy_(torch.arange(layout.rows + 1, device=device))
         self.active_ticket = None
+
+    def retire(self, generations):
+        # Caller supplies only ledger-retired, fully drained generations. These
+        # native-producer-stream clears do not read back device owners or touch
+        # native state. Equal-valued states cannot hide a cross-slot alias.
+        for generation in generations:
+            require(type(generation) is int and generation > 0, "retired generation identity")
+            self.state_owners.masked_fill_(self.state_owners == generation,0)
 
     def entry(self, ticket, temporal, conv, indices, inputs, positions, seq_lens, req_rows):
         b, s, n, slot = self.buffers, self.layout, len(ticket.members), ticket.slot
@@ -283,6 +299,11 @@ class CarriedBuffers:
         expected_req = device_values([m.pool_row for m in ticket.members], self.device)
         ownership = ((indices <= 0) | (indices >= temporal.shape[1]) | (req_rows != expected_req))
         ownership |= (indices[:,None] == indices[None,:]).sum(dim=1) != 1
+        owners = self.state_owners.index_select(0,safe_indices)
+        conflict = (owners != 0) & (owners != generations)
+        ownership |= conflict
+        ticket.flags[:,:,5].copy_(ownership.long()[None,:].expand(s.layers,-1))
+        self.state_owners.index_copy_(0,safe_indices,torch.where(conflict,owners,generations))
         sequence = (seq_lens != host_lengths) | (positions != seq_lens[:,None] + torch.arange(s.steps, device=self.device)).any(dim=1)
         sequence |= (inputs < 0).any(dim=1)
         root = b["control"][slot, :, 2].index_select(0, ticket.private)
@@ -307,7 +328,7 @@ class CarriedBuffers:
             meta = b["generation_epoch_length"][slot,i].index_select(0, ticket.private)
             ticket.flags[i,:,0].copy_(different_rows(actual, expected))
             ticket.flags[i,:,1].copy_(different_rows(ca, ce))
-            ticket.flags[i,:,5].copy_(ownership | (meta[:,0] != generations))
+            ticket.flags[i,:,5].bitwise_or_((meta[:,0] != generations).long())
             ticket.flags[i,:,6].copy_(meta[:,1] + 1 != epochs)
             ticket.flags[i,:,7].copy_(sequence | (meta[:,2] != seq_lens))
         b["control"][:,:,0].zero_()
@@ -430,3 +451,354 @@ class CarriedBuffers:
         b["control"][slot,0,0].zero_()
         ticket.phase = "enqueued"
         self.active_ticket = None
+
+
+def validate_server(args, arm):
+    from sglang.srt.debug_utils.b4_verify_diagnostic import _TARGET, _DRAFT, _TARGET_REV, _DRAFT_REV
+    require(arm in ("stock", "prior"), "frozen baseline identity")
+    capacity = 32 if arm == "stock" else 64
+    expected = dict(
+        model_path=_TARGET, speculative_draft_model_path=_DRAFT,
+        revision=_TARGET_REV, speculative_draft_model_revision=_DRAFT_REV,
+        speculative_algorithm="EAGLE3", speculative_num_steps=4,
+        speculative_eagle_topk=1, speculative_num_draft_tokens=5,
+        tp_size=1, dtype="bfloat16", page_size=1, max_running_requests=capacity,
+        max_mamba_cache_size=capacity, disable_radix_cache=True,
+        enable_gdn_compact_spec_state=True, disable_overlap_schedule=False,
+        disable_cuda_graph=False, disable_decode_cuda_graph=False,
+        enable_deterministic_inference=False, attention_backend="flashinfer",
+        speculative_use_rejection_sampling=False, random_seed=260792947,
+        enable_spec_pdmux=arm == "prior", enable_spec_sm_partition=False,
+        enable_custom_logit_processor=False, skip_server_warmup=False,
+        enable_two_batch_overlap=False, enable_single_batch_overlap=False,
+        quantization=None, mem_fraction_static=0.8017717968749999,
+        mamba_full_memory_ratio=0.9, mamba_ssm_dtype=None,
+        enable_int8_mamba_checkpoint=False, kv_cache_dtype="auto",
+        sampling_backend="flashinfer", pp_size=1, dp_size=1, ep_size=1,
+        enable_dp_attention=False, enable_dp_lm_head=False,
+        disable_cuda_graph_padding=False, speculative_draft_attention_backend=None,
+        disable_chunked_prefix_cache=True, enable_hierarchical_cache=False,
+        moe_runner_backend="auto", moe_a2a_backend="none", json_model_override_args="{}",
+        context_length=262144, load_format="auto", speculative_draft_load_format=None,
+        tokenizer_path=_TARGET, trust_remote_code=False,
+        spec_pdmux_slots=2, spec_pdmux_sm_split="132,56" if arm == "prior" else None,
+    )
+    for name, value in expected.items():
+        require(getattr(args,name,None) == value, "server setting " + name)
+    require(args.cuda_graph_config.decode.max_bs == capacity
+            and args.cuda_graph_config.decode.backend == "full", "native graph capacity/backend")
+    require(os.environ.get("SGLANG_B4_CARRIED_STATE_KIND") == "correctness-only", "explicit opt-in")
+    require(os.environ.get("DUMPER_ENABLE", "false").lower() in ("false","0")
+            and os.environ.get("DUMPER_NON_INTRUSIVE_MODE") == "off", "no tensor dumper/hooks")
+    require(os.environ.get("SGLANG_SPEC_PDMUX_SM_HINT", "0") == ("2" if arm == "prior" else "0"),
+            "native width hint")
+    for name in ("SGLANG_PHASE_EVENTS", "SGLANG_NVTX_PROFILE", "SGLANG_ACCEPT_HIST",
+                 "SGLANG_SPEC_PDMUX_SERIALIZE", "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV128_STREAM",
+                 "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP",
+                 "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD",
+                 "SGLANG_ENABLE_QWEN3_DRAFTER_SM120_KERNEL_OPTIMIZED",
+                 "SGLANG_ENABLE_QWEN3_DRAFT_EXTEND_GEMM_INTEGRATION", "SGLANG_ENABLE_QWEN3_DRAFTER_TMA",
+                 "SGLANG_ENABLE_QWEN3_DRAFTER_CUBLASLT_PORTFOLIO", "SGLANG_ENABLE_QWEN3_VERIFIER_CUBLASLT_PORTFOLIO",
+                 "SGLANG_SPEC_PDMUX_FLASHINFER_WIDTH", "SGLANG_SPEC_PDMUX_FLASHINFER_DECODE_WIDTH",
+                 "SGLANG_DRAFT_EXTEND_FLASHINFER_FORCE_Q_TILE_16", "SGLANG_ENABLE_DRAFT_EXTEND_SHORT_Q_ATTENTION"):
+        require(os.environ.get(name,"0") == "0", "diagnostic excludes " + name)
+    require(os.environ.get("SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT","auto") == "auto", "native QKV placement")
+    return capacity
+
+
+def runtime_identity():
+    base = "238969fcc722ad57a71493db8f5a7fec58c98884"
+    root = Path(__file__).resolve().parents[4]
+    def git(*args):
+        return subprocess.check_output(["git","-C",str(root),*args],text=True).strip()
+    require(not git("status","--porcelain"), "dirty runtime")
+    require(git("merge-base",base,"HEAD") == base, "unrelated runtime")
+    allowed = {"python/sglang/srt/debug_utils/b4_carried_state_diagnostic.py",
+               "test/manual/b4_carried_state_diagnostic.yaml",
+               "test/registered/unit/debug_utils/test_b4_carried_state_diagnostic.py"}
+    require(set(git("diff","--name-only",base,"HEAD").splitlines()) <= allowed, "production source changed")
+    return dict(base=base,revision=git("rev-parse","HEAD"))
+
+
+class Observer:
+    def __init__(self, runner, config):
+        from sglang.srt.debug_utils.b4_verify_diagnostic import _validate_config
+        self.capacity = validate_server(runner.server_args,config["arm"])
+        self.runtime = runtime_identity()
+        self.config, self.runner = config, runner
+        # Reuse the frozen tokenizer/template/member validator, while binding
+        # this arm's actual concurrency explicitly. This copy is validation
+        # input only; no launch setting or client metadata is mutated.
+        catalog = config["catalog"]
+        require(catalog["workload"]["concurrency"] == self.capacity, "client concurrency")
+        canonical = dict(catalog,workload=dict(catalog["workload"],concurrency=32))
+        self.rows = _validate_config(canonical)
+        self.pool = runner.req_to_token_pool
+        self.state = self.pool.get_speculative_mamba2_params_all_layers()
+        expected_map = {layer:i for i,layer in enumerate(j for j in range(40) if j % 4 != 3)}
+        require(self.pool.size == self.capacity and self.pool.mamba_map == expected_map,
+                "native full target pool/map")
+        require(tuple(self.state.temporal.shape) == (30,self.capacity+1,32,128,128)
+                and tuple(self.state.conv[0].shape) == (30,self.capacity+1,8192,3)
+                and self.state.temporal.dtype == torch.float32 and self.state.conv[0].dtype == torch.bfloat16
+                and self.state.intermediate_ssm is None
+                and tuple(self.state.compact_ssm_k.shape) == (30,self.capacity+1,5,32,128), "native state layout")
+        required = Layout().nbytes() + STATIC_METADATA_ALLOWANCE + TRANSIENT_ALLOWANCE + FREE_GUARD
+        free, _ = torch.cuda.mem_get_info(runner.device)
+        require(free >= required, "preallocation physical memory guard")
+        before = torch.cuda.memory_allocated(runner.device)
+        self.storage = CarriedBuffers(runner.device,self.pool.mamba_map)
+        self.host_flags = torch.empty(self.storage.buffers["result_flags"].shape,dtype=torch.int64,pin_memory=True)
+        self.device_meta = torch.empty((4,32,3),dtype=torch.int64,device=runner.device)
+        self.host_meta = torch.empty((4,32,3),dtype=torch.int64,pin_memory=True)
+        self.allocator_increment = torch.cuda.memory_allocated(runner.device)-before
+        require((self.storage.raw_epochs.numel()+self.storage.state_owners.numel()+self.device_meta.numel())*8 < STATIC_METADATA_ALLOWANCE,
+                "numeric metadata allocation bound")
+        require(self.allocator_increment <= Layout().nbytes()+STATIC_METADATA_ALLOWANCE,
+                "allocator-rounded persistent allocation exceeded declaration")
+        require(torch.cuda.mem_get_info(runner.device)[0] >= TRANSIENT_ALLOWANCE+FREE_GUARD,
+                "postallocation physical memory guard")
+        self.preallocation_free = free
+        self.ledger = OwnershipLedger(self.capacity)
+        self.seen, self.mismatches, self.completed = set(), 0, 0
+        self.prefix_histogram = [0]*5
+        self.seeds = self.continuity = 0
+        self.client_layer_checks = {1:0,2:0}
+        self.initialization_layer_checks = 0
+        self.last_failure = None
+        self.stream = None
+
+    def request(self, req):
+        row, p = self.rows.get(req.rid), req.sampling_params
+        if row is None:
+            require((list(req.origin_input_ids) == self.config["catalog"]["server_warmup_input_ids"] and p.max_new_tokens == 8)
+                    or (req.rid.startswith("HEALTH_CHECK") and list(req.origin_input_ids) == [0] and p.max_new_tokens == 1),
+                    "unregistered request")
+        else:
+            require(list(req.origin_input_ids) == row["input_ids"] and p.max_new_tokens == row["max_new_tokens"],
+                    "frozen prompt/cap identity")
+            self.seen.add(req.rid)
+        require(p.top_k == 1 and p.temperature == 1.0 and not p.ignore_eos
+                and p.frequency_penalty == p.presence_penalty == 0 and p.repetition_penalty == 1
+                and p.min_new_tokens == 0 and p.logit_bias is None
+                and req.grammar is None and not req.return_logprob, "sampling/grammar override")
+        return len(req.origin_input_ids)
+
+    def prepare(self, worker, batch, forward, can_graph):
+        require(not torch.cuda.is_current_stream_capturing(), "live prepare inside capture")
+        if batch.forward_mode.is_idle():
+            require(not batch.reqs, "idle batch contains live requests")
+            return None
+        require(worker.target_worker.model_runner is self.runner and forward.forward_metadata_ready,
+                "target native plan ownership")
+        graph = self.runner.decode_cuda_graph_runner
+        require(graph.model_runner is self.runner and graph.raw_bs == len(batch.reqs)
+                and can_graph is True, "actual replay ownership")
+        stream = torch.cuda.current_stream(self.runner.device).cuda_stream
+        if self.stream is None:
+            self.stream = stream
+        require(stream == self.stream, "target producing stream changed")
+        prompt_lengths = [self.request(req) for req in batch.reqs]
+        cpu_lengths = forward.seq_lens_cpu
+        require(cpu_lengths.device.type == "cpu", "native CPU sequence metadata")
+        n = len(batch.reqs)
+        slot = getattr(batch,"spec_pdmux_slot",None)
+        if self.capacity == 32:
+            require(slot is None, "stock slot tag")
+            slot = 0
+        ticket = self.ledger.prepare(batch.reqs,slot=slot,
+            pool_rows=[req.req_pool_idx for req in batch.reqs],
+            lengths=[int(v) for v in cpu_lengths[:n]], prompt_lengths=prompt_lengths,
+            bucket=graph.bs, can_graph=can_graph)
+        self.storage.retire(self.ledger.newly_retired_generations)
+        self.ledger.newly_retired_generations.clear()
+        require(not hasattr(forward,"_b4_carried_ticket"), "duplicate prepared forward")
+        forward._b4_carried_ticket = ticket
+        return ticket
+
+    def graph_entry(self, graph, forward):
+        ticket = getattr(forward,"_b4_carried_ticket",None)
+        if ticket is None:
+            return
+        n = len(ticket.members)
+        require(graph.model_runner is self.runner and graph.bs == ticket.bucket and graph.raw_bs == n,
+                "executed graph changed after prepare")
+        linear, source = graph.attn_backend.linear_attn_backend, graph.buffers
+        require(linear.req_to_token_pool is self.pool, "actual graph native pool")
+        metadata = linear.forward_metadata
+        indices = metadata.mamba_cache_indices[:n]
+        self.storage.entry(ticket,self.state.temporal,self.state.conv[0],indices,
+            source.input_ids[:n*5].reshape(n,5),source.positions[:n*5].reshape(n,5),
+            source.seq_lens[:n],source.req_pool_indices[:n])
+        bounds = metadata.query_start_loc[:n+1]
+        expected = torch.arange(0,(n+1)*5,5,device=self.runner.device)
+        ticket.flags[:,:,5].bitwise_or_((bounds != expected).any().long())
+        for i,member in enumerate(ticket.members):
+            req = member.request
+            require(isinstance(req.mamba_pool_idx,torch.Tensor) and req.mamba_pool_idx.numel() == 1,
+                    "native request state index")
+            ticket.flags[:,i,5].bitwise_or_((indices[i] != req.mamba_pool_idx).any().long())
+        del forward._b4_carried_ticket
+
+    def attach(self, ticket, result):
+        if ticket is None:
+            return result
+        require(result.can_run_cuda_graph is True and result.extra_keep_alive_refs, "native replay/result lifetime")
+        self.ledger.attach(ticket,result)
+        result.extra_keep_alive_refs.append(ticket)
+        n = len(ticket.members)
+        meta = self.device_meta[ticket.mailbox,:n]
+        meta[:,0].copy_(ticket.accepted)
+        meta[:,1].copy_(ticket.next_root)
+        meta[:,2].fill_(ticket.serial)
+        ticket.device_meta = meta
+        return result
+
+    def copy(self, result):
+        ticket = getattr(result,"_b4_carried_ticket",None)
+        if ticket is None:
+            return
+        require(result.copy_done is not None, "native result copy fence absent")
+        self.ledger.copied(ticket,result)
+        n, index = len(ticket.members), ticket.mailbox
+        ticket.host_flags, ticket.host_meta = self.host_flags[index,:,:n], self.host_meta[index,:n]
+        ticket.host_flags.copy_(ticket.flags,non_blocking=True)
+        ticket.host_meta.copy_(ticket.device_meta,non_blocking=True)
+        # Existing scheduler copy_stream already waits on the native producer.
+        # The result's existing copy_done.record follows this method.
+        ticket.flags.record_stream(torch.cuda.current_stream(self.runner.device))
+        ticket.device_meta.record_stream(torch.cuda.current_stream(self.runner.device))
+
+    def drain(self, result, batch):
+        ticket = getattr(result,"_b4_carried_ticket",None)
+        if ticket is None:
+            return
+        require(result.copy_done is not None and result.copy_done.query(), "native copy fence not completed")
+        require(tuple(batch.reqs) == tuple(m.request for m in ticket.members), "published result batch identity")
+        flags, meta = ticket.host_flags, ticket.host_meta
+        require(flags.device.type == meta.device.type == "cpu", "diagnostic D2H missing")
+        n = len(ticket.members)
+        problems = bool(flags.any()) or not bool((meta[:,2] == ticket.serial).all())
+        accepted = result.accept_lens.tolist()
+        problems |= accepted != meta[:,0].tolist()
+        for row,a in enumerate(accepted):
+            if not 1 <= a <= 5:
+                problems = True
+            else:
+                # Native CPU output is still the flat prediction array here;
+                # normalization/publication follows this existing result fence.
+                problems |= int(result.next_token_ids.reshape(-1)[row*5+a-1]) != int(meta[row,1])
+                self.prefix_histogram[a-1] += 1
+        if problems:
+            self.mismatches += 1
+            self.last_failure = dict(serial=ticket.serial,slot=ticket.slot,flags=flags.tolist(),
+                epochs=list(ticket.epochs),lengths=list(ticket.lengths),seeds=list(ticket.seeds),
+                generations=[m.generation for m in ticket.members],metadata=meta.tolist())
+        # All rows drain BEFORE native finished-result skips. No new observer
+        # event, synchronization, or replay-buffer reference is involved.
+        self.ledger.drain(ticket,result)
+        ticket.refs.clear()
+        for name in ("flags","indices","private","accepted","next_root","device_meta"):
+            if hasattr(ticket,name):
+                delattr(ticket,name)
+        self.completed += 1
+        self.seeds += sum(ticket.seeds)*30
+        self.continuity += (n-sum(ticket.seeds))*30
+        for member in ticket.members:
+            row = self.rows.get(member.rid)
+            if row is None:
+                self.initialization_layer_checks += 30
+            else:
+                self.client_layer_checks[row["repetition"]] += 30
+        require(not problems, "saved state/sequence/ownership mismatch: " + json.dumps(self.last_failure))
+
+    def snapshot(self):
+        return dict(performance_eligible=False,runtime=self.runtime,
+            static_tensor_bytes=Layout().nbytes(),metadata_allowance=STATIC_METADATA_ALLOWANCE,
+            transient_allowance=TRANSIENT_ALLOWANCE,preallocation_free=self.preallocation_free,
+            allocator_increment=self.allocator_increment,registered_requests=len(self.rows),
+            seen_requests=len(self.seen),completed_verifies=self.completed,
+            client_seen_requests={str(client):sum(self.rows[rid]["repetition"] == client for rid in self.seen)
+                                  for client in (1,2)},
+            client_layer_checks=dict(self.client_layer_checks),
+            initialization_layer_checks=self.initialization_layer_checks,
+            pending_results=len(self.ledger.pending),max_live_per_slot=self.ledger.max_live[:],
+            seeded_layer_requests=self.seeds,continuity_layer_requests=self.continuity,
+            prefix_histogram=self.prefix_histogram[:],mismatches=self.mismatches,
+            last_failure=self.last_failure,
+            limitation="Post-prefill seed is trusted; conv carry only, not independent convolution output arithmetic.")
+
+
+_observer = None
+
+
+def initialize(runner):
+    global _observer
+    if runner.is_draft_worker:
+        return
+    require(_observer is None, "duplicate initialization")
+    config = json.loads(Path(os.environ["SGLANG_B4_CARRIED_STATE_CONFIG"]).read_text())
+    _observer = Observer(runner,config)
+
+
+def prepare(worker,batch,forward,can_graph):
+    require(_observer is not None,"verify before initialization")
+    return _observer.prepare(worker,batch,forward,can_graph)
+
+
+def prefill(worker,batch,is_verify):
+    if _observer is not None and worker.model_runner is _observer.runner and batch is not None and not is_verify:
+        for req in batch.reqs:
+            _observer.request(req)
+
+
+def graph_entry(graph,forward):
+    if _observer is not None and graph.model_runner is _observer.runner:
+        _observer.graph_entry(graph,forward)
+
+
+def raw(backend,layer,value):
+    if _observer is not None and backend.req_to_token_pool is _observer.pool:
+        _observer.storage.capture_raw(layer.layer_id,value)
+
+
+def operands(backend,layer,q,k,v,a,b,parent):
+    if _observer is not None and backend.req_to_token_pool is _observer.pool:
+        _observer.storage.capture_operands(layer,q,k,v,a,b,parent)
+
+
+def output(backend,layer,value):
+    if _observer is not None and backend.req_to_token_pool is _observer.pool:
+        _observer.storage.capture_output(layer.layer_id,value)
+
+
+def select(ticket,predict,lengths,indices):
+    if ticket is not None:
+        _observer.storage.select(ticket,predict,lengths,indices)
+
+
+def commit(backend,steps,track,track_steps):
+    if _observer is None or backend.linear_attn_backend.req_to_token_pool is not _observer.pool:
+        return
+    ticket = _observer.storage.active_ticket
+    require(ticket is not None and track is None and track_steps is None,"cache-off commit ticket/tracking")
+    indices = backend.linear_attn_backend.forward_metadata.mamba_cache_indices[:len(ticket.members)]
+    _observer.storage.commit(ticket,_observer.state.temporal,_observer.state.conv[0],indices,steps)
+
+
+def attach(result,ticket):
+    return _observer.attach(ticket,result) if ticket is not None else result
+
+
+def copy(result):
+    if _observer is not None:
+        _observer.copy(result)
+
+
+def drain(result,batch):
+    if _observer is not None:
+        _observer.drain(result,batch)
+
+
+def snapshot():
+    return _observer.snapshot() if _observer is not None else {"initialized":False}

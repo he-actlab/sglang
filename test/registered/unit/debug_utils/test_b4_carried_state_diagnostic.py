@@ -1,7 +1,14 @@
 from types import SimpleNamespace
+import ast
+import inspect
+import textwrap
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
+import yaml
+import sglang.srt.debug_utils.b4_carried_state_diagnostic as diag
 
 from sglang.srt.debug_utils.b4_carried_state_diagnostic import (
     FREE_GUARD,
@@ -294,3 +301,366 @@ def test_capture_snapshots_are_owned_and_never_feed_inputs():
     assert torch.equal(before,engine.buffers["raw"][0,:,0])
     engine.buffers["raw"][0,:,0].fill_(123)
     assert not raw.any()
+
+
+def test_equal_state_cross_slot_alias_is_rejected_before_second_seed():
+    engine, ledger, temporal, conv, reqs = tiny_engine(n=1)
+    first = enter(engine,ledger,temporal,conv,reqs[0],0)
+    captured(engine,first)
+    advance(engine,first,temporal,conv)
+    publish(ledger,first)
+    second = prepare(ledger,reqs[1],1)
+    # Distinct request-row33 incorrectly resolves to still-live native state1.
+    # Seeding it would make equality alone pass; ownership must reject it.
+    engine.entry(second,temporal,conv,torch.tensor([1]),torch.full((1,5),7),
+                 torch.arange(149,154).reshape(1,5),torch.tensor([149]),torch.tensor([33]))
+    assert second.flags[:,:,5].all()
+    assert int(engine.state_owners[1]) == first.members[0].generation
+
+
+def test_state_owner_recycled_only_after_finished_generation_and_native_drain():
+    engine, ledger, temporal, conv, reqs = tiny_engine(n=1)
+    first = enter(engine,ledger,temporal,conv,reqs[0],0)
+    captured(engine,first)
+    advance(engine,first,temporal,conv)
+    reqs[0][0].done = True
+    with pytest.raises(RuntimeError,match="still owned"):
+        prepare(ledger,[Request("recycled")])
+    assert ledger.newly_retired_generations == []
+    publish(ledger,first)
+    second = prepare(ledger,[Request("recycled")])
+    assert ledger.newly_retired_generations == [first.members[0].generation]
+    engine.retire(ledger.newly_retired_generations)
+    ledger.newly_retired_generations.clear()
+    assert not engine.state_owners.any()
+    engine.entry(second,temporal,conv,torch.tensor([1]),torch.full((1,5),7),
+                 torch.arange(149,154).reshape(1,5),torch.tensor([149]),torch.tensor([1]))
+    assert not second.flags.any()
+    assert int(engine.state_owners[1]) == second.members[0].generation
+
+
+ROOT = Path(__file__).resolve().parents[4]
+
+
+def patched_methods():
+    from sglang.srt.debug_utils.source_patcher.source_editor import apply_edits
+    from sglang.srt.debug_utils.source_patcher.code_patcher import _insert_preamble
+    from sglang.srt.debug_utils.source_patcher.types import EditSpec, PatchApplicationError
+    results = {}
+    for item in yaml.safe_load((ROOT / "test/manual/b4_carried_state_diagnostic.yaml").read_text())["patches"]:
+        target = item["target"].removesuffix(".__wrapped__")
+        module, owner, method = target.rsplit(".",2)
+        path = ROOT / "python" / (module.replace(".","/") + ".py")
+        source = path.read_text()
+        cls = next(n for n in ast.parse(source).body if isinstance(n,ast.ClassDef) and n.name == owner)
+        fn = next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name == method)
+        first_line = fn.decorator_list[0].lineno if fn.decorator_list else fn.lineno
+        original = textwrap.dedent("\n".join(source.splitlines()[first_line-1:fn.end_lineno]))
+        edits = [EditSpec(**edit) for edit in item["edits"]]
+        modified = apply_edits(source=original,edits=edits)
+        if item.get("preamble"):
+            modified = _insert_preamble(source=modified,preamble=item["preamble"])
+        compile(modified,str(path),"exec")
+        results[method] = modified
+        for edit in edits:
+            with pytest.raises(PatchApplicationError):
+                apply_edits(source="def absent():\n    pass\n",edits=[edit])
+    return results
+
+
+def test_native_source_patches_exact_and_ordered_without_extra_fence():
+    methods = patched_methods()
+    assert len(methods) == 10
+    assert methods["execute"].index("self.load_batch(") < methods["execute"].index("graph_entry(self") < methods["execute"].index("self.backend.replay(")
+    assert methods["forward_extend"].index("raw(self") < methods["forward_extend"].index("mixed_qkv_processed = causal_conv1d_update(")
+    assert methods["update_mamba_state_after_mtp_verify"].index("fused_conv_window_scatter_with_mask(") < methods["update_mamba_state_after_mtp_verify"].index("commit(self")
+    assert methods["copy_to_cpu"].index("copy(self)") < methods["copy_to_cpu"].index("self.copy_done.record()")
+    result = methods["process_batch_result_decode"]
+    assert result.index("result.copy_done.synchronize()") < result.index("drain(result, batch)") < result.index("for i, req in enumerate(batch.reqs)")
+    source = Path(diag.__file__).read_text()
+    assert ".synchronize(" not in source and ".wait_stream(" not in source and ".cpu(" not in source
+
+
+@pytest.mark.parametrize("arm", ["stock","prior"])
+def test_strict_post_init_baseline_guards(arm,monkeypatch):
+    from sglang.srt.debug_utils import b4_verify_diagnostic as old
+    tree = ast.parse(inspect.getsource(old._validate_server))
+    fn = tree.body[0]
+    expr = next(n.value for n in fn.body if isinstance(n,ast.Assign)
+                and any(isinstance(t,ast.Name) and t.id == "expected" for t in n.targets))
+    fields = eval(compile(ast.Expression(expr),"expected","eval"),vars(old))
+    capacity = 32 if arm == "stock" else 64
+    fields.update(max_running_requests=capacity,max_mamba_cache_size=capacity,
+        enable_spec_pdmux=arm == "prior",spec_pdmux_slots=2,
+        spec_pdmux_sm_split="132,56" if arm == "prior" else None)
+    args = SimpleNamespace(**fields,cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=capacity,backend="full")))
+    monkeypatch.setenv("SGLANG_B4_CARRIED_STATE_KIND","correctness-only")
+    monkeypatch.setenv("DUMPER_NON_INTRUSIVE_MODE","off")
+    monkeypatch.setenv("SGLANG_SPEC_PDMUX_SM_HINT","2" if arm == "prior" else "0")
+    assert diag.validate_server(args,arm) == capacity
+    for key,value in (("disable_radix_cache",False),("disable_chunked_prefix_cache",False),
+                      ("speculative_num_draft_tokens",7),("mem_fraction_static",0.90),
+                      ("max_mamba_cache_size",None),("enable_deterministic_inference",True)):
+        prior = getattr(args,key)
+        setattr(args,key,value)
+        with pytest.raises(RuntimeError,match=key):
+            diag.validate_server(args,arm)
+        setattr(args,key,prior)
+
+
+def test_runtime_guard_rejects_changed_native_production():
+    base = "238969fcc722ad57a71493db8f5a7fec58c98884"
+    with patch.object(diag.subprocess,"check_output",side_effect=["",base,"python/sglang/srt/models/qwen3_5.py"]):
+        with pytest.raises(RuntimeError,match="production source"):
+            diag.runtime_identity()
+    with patch.object(diag.subprocess,"check_output",return_value="dirty"):
+        with pytest.raises(RuntimeError,match="dirty"):
+            diag.runtime_identity()
+
+
+class ReadyFence:
+    def __init__(self, ready=True):
+        self.ready = ready
+
+    def query(self):
+        return self.ready
+
+
+class DecoratedCopy:
+    @torch.profiler.record_function("copy_result_to_cpu")
+    def copy_to_cpu(self):
+        self.calls.append("native-copy")
+        self.copy_done.record()
+
+
+def test_actual_profiler_wrapper_invokes_patched_inner_not_old_closure():
+    from sglang.srt.debug_utils.source_patcher.code_patcher import patch_function
+    from sglang.srt.debug_utils.source_patcher.types import EditSpec
+    instance = DecoratedCopy()
+    instance.calls = []
+    instance.copy_done = SimpleNamespace(record=lambda:instance.calls.append("native-record"))
+    wrapper = DecoratedCopy.copy_to_cpu
+    inner = wrapper.__wrapped__
+    saved = inner.__code__
+    state = patch_function(target=inner,edits=[
+        EditSpec(match='@torch.profiler.record_function("copy_result_to_cpu")',replacement=''),
+        EditSpec(match="self.copy_done.record()",prepend='self.calls.append("diagnostic-copy")'),
+    ])
+    try:
+        assert DecoratedCopy.copy_to_cpu is wrapper and wrapper.__wrapped__ is inner
+        instance.copy_to_cpu()
+        assert instance.calls == ["native-copy","diagnostic-copy","native-record"]
+    finally:
+        state.restore()
+    assert inner.__code__ is saved
+
+
+def drain_observer(ledger):
+    obj = diag.Observer.__new__(diag.Observer)
+    obj.ledger = ledger
+    obj.prefix_histogram = [0]*5
+    obj.mismatches = obj.completed = obj.seeds = obj.continuity = 0
+    obj.client_layer_checks, obj.initialization_layer_checks, obj.rows = {1:0,2:0}, 0, {}
+    obj.last_failure = None
+    return obj
+
+
+@pytest.mark.parametrize("failure", [None,"flags","owner","event","published_bonus","serial"])
+def test_native_fence_drain_includes_finished_rows_and_retains_failure(failure):
+    engine, ledger, temporal, conv, reqs = tiny_engine(n=1)
+    ticket = enter(engine,ledger,temporal,conv,reqs[0],0)
+    captured(engine,ticket)
+    advance(engine,ticket,temporal,conv)
+    result = SimpleNamespace(copy_done=ReadyFence(),accept_lens=torch.tensor([2]),next_token_ids=torch.full((5,),9))
+    ledger.attach(ticket,result)
+    ledger.copied(ticket,result)
+    ticket.host_flags = ticket.flags.clone()
+    ticket.host_meta = torch.tensor([[2,9,ticket.serial]])
+    reqs[0][0].done = True  # Native output loop will discard; diagnostic must drain.
+    observer = drain_observer(ledger)
+    batch = SimpleNamespace(reqs=reqs[0])
+    if failure == "flags":
+        ticket.host_flags[0,0,0] = 1
+    elif failure == "owner":
+        batch.reqs = [Request("replacement")]
+    elif failure == "event":
+        result.copy_done.ready = False
+    elif failure == "published_bonus":
+        result.next_token_ids[1] = 10
+    elif failure == "serial":
+        ticket.host_meta[0,2] += 1
+    if failure:
+        with pytest.raises(RuntimeError):
+            observer.drain(result,batch)
+        if failure in ("flags","published_bonus","serial"):
+            assert observer.last_failure and observer.mismatches == 1
+    else:
+        observer.drain(result,batch)
+        assert not ledger.pending and observer.completed == 1
+        assert ticket.result is None and not ticket.refs and not hasattr(ticket,"flags")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason="root-owned CUDA component gate")
+def test_cuda_component_native_full32_two_slots_graph64_carry_and_recovery():
+    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+        fused_gdn_compact_state_commit, fused_sigmoid_gating_delta_rule_update,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import causal_conv1d_update
+    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import fused_conv_window_scatter_with_mask
+    # One real native B4 layer: all heads/dimensions, both full32 slots and
+    # graph64 padding. The separate full-model gate must cover all30 layers.
+    torch.manual_seed(260792947)
+    device = torch.device("cuda")
+    layout = Layout(layers=1)
+    engine = CarriedBuffers(device,{0:0},layout)
+    ledger = OwnershipLedger(64)
+    temporal = torch.randn((1,65,32,128,128),device=device,dtype=torch.float32)
+    conv = torch.randn((1,65,8192,3),device=device,dtype=torch.bfloat16)
+    raw = torch.randn((64,8192,5),device=device,dtype=torch.bfloat16)
+    weights = torch.randn((8192,4),device=device,dtype=torch.bfloat16)
+    layer = SimpleNamespace(layer_id=0,A_log=torch.zeros(32,device=device),
+                            dt_bias=torch.zeros(32,device=device,dtype=torch.bfloat16))
+    a = torch.randn((1,320,32),device=device,dtype=torch.bfloat16)
+    beta = torch.randn_like(a)
+    indices = torch.full((64,),-1,device=device,dtype=torch.int32)
+    cu = torch.arange(0,321,5,device=device,dtype=torch.int32)
+    factor_k = torch.empty((1,65,5,32,128),device=device)
+    factor_d = torch.empty_like(factor_k)
+    factor_alpha = torch.empty((1,65,5,32),device=device)
+    physical = torch.empty((1,65,8192,7),device=device,dtype=torch.bfloat16)
+    windows = physical.as_strided((1,65,5,8192,3),
+        (physical.stride(0),physical.stride(1),1,physical.stride(2),1))
+    def production():
+        engine.capture_raw(0,raw)
+        convolved = causal_conv1d_update(raw,conv[0],weights,activation="silu",
+            conv_state_indices=indices,intermediate_conv_window=windows[0],
+            intermediate_state_indices=indices)
+        packed = convolved.transpose(1,2).reshape(320,8192)
+        q,k,v = packed.split((2048,2048,4096),dim=-1)
+        q,k,v = q.reshape(1,320,16,128),k.reshape(1,320,16,128),v.reshape(1,320,32,128)
+        engine.capture_operands(layer,q,k,v,a,beta,None)
+        out = fused_sigmoid_gating_delta_rule_update(A_log=layer.A_log,dt_bias=layer.dt_bias,
+            q=q,k=k,v=v,a=a,b=beta,softplus_beta=1.0,softplus_threshold=20.0,
+            initial_state_source=temporal[0],initial_state_indices=indices,
+            cu_seqlens=cu,cache_steps=5,disable_state_update=True,use_qk_l2norm_in_kernel=True,
+            intermediate_state_indices=indices,compact_ssm_k=factor_k[0],
+            compact_ssm_d=factor_d[0],compact_ssm_alpha=factor_alpha[0])
+        engine.capture_output(0,out)
+    producer = torch.cuda.Stream()
+    producer.wait_stream(torch.cuda.current_stream())  # Initialization owns the default stream.
+    with torch.cuda.stream(producer):
+        production()
+        production()
+    producer.synchronize()  # Component setup only, not a serving observer fence.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph,stream=producer):
+        production()
+    requests = [[Request(f"slot{slot}-{r}") for r in range(32)] for slot in range(2)]
+    lengths = {r.rid:149 for group in requests for r in group}
+    for round_id in range(3):
+        for slot in range(2):
+            group = requests[slot] if round_id != 1 else list(reversed(requests[slot]))
+            rows = [slot*32+requests[slot].index(req)+1 for req in group]
+            lens = [lengths[r.rid] for r in group]
+            ticket = prepare(ledger,group,slot,rows=rows,lengths=lens)
+            with torch.cuda.stream(producer):
+                indices.fill_(-1)
+                for i,row in enumerate(rows):
+                    indices[i].fill_(row)
+                seqs = diag.device_values(lens,device)
+                engine.entry(ticket,temporal,conv,indices[:32],
+                    torch.full((32,5),7 if round_id == 0 else 9,device=device,dtype=torch.int64),
+                    seqs[:,None]+torch.arange(5,device=device),seqs,indices[:32])
+                graph.replay()
+                accepted = torch.arange(32,device=device,dtype=torch.int32)%5+1
+                engine.select(ticket,torch.full((160,),9,device=device,dtype=torch.int64),accepted,
+                              torch.arange(160,device=device).reshape(32,5))
+                fused_gdn_compact_state_commit(temporal,factor_k,factor_d,factor_alpha,
+                    indices[:32],accepted-1,intermediate_state_indices=indices[:32])
+                fused_conv_window_scatter_with_mask(conv,windows,indices[:32],accepted-1)
+                engine.commit(ticket,temporal,conv,indices[:32],accepted-1)
+                # The component checks under one owned terminal event, rather
+                # than introducing a fence into the production diagnostic.
+                flags = ticket.flags.detach().clone()
+                done = torch.cuda.Event()
+                done.record()
+            done.synchronize()
+            assert not flags.any(), (round_id,slot,flags.cpu().tolist())
+            publish(ledger,ticket)
+            for i,req in enumerate(group):
+                lengths[req.rid] += i%5+1
+    ledger.require_complete()
+    # Between-call corruption cannot be overwritten by a fresh production seed.
+    with torch.cuda.stream(producer):
+        temporal[0,1,0,0,0].add_(1)
+        ticket = prepare(ledger,requests[0],0,lengths=[lengths[r.rid] for r in requests[0]])
+        idx = torch.arange(1,33,device=device,dtype=torch.int32)
+        seqs = diag.device_values(ticket.lengths,device)
+        engine.entry(ticket,temporal,conv,idx,torch.full((32,5),9,device=device),
+                     seqs[:,None]+torch.arange(5,device=device),seqs,idx)
+        failure = ticket.flags.detach().clone()
+        done = torch.cuda.Event()
+        done.record()
+    done.synchronize()
+    assert int(failure[0,0,0]) == 1
+    torch.cuda.current_stream().wait_stream(producer)  # Fixture tensor destruction safety.
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason="root-owned CUDA import gate")
+def test_cuda_component_native_source_patch_install_restore():
+    from sglang.srt.debug_utils.source_patcher.code_patcher import CodePatcher, _resolve_target
+    from sglang.srt.debug_utils.source_patcher.types import PatchConfig
+    diag.runtime_identity()
+    specs = PatchConfig(**yaml.safe_load((ROOT / "test/manual/b4_carried_state_diagnostic.yaml").read_text())).patches
+    functions = [_resolve_target(spec.target) for spec in specs]
+    codes = [function.__code__ for function in functions]
+    with CodePatcher(patches=specs):
+        assert all(fn.__code__ is not code for fn,code in zip(functions,codes))
+    assert all(fn.__code__ is code for fn,code in zip(functions,codes))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason="root-owned CUDA result-copy gate")
+def test_cuda_component_native_result_copy_fence_drains_owned_finished_ticket(monkeypatch):
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.debug_utils.source_patcher.code_patcher import CodePatcher
+    from sglang.srt.debug_utils.source_patcher.types import PatchConfig
+    diag.runtime_identity()
+    specs = PatchConfig(**yaml.safe_load((ROOT / "test/manual/b4_carried_state_diagnostic.yaml").read_text())).patches
+    copy_specs = [spec for spec in specs if spec.target.endswith("copy_to_cpu.__wrapped__")]
+    ledger, req = OwnershipLedger(64), Request("native-copy")
+    ticket = prepare(ledger,[req])
+    observer = drain_observer(ledger)
+    observer.runner = SimpleNamespace(device=torch.device("cuda"))
+    observer.host_flags = torch.empty((4,1,32,8),dtype=torch.int64,pin_memory=True)
+    observer.host_meta = torch.empty((4,32,3),dtype=torch.int64,pin_memory=True)
+    producer, copy_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(producer):
+        observer.device_meta = torch.empty((4,32,3),dtype=torch.int64,device="cuda")
+        reusable_capture = torch.zeros((1,1,8),dtype=torch.int64,device="cuda")
+        ticket.flags = reusable_capture.clone()
+        reusable_capture.fill_(123)  # A later capture cannot alter owned flags.
+        ticket.accepted = torch.tensor([2],dtype=torch.int32,device="cuda")
+        ticket.next_root = torch.tensor([9],dtype=torch.int64,device="cuda")
+        ticket.phase = "enqueued"
+        result = GenerationBatchResult(logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=torch.full((5,),9,dtype=torch.int64,device="cuda"),
+            accept_lens=ticket.accepted,can_run_cuda_graph=True,
+            copy_done=torch.cuda.Event(),extra_keep_alive_refs=["native"])
+        observer.attach(ticket,result)
+    monkeypatch.setattr(diag,"_observer",observer)
+    # Exactly the native scheduler's producer->copy dependency, not an
+    # observer-wide join. The original profiler wrapper remains installed.
+    copy_stream.wait_stream(producer)
+    wrapper = GenerationBatchResult.copy_to_cpu
+    with CodePatcher(patches=copy_specs),torch.cuda.stream(copy_stream):
+        result.copy_to_cpu(return_logprob=False,return_hidden_states=False)
+        assert GenerationBatchResult.copy_to_cpu is wrapper
+    assert ticket.phase == "copied"
+    result.copy_done.synchronize()  # Exactly the native result processor fence.
+    req.done = True
+    observer.drain(result,SimpleNamespace(reqs=[req]))
+    assert observer.completed == 1 and not ledger.pending and ticket.result is None
+    assert result.next_token_ids.tolist() == [9]*5 and result.extra_keep_alive_refs[0] == "native"
+    assert not hasattr(ticket,"flags")
+    torch.cuda.current_stream().wait_stream(copy_stream)  # Component teardown only.
