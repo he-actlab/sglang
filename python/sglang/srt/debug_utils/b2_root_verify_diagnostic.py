@@ -568,6 +568,12 @@ class _State:
             if data["req_pool_indices"][i] != cap.metadata["req_pool_indices_cpu"][i]:
                 problems.append("device request pool differs from owner")
         else:
+            if (
+                cap.metadata["can_run_cuda_graph"] is not True
+                or type(cap.metadata["graph_bucket"]) is not int
+                or not cap.metadata["batch_size"] <= cap.metadata["graph_bucket"] <= 32
+            ):
+                problems.append("verify did not use the frozen CUDA-graph capacity")
             length = data["accept_lens"][i]
             accepted = data["accept_index"][i][:length]
             predicted = data["predicted"][i * _TREE : i * _TREE + length]

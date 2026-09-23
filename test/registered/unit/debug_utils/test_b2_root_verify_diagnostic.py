@@ -327,6 +327,23 @@ def test_result_owned_clone_and_event_before_cpu_read(tmp_path):
     assert result.extra_keep_alive_refs[0] == "native"
 
 
+@pytest.mark.parametrize(
+    "key,value",
+    [("can_run_cuda_graph", False), ("graph_bucket", 64), ("graph_bucket", 0)],
+)
+def test_eager_or_wrong_capacity_verify_is_retained_but_ineligible(
+    tmp_path, key, value
+):
+    state = diag._State(config(tmp_path))
+    req = request(state)
+    _, _, _, result, cap = verify(state, req)
+    cap.metadata[key] = value
+    req.output_ids.extend([3, 4, 6, 7])
+    with pytest.raises(RuntimeError, match="CUDA-graph"):
+        state.publish(req, [3, 4, 6, 7], result, "verify")
+    assert "CUDA-graph" in records(state)[0]["problems"][0]
+
+
 @pytest.mark.parametrize("problem", ["missing", "wrong", "duplicate", "owner"])
 def test_publication_lifetime_failures(tmp_path, problem):
     state = diag._State(config(tmp_path))
@@ -547,6 +564,7 @@ def test_native_llama_lifecycle_strict_graph_hook_guard(monkeypatch):
 
 def test_guard_fields_exist_in_actual_native_server_args():
     from sglang.srt.server_args import ServerArgs
+
     assert set(vars(server_args())) <= set(ServerArgs.__dataclass_fields__)
 
 
