@@ -46,7 +46,7 @@ def config(tmp_path):
         purpose="correctness-only",
         performance_eligible=False,
         base_runtime=diag._BASE,
-        window=16,
+        window=1024,
         rid_prefixes=["b4-verify-diag-r0-c1", "b4-verify-diag-r0-c2"],
         requests=rows,
         server_warmup_input_ids=[100, 999],
@@ -71,16 +71,33 @@ def config(tmp_path):
     )
 
 
+class FakeRequest(NS):
+    def finished(self):
+        return self.finished_reason is not None
+
+    @property
+    def output_ids_through_stop(self):
+        return self.output_ids[:self.finished_len] if self.finished_len is not None else self.output_ids
+
+
+class FinishReason(NS):
+    def to_json(self):
+        return vars(self).copy()
+
+
 def request(state, idx=27, repetition=1, phase="measure"):
     row = next(
         r
         for r in state.rows.values()
         if (r["idx"], r["repetition"], r["phase"]) == (idx, repetition, phase)
     )
-    return NS(
+    return FakeRequest(
         rid=row["rid"],
         origin_input_ids=row["input_ids"][:],
         output_ids=[],
+        finished_reason=None,
+        finished_len=None,
+        is_retracted=False,
         req_pool_idx=7,
         mamba_pool_idx=torch.tensor(11),
         grammar=None,
@@ -128,11 +145,13 @@ def prefill(state, req):
     return f, result, cap
 
 
-def verify(state, req, start=1, length=3):
+def verify(state, req, start=1, length=3, constant=False):
     req.output_ids = [2] * start
     f = forward(req)
     seq = len(req.origin_input_ids) + start - 1
     f.input_ids = torch.tensor([2, 3, 4, 5, 6])
+    if constant:
+        f.input_ids.fill_(2)
     if length < 5:
         f.input_ids[length] = 9  # The first rejected draft, not a synthetic early stop.
     f.positions = torch.arange(seq, seq + 5)
@@ -152,6 +171,10 @@ def verify(state, req, start=1, length=3):
     logits[torch.arange(5), torch.arange(4, 9)] = 1
     output = NS(next_token_logits=logits)
     pred = torch.arange(3, 8)
+    if constant:
+        logits.zero_()
+        logits[:, 2] = 3
+        pred.fill_(2)
     lens = torch.tensor([length])
     indices = torch.tensor([list(range(length)) + [-1] * (5 - length)])
     worker = NS(target_worker=NS(model_runner=NS(decode_cuda_graph_runner=NS(bs=4))))
@@ -336,14 +359,17 @@ def test_mismatch_archived_before_failure(tmp_path, mutation):
     assert len(records(s)) == 1 and records(s)[0]["problems"]
 
 
-def test_boundary_crossing_keeps_entire_decision_but_only_first16_coverage(tmp_path):
+def test_cap_crossing_keeps_native_block_and_clips_only_visible_coverage(tmp_path):
     s = diag._State(config(tmp_path))
     req = request(s)
-    _, _, _, result, _ = verify(s, req, start=15, length=5)
+    _, _, _, result, _ = verify(s, req, start=1023, length=5)
     req.output_ids.extend([3, 4, 5, 6, 7])
+    req.finished_len = 1024
+    req.finished_reason = FinishReason(type="length", length=1024)
     s.publish(req, [3, 4, 5, 6, 7], result, "verify")
-    assert records(s)[0]["capture_positions"] == [15]
-    assert records(s)[0]["published_tokens"] == [3, 4, 5, 6, 7]
+    assert records(s)[0]["capture_positions"] == [1023]
+    assert records(s)[0]["published_tokens"] == [3]
+    assert records(s)[0]["native_appended_tokens"] == [3, 4, 5, 6, 7]
     assert s._selected(NS(reqs=[req])) == []
 
 
@@ -390,6 +416,146 @@ def test_result_attach_is_exactly_once_and_preserves_native_refs(tmp_path):
     with pytest.raises(RuntimeError, match="already owns"):
         diag.attach_result(result, cap)
     assert result.extra_keep_alive_refs[0] == "native"
+
+
+def native_finish(req, count):
+    """Execute the unchanged native terminal rules without importing GPU backends."""
+    source = (ROOT / "python/sglang/srt/managers/schedule_batch.py").read_text()
+    owner = next(n for n in ast.parse(source).body
+                 if isinstance(n, ast.ClassDef) and n.name == "Req")
+    methods = [n for n in owner.body if isinstance(n, ast.FunctionDef)
+               and n.name in ("update_finish_state", "_check_token_based_finish")]
+    namespace = dict(List=list, FINISH_LENGTH=lambda length: FinishReason(type="length", length=length),
+                     FINISH_MATCHED_TOKEN=lambda matched: FinishReason(type="stop", matched=matched))
+    exec(compile(ast.Module(body=methods, type_ignores=[]), "native-finish", "exec"), namespace)
+    req.to_finish = None
+    req.eos_token_ids = getattr(req, "eos_token_ids", {4})
+    req.tokenizer = None
+    req.sampling_params.stop_token_ids = None
+    req._check_vocab_boundary_finish = lambda _: False
+    req._check_str_based_finish = lambda _: False
+    req._check_token_based_finish = lambda tokens: namespace["_check_token_based_finish"](req, tokens)
+    namespace["update_finish_state"](req, count)
+
+
+def test_native_eos_preserves_full_accepted_block_and_visible_prefix(tmp_path):
+    s = diag._State(config(tmp_path))
+    req = request(s)
+    _, _, _, result, _ = verify(s, req, length=3)
+    req.output_ids.extend([3, 4, 5])
+    native_finish(req, 3)
+    s.publish(req, [3, 4, 5], result, "verify")
+    record = records(s)[0]
+    assert record["native_appended_tokens"] == [3, 4, 5]
+    assert record["published_tokens"] == [3, 4]
+    assert record["terminal"]["length"] == 3
+    assert record["terminal"]["reason"] == dict(type="stop", matched=4)
+    assert record["tensors"]["accept_lens"] == [3]  # Never change native acceptance.
+    assert s._selected(NS(reqs=[req])) == []
+    assert not s.snapshot()["selected_windows_complete"]  # Other selected requests absent.
+
+
+def test_prefill_eos_records_terminal_and_unobserved_termination_is_not_complete(tmp_path):
+    s = diag._State(config(tmp_path))
+    req = request(s)
+    req.eos_token_ids = {2}
+    _, result, _ = prefill(s, req)
+    req.output_ids.append(2)
+    native_finish(req, 1)
+    s.publish(req, [2], result, "prefill")
+    assert s.terminals[req.rid]["length"] == 1
+    assert s.snapshot()["snapshot_counts"][req.rid] == 1
+    assert records(s)[0]["terminal"]["reason"] == dict(type="stop", matched=2)
+    assert not s.snapshot()["selected_windows_complete"]
+
+
+def test_terminal_clipping_does_not_hide_mismatched_native_tail(tmp_path):
+    s = diag._State(config(tmp_path))
+    req = request(s)
+    _, _, _, result, cap = verify(s, req, length=3)
+    req.output_ids.extend([3, 4, 5])
+    native_finish(req, 3)
+    cap.tensors["predicted"][2] = 8  # Clipped after EOS, but still must be checked.
+    with pytest.raises(RuntimeError, match="prediction"):
+        s.publish(req, [3, 4, 5], result, "verify")
+    assert records(s)[0]["problems"]
+
+
+@pytest.mark.parametrize("accepted", [1, 3, 5])
+def test_full_cap_continuous_trajectory_and_count_bound(tmp_path, accepted):
+    s = diag._State(config(tmp_path))
+    req = request(s)
+    _, result, _ = prefill(s, req)
+    req.output_ids.append(2)
+    s.publish(req, [2], result, "prefill")
+    while not req.finished():
+        start = len(req.output_ids)
+        _, _, _, result, _ = verify(s, req, start=start, length=accepted, constant=True)
+        req.output_ids.extend([2] * accepted)
+        native_finish(req, accepted)
+        s.publish(req, [2] * accepted, result, "verify")
+    assert s.coverage[req.rid] == set(range(1024))
+    assert s.terminals[req.rid]["length"] == 1024
+    assert 20 < s.counts[req.rid] <= 1024
+    assert s.retained_bytes == 0 and not s.pending
+    assert all(not r["problems"] for r in records(s))
+    # Completion is actual length, not a request to generate1024 after EOS.
+    for rid in s.coverage:
+        if rid != req.rid:
+            s.coverage[rid] = set(range(3))
+            s.terminals[rid] = dict(length=3)
+    assert s.snapshot()["selected_windows_complete"]
+    s.coverage[req.rid].remove(900)
+    assert not s.snapshot()["selected_windows_complete"]
+
+
+def test_finished_overlap_result_waits_event_and_retires_without_publication(tmp_path):
+    s = diag._State(config(tmp_path))
+    req = request(s)
+    _, _, _, first, _ = verify(s, req, start=1023, length=5)
+    _, _, _, queued, cap = verify(s, req, start=1023, length=5)
+    req.output_ids.extend([3, 4, 5, 6, 7])
+    native_finish(req, 5)
+    s.publish(req, [3, 4, 5, 6, 7], first, "verify")
+    req.req_pool_idx = None  # Native release/reuse does not own diagnostic clones.
+    waits = []
+    cap.completion = NS(synchronize=lambda: waits.append(cap.nbytes))
+    before = req.output_ids[:]
+    s.discard_finished(req, queued, "verify")
+    assert waits == [cap.nbytes]
+    assert req.output_ids == before
+    assert records(s)[-1]["disposition"] == "discarded_finished"
+    assert "published_tokens" not in records(s)[-1]
+    assert s.discarded_finished == 1 and not cap.tensors and not s.pending
+    assert s.retained_bytes == 0
+    with pytest.raises(RuntimeError, match="retirement"):
+        s.discard_finished(req, queued, "verify")
+
+
+@pytest.mark.parametrize("mutation", ["unfinished", "retracted", "changed", "wrong_result"])
+def test_discard_cannot_hide_unmatched_or_changed_output(tmp_path, mutation):
+    s = diag._State(config(tmp_path))
+    req = request(s)
+    _, _, _, result, _ = verify(s, req)
+    if mutation != "unfinished":
+        req.finished_reason = FinishReason(type="stop", matched=2)
+        req.finished_len = 1
+        s.terminals[req.rid] = dict(length=1, output_sha256=diag._digest([2]))
+    if mutation == "retracted":
+        req.is_retracted = True
+    elif mutation == "changed":
+        req.output_ids[0] = 3
+    elif mutation == "wrong_result":
+        _, _, _, result, _ = verify(s, request(s, 107))
+    with pytest.raises(RuntimeError):
+        s.discard_finished(req, result, "verify")
+    assert s.retained_bytes > 0 and s.pending  # Failure does not silently release evidence.
+
+
+def test_full_scope_preserves_pending_retained_and_transient_guards():
+    assert diag._MAX_PENDING == 8 and diag._MAX_BYTES == 512 << 10
+    assert diag._TRANSIENT_GUARD == 64 << 20
+    assert diag._WINDOW == 1024
 
 
 def server_args():
@@ -512,12 +678,16 @@ def test_publication_hooks_follow_actual_native_append_and_fence():
     assert (
         prefill_source.index("copy_done.synchronize()")
         < prefill_source.index("req.output_ids.append")
+        < prefill_source.index("req.update_finish_state()")
         < prefill_source.index("publish(req")
     )
     _, decode_source = funcs["process_batch_result_decode"]
-    assert decode_source.index("req.output_ids.extend") < decode_source.index(
-        "publish(req"
-    )
+    assert (decode_source.index("copy_done.synchronize()")
+            < decode_source.index("discard_finished(req")
+            < decode_source.index("req.output_ids.extend")
+            < decode_source.index("req.update_finish_state(new_accept_len)")
+            < decode_source.index("publish(req")
+            < decode_source.index("self._handle_finish_state_updated_req(req"))
     _, target_source = funcs["forward_batch_generation"]
     assert target_source.index("if is_verify:") < target_source.index(
         "capture_prefill("
@@ -541,6 +711,9 @@ def test_snapshot_never_confuses_partial_coverage_with_complete_pair(tmp_path):
     for rid in s.coverage:
         s.coverage[rid] = set(range(16))
     s.seen = set(s.rows)
+    assert not s.snapshot()["selected_windows_complete"]
+    for rid in s.coverage:
+        s.terminals[rid] = dict(length=16)
     final = s.snapshot()
     assert final["selected_windows_complete"] and final["all_registered_requests_seen"]
     assert final["mismatches"] == final["pending_snapshots"] == 0

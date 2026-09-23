@@ -24,7 +24,7 @@ _TARGET_REV = "59d61f3ce65a6d9863b86d2e96597125219dc754"
 _DRAFT_REV = "d07a277ececba408f017a0416002d7abb23caf36"
 _SELECTED = {27, 107, 187}
 _PROMPT_SHA = "9d07d908dabd71c4"
-_WINDOW = 16
+_WINDOW = 1024  # Observer coverage; the native request cap is unchanged.
 _MAX_PENDING = 8
 _MAX_BYTES = 512 << 10  # Retained tensors per result, not allocator workspace.
 _TRANSIENT_GUARD = 64 << 20
@@ -273,6 +273,8 @@ class _State:
         self.counts = {}
         self.seen = set()
         self.coverage = {r["rid"]: set() for r in self.rows.values() if r["capture"]}
+        self.terminals = {}
+        self.discarded_finished = 0
 
     def request_row(self, req):
         row = self.rows.get(req.rid)
@@ -319,7 +321,7 @@ class _State:
             # CPU publication can lag GPU generation by an overlap iteration.
             # Keep the entire boundary result and trim by actual publication
             # position, never assume that a verify round equals five tokens.
-            if row and row["capture"] and len(req.output_ids) < _WINDOW:
+            if row and row["capture"] and not req.finished() and len(req.output_ids) < _WINDOW:
                 selected.append(i)
         return selected
 
@@ -360,7 +362,10 @@ class _State:
             tensors[f"request_mamba_pool_index_{i}"] = batch.reqs[i].mamba_pool_idx
             rid = batch.reqs[i].rid
             self.counts[rid] = self.counts.get(rid, 0) + 1
-            _require(self.counts[rid] <= 20, "capture window failed to advance")
+            _require(
+                self.counts[rid] <= _WINDOW + _MAX_PENDING,
+                "capture trajectory failed to advance",
+            )
         nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
         _require(nbytes <= _MAX_BYTES, "snapshot retained-byte bound")
         copies = {k: v.detach().clone() for k, v in tensors.items()}
@@ -553,6 +558,30 @@ class _State:
             problems.append("CPU publication differs from native prediction")
         if cap.metadata["req_pool_indices_cpu"][i] != req.req_pool_idx:
             problems.append("request pool ownership changed")
+        # This observer runs after native update_finish_state and before any
+        # state ownership release. Never replace the native accepted block:
+        # the streamer may expose only its prefix through EOS or the cap.
+        visible = list(req.output_ids_through_stop)
+        end = len(visible)
+        terminal = None
+        if not start < end <= min(len(req.output_ids), _WINDOW):
+            problems.append("invalid native visible output extent")
+        if list(req.output_ids[:end]) != visible:
+            problems.append("native visible output is not an accepted prefix")
+        if req.finished():
+            reason = req.finished_reason.to_json()
+            if reason.get("type") not in ("length", "stop"):
+                problems.append("unsupported terminal reason")
+            terminal = dict(length=end, native_length=len(req.output_ids),
+                            reason=reason, output_sha256=_digest(visible))
+            if req.rid in self.terminals:
+                problems.append("duplicate terminal publication")
+            self.terminals[req.rid] = terminal
+        elif end != len(req.output_ids):
+            problems.append("unfinished request unexpectedly clipped")
+        positions = set(range(start, end))
+        if self.coverage[req.rid] & positions:
+            problems.append("duplicate published positions")
         values = data[f"top_values_{i}"]
         margins = (
             [v[0] - v[1] for v in values] if kind == "verify" else values[0] - values[1]
@@ -561,13 +590,16 @@ class _State:
             runtime=self.runtime,
             snapshot=cap.serial,
             kind=kind,
+            disposition="published",
             rid=req.rid,
             repetition=row["repetition"],
             idx=row["idx"],
             prompt_sha=row["prompt_sha"],
             start_position=start,
-            capture_positions=list(range(start, min(start + len(tokens), _WINDOW))),
-            published_tokens=list(tokens),
+            capture_positions=sorted(positions),
+            published_tokens=visible[start:end],
+            native_appended_tokens=list(tokens),
+            terminal=terminal,
             accepted_indices=accepted,
             accepted_prefix=list(req.output_ids[:start]),
             accepted_prefix_sha256=_digest(list(req.output_ids[:start])),
@@ -579,20 +611,60 @@ class _State:
             retained_tensor_peak_bytes=self.peak_bytes,
             problems=problems,
             performance_eligible=False,
-            limitations="No full logits or KV/recurrent state; changed prediction is not root-cause attribution. Whole boundary result retained when it crosses position16.",
+            limitations="No full logits or KV/recurrent state; changed prediction is not root-cause attribution. Native accepted block retained; visible publication follows native stop/cap clipping.",
         )
         path = self.directory / f'{row["idx"]:04d}-{cap.serial:06d}-{kind}.json'
         with path.open("x") as stream:
             json.dump(_json_finite(record), stream, indent=2, allow_nan=False)
             stream.write("\n")
-        cap.remaining.remove(req.rid)
         self.coverage[req.rid].update(record["capture_positions"])
+        self._retire(req.rid, cap)
+        self.mismatches += bool(problems)
+        _require(not problems, "; ".join(problems))
+
+    def _retire(self, rid, cap):
+        cap.remaining.remove(rid)
         if not cap.remaining:
             self.pending.remove(cap.serial)
             self.retained_bytes -= cap.nbytes
             cap.tensors.clear()
-        self.mismatches += bool(problems)
-        _require(not problems, "; ".join(problems))
+
+    def discard_finished(self, req, result, kind):
+        row = self.rows.get(req.rid)
+        if row is None or not row["capture"]:
+            return
+        _require(not req.is_retracted, "selected request retracted")
+        _require(req.finished() and req.rid in self.terminals,
+                 "discard without recorded terminal publication")
+        cap = getattr(result, "_b4_verify_diagnostic", None)
+        if cap is None:
+            return  # No selected snapshot was issued for this already-finished row.
+        _require(req.rid in cap.metadata["batch_rids"], "finished result request identity")
+        i = cap.metadata["batch_rids"].index(req.rid)
+        if i not in cap.metadata["selected"]:
+            return
+        _require(cap.kind == kind and cap.serial in self.pending and req.rid in cap.remaining,
+                 "duplicate/wrong finished-result retirement")
+        # Called only inside the native result-ready skip branch. Even unused
+        # clones remain owned until their producing stream's event completes.
+        if cap.completion is not None:
+            cap.completion.synchronize()
+        terminal = self.terminals[req.rid]
+        _require(_digest(list(req.output_ids_through_stop)) == terminal["output_sha256"],
+                 "finished output changed before overlap-result retirement")
+        record = dict(runtime=self.runtime, snapshot=cap.serial, kind=kind,
+                      disposition="discarded_finished", rid=req.rid,
+                      repetition=row["repetition"], idx=row["idx"],
+                      prompt_sha=row["prompt_sha"], metadata=cap.metadata,
+                      terminal=terminal, retained_tensor_bytes=cap.nbytes,
+                      retained_tensor_peak_bytes=self.peak_bytes,
+                      problems=[], performance_eligible=False)
+        path = self.directory / f'{row["idx"]:04d}-{cap.serial:06d}-{kind}.json'
+        with path.open("x") as stream:
+            json.dump(record, stream, indent=2, allow_nan=False)
+            stream.write("\n")
+        self.discarded_finished += 1
+        self._retire(req.rid, cap)
 
     def snapshot(self):
         return dict(
@@ -603,8 +675,12 @@ class _State:
             mismatches=self.mismatches,
             all_registered_requests_seen=len(self.seen) == len(self.rows),
             selected_windows_complete=all(
-                v == set(range(_WINDOW)) for v in self.coverage.values()
+                rid in self.terminals and v == set(range(self.terminals[rid]["length"]))
+                for rid, v in self.coverage.items()
             ),
+            terminals=self.terminals.copy(),
+            discarded_finished=self.discarded_finished,
+            snapshot_counts={rid: self.counts.get(rid, 0) for rid in self.coverage},
             retained_tensor_bytes=self.retained_bytes,
             retained_tensor_peak_bytes=self.peak_bytes,
             retained_tensor_limit_bytes=_MAX_BYTES * _MAX_PENDING,
@@ -673,6 +749,11 @@ def capture_verify(
 def publish(req, tokens, result, kind):
     if _state is not None:
         _state.publish(req, tokens, result, kind)
+
+
+def discard_finished(req, result, kind):
+    if _state is not None:
+        _state.discard_finished(req, result, kind)
 
 
 def snapshot():

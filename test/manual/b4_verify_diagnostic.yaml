@@ -61,15 +61,36 @@ patches:
               extra_keep_alive_refs=[verify_forward_batch],
           ), diagnostic_capture)
   - target: sglang.srt.managers.scheduler_components.batch_result_processor.SchedulerBatchResultProcessor.process_batch_result_prefill
-    preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import publish
+    preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import publish, discard_finished
     edits:
-      - match: req.output_ids.append(next_token_id)
-        append: publish(req, [next_token_id], result, "prefill")
+      - match: |
+          req.update_finish_state()
+          if req.finished():
+        replacement: |
+          req.update_finish_state()
+          publish(req, [next_token_id], result, "prefill")
+          if req.finished():
+      - match: |
+          # aborted middle chunk in the chunked branch long enough to
+          # drain its accounting without streaming it.
+          continue
+        replacement: |
+          # aborted middle chunk in the chunked branch long enough to
+          # drain its accounting without streaming it.
+          discard_finished(req, result, "prefill")
+          continue
   - target: sglang.srt.managers.scheduler_components.batch_result_processor.SchedulerBatchResultProcessor.process_batch_result_decode
-    preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import publish
+    preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import publish, discard_finished
     edits:
-      - match: req.output_ids.extend(next_token_id)
+      - match: req.update_finish_state(new_accept_len)
         append: publish(req, next_token_id, result, "verify")
+      - match: |
+          # And all the over-allocated tokens will be freed in `release_kv_cache`.
+          continue
+        replacement: |
+          # And all the over-allocated tokens will be freed in `release_kv_cache`.
+          discard_finished(req, result, "verify")
+          continue
   - target: sglang.srt.managers.scheduler.Scheduler.get_internal_state
     preamble: from sglang.srt.debug_utils.b4_verify_diagnostic import snapshot
     edits:
