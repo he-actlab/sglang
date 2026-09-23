@@ -296,6 +296,7 @@ class ComponentPair:
                 next_token_ids=ticket.predictions.flatten(),
                 accept_lens=ticket.accepted,
                 next_draft_input=NS(bonus_tokens=bonus),
+                can_run_cuda_graph=True,  # The native graph.replay() above ran.
             )
             fixture.attach_result(batch, result)
             self.worker_class._prepare_paired_mamba_publication(self.worker, result)
