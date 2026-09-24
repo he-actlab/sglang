@@ -485,6 +485,69 @@ def test_cuda_component_native_linear_out_exact(hidden, intermediate):
             del actual, expected, out, x
 
 
+def _refresh_verify_fixture_metadata(metadata, rows, active, full_query_start_loc):
+    # Native replay distinguishes padded request row0 from physical state -1.
+    metadata.mamba_cache_indices.copy_(rows)
+    metadata.mamba_cache_indices[active:].fill_(-1)
+    metadata.query_start_loc.copy_(full_query_start_loc)
+    metadata.query_start_loc[active:].fill_(active * 7)
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize("bucket", [8, 32, 64])
+def test_verify_fixture_padding_matches_native_replay_metadata(role, bucket):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    native = method(
+        "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py",
+        "MambaAttnBackendBase",
+        "_replay_metadata",
+        dict(torch=torch, ForwardMetadata=NS),
+    )
+    full_query = torch.arange(bucket + 1, dtype=torch.int32) * 7
+    metadata = NS(
+        mamba_cache_indices=torch.empty(bucket, dtype=torch.int32),
+        query_start_loc=torch.empty_like(full_query),
+    )
+    pointers = metadata.mamba_cache_indices.data_ptr(), metadata.query_start_loc.data_ptr()
+    backend = NS(
+        _state_indices=lambda rows, mode: rows.to(torch.int32),
+        state_indices_list={bucket - 1: torch.empty(bucket, dtype=torch.int32)},
+        query_start_loc_list={bucket - 1: torch.empty_like(full_query)},
+        cached_cuda_graph_verify_query_start_loc=full_query,
+        replayssm_write_pos_list=None,
+        topk=1,
+    )
+    mode = ForwardMode.TARGET_VERIFY if role == "target" else ForwardMode.DRAFT_EXTEND_V2
+    for start, active in (
+        (1, min(bucket, 32)),
+        (33, min(bucket, 32)),
+        (1, bucket),
+        (33, min(bucket, 7)),
+    ):
+        rows = torch.zeros(bucket, dtype=torch.int64)
+        rows[:active] = ((torch.arange(active) + start - 1) % 64 + 1).flip(0)
+        expected = native(
+            backend, bucket, rows.clone(), mode,
+            NS(num_tokens_per_req=7, draft_token_num=7), None,
+            num_padding=bucket - active,
+        )
+        _refresh_verify_fixture_metadata(metadata, rows, active, full_query)
+        assert torch.equal(metadata.mamba_cache_indices, expected.mamba_cache_indices)
+        assert torch.equal(metadata.query_start_loc, expected.query_start_loc)
+        assert pointers == (
+            metadata.mamba_cache_indices.data_ptr(), metadata.query_start_loc.data_ptr()
+        )
+        assert torch.all(metadata.mamba_cache_indices[:active] > 0)
+        assert torch.all(metadata.mamba_cache_indices[active:] == -1)
+        assert torch.all(metadata.query_start_loc[active:] == active * 7)
+        if active < bucket:
+            # The old request-to-state copy creates duplicate row0 writes and
+            # gives padding nonempty recurrent queries; neither is native.
+            assert not torch.equal(rows.to(torch.int32), expected.mamba_cache_indices)
+            assert not torch.equal(full_query, expected.query_start_loc)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA component gate")
 @pytest.mark.parametrize("role", ["target", "draft"])
 @pytest.mark.parametrize("bucket", [8, 32, 64])
@@ -544,10 +607,11 @@ def test_cuda_component_rewrite_reseed_padding_rejection_and_recycled_slots(
     ]
     mixed = torch.randn(bucket * 7, 512, **bf16)
     a, b = torch.randn(bucket * 7, 2, **bf16), torch.randn(bucket * 7, 2, **bf16)
+    full_query_start_loc = torch.arange(
+        0, bucket * 7 + 1, 7, device="cuda", dtype=torch.int32
+    )
     metadata = NS(
-        query_start_loc=torch.arange(
-            0, bucket * 7 + 1, 7, device="cuda", dtype=torch.int32
-        ),
+        query_start_loc=full_query_start_loc.clone(),
         mamba_cache_indices=state_indices,
         retrieve_next_token=None,
         retrieve_next_sibling=None,
@@ -660,7 +724,7 @@ def test_cuda_component_rewrite_reseed_padding_rejection_and_recycled_slots(
             ) % 64 + 1
             rows[:active].copy_(active_rows.flip(0))
             rows[active:].zero_()
-            state_indices.copy_(rows)
+            _refresh_verify_fixture_metadata(metadata, rows, active, full_query_start_loc)
             accepted.add_(1).remainder_(7)
             accepted[active:] = -1
             for graph in graphs:
