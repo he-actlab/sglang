@@ -645,7 +645,7 @@ def test_fixture_matches_live_source_and_only_drains_after_existing_fence():
     config = PatchConfig(
         **yaml.safe_load((ROOT / "test/manual/b3_watched_shadow.yaml").read_text())
     )
-    assert len(config.patches) == 10
+    assert len(config.patches) == 11
     for spec in config.patches:
         module, cls, fn = spec.target.rsplit(".", 2)
         path = ROOT / "python" / Path(*module.split(".")).with_suffix(".py")
