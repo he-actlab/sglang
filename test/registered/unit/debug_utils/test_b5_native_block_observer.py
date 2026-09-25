@@ -47,7 +47,7 @@ def test_complete_combined_fixture_installs_and_restores_real_decorated_methods(
     specs = PatchConfig(
         **yaml.safe_load((ROOT / "test/manual/gdn_compact_shadow_b5.yaml").read_text())
     ).patches
-    assert len(specs) == 14
+    assert len(specs) == 15
     saved = [
         (_resolve_target(p.target), inspect.unwrap(_resolve_target(p.target)), p.target)
         for p in specs

@@ -47,10 +47,22 @@ class B5ShadowShape(ShadowShape):
     def conv_dim(self):
         return 2 * self.heads * self.key_dim + self.value_heads * self.value_dim
 
+    @property
+    def live_rows(self):
+        # Native graph/request capacity is unchanged; a physical verify owns
+        # at most one real batch32, even when its graph is padded to64.
+        return min(self.batch, 32)
+
     def specs(self):
         l, n, c, w = self.layers, self.batch, self.conv_dim, self.conv_width - 1
+        specs = super().specs()
+        dims, dtype = specs["base"]
+        specs["base"] = ((l, self.live_rows, *dims[2:]), dtype)
+        for name in ("dense", "expected", "actual"):
+            dims, dtype = specs[name]
+            specs[name] = ((self.live_rows, *dims[1:]), dtype)
         return dict(
-            super().specs(),
+            specs,
             conv_base=((l, n, c, w), torch.bfloat16),
             conv_input=((l, n, c, self.steps), torch.bfloat16),
             conv_indices=((l, n), torch.int32),
@@ -82,6 +94,9 @@ class B5NativeDenseShadow(NativeDenseShadow):
             validation_scope="same_input_gdn_state_only_NOT_FULL_MODEL",
             first_prefill_entry_is_baseline=True,
             serving_storage_offloaded=False,
+            diagnostic_live_rows=shape.live_rows,
+            diagnostic_graph_capacity=shape.batch,
+            diagnostic_request_owner_capacity=shape.batch,
             diagnostic_gpu_static_bytes=shape.nbytes(),
             diagnostic_cpu_capacity_bytes=shape.cpu_oracle_capacity_bytes(),
             diagnostic_cpu_persistent_bytes=0,
@@ -99,6 +114,11 @@ class B5NativeDenseShadow(NativeDenseShadow):
         )
         self.seen_physical = set()
         _emit("b5_diagnostic_allocated", **self.stats)
+
+    def _capture_base(self, states, layer_index, n):
+        # Full graph inputs/outputs/ownership metadata still capture all rows.
+        # begin() rejects a real batch exceeding this bank before graph replay.
+        super()._capture_base(states, layer_index, min(n, self.shape.live_rows))
 
     def _cpu(self, value):
         result = value.detach().cpu()
@@ -149,7 +169,7 @@ class B5NativeDenseShadow(NativeDenseShadow):
         elif slot not in (0, 1) or getattr(batch, "spec_pdmux_slot", None) != slot:
             raise AssertionError("native shadow requires the actual scheduler slot")
         n = len(batch.reqs)
-        if not 0 < n <= 32 or batch.seq_lens.numel() != n:
+        if not 0 < n <= self.shape.live_rows or batch.seq_lens.numel() != n:
             raise AssertionError("native diagnostic preserves one batch32 per slot")
         self._prune()
         requests = tuple(batch.reqs)

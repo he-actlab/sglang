@@ -113,7 +113,7 @@ def verify(shadow, states, mapping, backend, reqs, prefixes, slot, steps, corrup
             states=states.temporal[i],
             indices=indices,
             cu=torch.arange(0, (n + 1) * s.steps, s.steps, dtype=torch.int32),
-            parent=None
+            parent=None,
         )
         shadow.output(
             layer.layer_id,
@@ -135,7 +135,15 @@ def verify(shadow, states, mapping, backend, reqs, prefixes, slot, steps, corrup
 def test_b5_budgets_include_every_gpu_tensor_and_separate_cpu_expected_mirror():
     for capacity in (32, 64):
         s = b5.B5ShadowShape(batch=capacity)
-        assert s.specs()["base"][0] == (48, capacity, 48, 128, 128)
+        assert s.live_rows == 32
+        assert s.batch == capacity
+        assert s.specs()["base"][0] == (48, 32, 48, 128, 128)
+        assert s.specs()["dense"][0] == (32, 8, 48, 128, 128)
+        assert s.specs()["expected"][0] == s.specs()["actual"][0] == (32, 48, 128, 128)
+        assert s.specs()["q"][0] == (48, 1, capacity * 8, 16, 128)
+        assert s.specs()["output"][0] == (48, 1, capacity * 8, 48, 128)
+        assert s.specs()["indices"][0] == (48, capacity)
+        assert s.specs()["cu_seqlens"][0] == (48, capacity + 1)
         assert s.specs()["conv_input"][0] == (48, capacity, 10240, 8)
         assert s.nbytes() == sum(
             torch.empty(dims, dtype=dtype, device="meta").nbytes
@@ -144,6 +152,86 @@ def test_b5_budgets_include_every_gpu_tensor_and_separate_cpu_expected_mirror():
         assert s.cpu_oracle_capacity_bytes() == 48 * capacity * (
             48 * 128 * 128 * 4 + 10240 * 3 * 2
         )
+    assert b5.B5ShadowShape(batch=64).nbytes() == 7344527168
+    assert b5.B5ShadowShape(batch=64).cpu_oracle_capacity_bytes() == 9852420096
+
+
+def test_generic_base_hook_preserves_full_row_copy_and_storage():
+    shadow = generic.NativeDenseShadow.__new__(generic.NativeDenseShadow)
+    states = torch.randn(5, 2, 3)
+    indices = torch.tensor([4, 0, 2, 1], dtype=torch.int32)
+    base = torch.empty(2, 4, 2, 3)
+    shadow.buffers = dict(base=base, normalized_indices=indices)
+    address = base.data_ptr()
+    expected = states[indices].clone()
+    shadow._capture_base(states, 1, 4)
+    states.add_(1)
+    generic._assert_bits(base[1], expected, "generic full-row immutable base")
+    assert base.data_ptr() == address
+    assert base.shape == (2, 4, 2, 3)
+
+
+def test_b5_graph64_capture_retains_all_metadata_but_only_real_row_state():
+    shape = b5.B5ShadowShape(
+        layers=1, batch=64, heads=1, value_heads=2, key_dim=2, value_dim=2
+    )
+    shadow = b5.B5NativeDenseShadow.__new__(b5.B5NativeDenseShadow)
+    shadow.shape, shadow.layer_map, shadow.parameters = shape, {3: 0}, {}
+    shadow.buffers = {
+        name: torch.zeros(dims, dtype=dtype)
+        for name, (dims, dtype) in shape.specs().items()
+    }
+    states = torch.randn(65, 2, 2, 2)
+    states[:33].fill_(float("nan"))  # Padded rows must not enter the live bank.
+    indices = torch.cat(
+        [
+            torch.arange(64, 32, -1, dtype=torch.int32),
+            torch.arange(1, 33, dtype=torch.int32),
+        ]
+    )
+    expected = states[indices[:32]].clone()
+    cu = torch.arange(0, 65 * 8, 8, dtype=torch.int32)
+    inputs = {
+        name: torch.zeros_like(shadow.buffers[name][0])
+        for name in ("q", "k", "v", "a", "b")
+    }
+    addresses = {name: value.data_ptr() for name, value in shadow.buffers.items()}
+    shadow.capture(
+        None,
+        SimpleNamespace(layer_id=3, A_log=None, dt_bias=None),
+        **inputs,
+        states=states,
+        indices=indices,
+        cu=cu,
+        parent=None,
+    )
+    output = torch.randn_like(shadow.buffers["output"][0])
+    shadow.output(3, output)
+    states[33:].add_(1)
+    generic._assert_bits(shadow.buffers["base"][0], expected, "B5 live-row base")
+    assert torch.equal(shadow.buffers["indices"][0], indices)
+    assert torch.equal(shadow.buffers["cu_seqlens"][0], cu)
+    generic._assert_bits(shadow.buffers["output"][0], output, "full graph output")
+    assert shadow.buffers["epochs"].tolist() == [[1, 1]]
+    assert addresses == {
+        name: value.data_ptr() for name, value in shadow.buffers.items()
+    }
+
+
+def test_live_batch33_rejects_before_capture_or_owner_mutation():
+    shadow = b5.B5NativeDenseShadow.__new__(b5.B5NativeDenseShadow)
+    shadow.shape = b5.B5ShadowShape(batch=64)
+    shadow.slots, shadow.pending = 2, None
+    shadow.entries = {}
+    b = SimpleNamespace(
+        reqs=[object() for _ in range(33)], seq_lens=torch.ones(33), spec_pdmux_slot=0
+    )
+    # begin must reject before touching any backend or capture state.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        with pytest.raises(AssertionError, match="batch32"):
+            shadow.begin(None, b, 0)
+    assert shadow.pending is None and not shadow.entries
 
 
 def test_generic_hook_is_noop_and_does_not_alias_or_modify_evidence():
@@ -385,7 +473,7 @@ def test_b5_fixture_matches_unique_live_seams_and_compiles():
     config = PatchConfig(
         **yaml.safe_load((ROOT / "test/manual/gdn_compact_shadow_b5.yaml").read_text())
     )
-    assert len(config.patches) == 14
+    assert len(config.patches) == 15
     for spec in config.patches:
         module, cls, fn = spec.target.rsplit(".", 2)
         path = ROOT / "python" / Path(*module.split(".")).with_suffix(".py")
@@ -406,3 +494,67 @@ def test_b5_fixture_matches_unique_live_seams_and_compiles():
         compile(patched, str(path), "exec")
         with pytest.raises(PatchApplicationError):
             apply_edits(source="def unmatched(): pass", edits=spec.edits)
+
+
+def test_source_patcher_only_guard_never_initializes_or_retires_a_manager():
+    config = PatchConfig(
+        **yaml.safe_load((ROOT / "test/manual/gdn_compact_shadow_b5.yaml").read_text())
+    )
+    spec = config.patches[0]
+    assert spec.target.endswith("._Dumper.register_non_intrusive_dumper")
+    source = (ROOT / "python/sglang/srt/debug_utils/dumper.py").read_text()
+    owner = next(
+        n
+        for n in ast.parse(source).body
+        if isinstance(n, ast.ClassDef) and n.name == "_Dumper"
+    )
+    node = next(
+        n
+        for n in owner.body
+        if isinstance(n, ast.FunctionDef) and n.name == "register_non_intrusive_dumper"
+    )
+    patched = textwrap.dedent(
+        apply_edits(source=ast.get_source_segment(source, node), edits=spec.edits)
+    )
+    namespace = {}
+    exec(
+        compile(
+            "from __future__ import annotations\n" + patched, "<B5 fixture>", "exec"
+        ),
+        namespace,
+    )
+    register = namespace["register_non_intrusive_dumper"]
+
+    class ForbiddenManager:
+        @property
+        def _http_manager(self):
+            raise AssertionError("manager access would initialize pre-pool CUDA/RPC")
+
+    def fixture(**changes):
+        obj = ForbiddenManager()
+        obj._config = SimpleNamespace(
+            **dict(
+                dict(
+                    enable=False, non_intrusive_mode="off", server_port_parsed="reuse"
+                ),
+                **changes,
+            )
+        )
+        return obj
+
+    obj = fixture()
+    assert register(obj, object()) is None
+    assert obj.__dict__["_http_manager"] is None
+    for changes in (
+        dict(enable=True),
+        dict(non_intrusive_mode="all"),
+        dict(server_port_parsed=None),
+    ):
+        with pytest.raises(ValueError, match="source-patcher-only"):
+            register(fixture(**changes), object())
+    obj = fixture()
+    active = object()
+    obj.__dict__["_http_manager"] = active
+    with pytest.raises(RuntimeError, match="cannot retire"):
+        register(obj, object())
+    assert obj.__dict__["_http_manager"] is active

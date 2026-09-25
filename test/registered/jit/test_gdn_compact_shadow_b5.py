@@ -40,6 +40,15 @@ def test_b5_shadow_native_graph_induction_two_layer_component(slots):
     capacity, active = 32 * slots, 32
     s = B5ShadowShape(layers=2, batch=capacity)
     shadow = B5NativeDenseShadow(s, {0: 0, 2: 1}, "cuda", slots=slots)
+    assert s.batch == capacity and s.live_rows == active
+    assert shadow.buffers["base"].shape[1] == active
+    assert shadow.buffers["dense"].shape[0] == active
+    assert shadow.buffers["expected"].shape[0] == active
+    assert shadow.buffers["actual"].shape[0] == active
+    assert shadow.buffers["q"].shape[2] == capacity * 8
+    assert shadow.buffers["output"].shape[2] == capacity * 8
+    assert shadow.buffers["indices"].shape[1] == capacity
+    assert shadow.buffers["cu_seqlens"].shape[1] == capacity + 1
     states = SimpleNamespace(
         temporal=torch.randn(
             s.layers, capacity + 1, s.value_heads, 128, 128, device="cuda"
@@ -191,6 +200,10 @@ def test_b5_shadow_native_graph_induction_two_layer_component(slots):
 
     for slot, group in enumerate(groups):
         shadow.prefill(make_batch(group, slot))
+    if slots == 2:
+        with pytest.raises(AssertionError, match="batch32"):
+            shadow.begin(backend, make_batch(groups[0] + groups[1][:1], 0), 0)
+        assert shadow.pending is None and not shadow.entries
     addresses = {name: value.data_ptr() for name, value in shadow.buffers.items()}
     for iteration in range(3):
         for slot in (range(slots) if iteration % 2 == 0 else reversed(range(slots))):
@@ -247,6 +260,10 @@ def test_b5_shadow_native_graph_induction_two_layer_component(slots):
     assert result["physical_row_reuses"] == 1
     assert result["rejected_suffix_tokens"] > 0
     assert result["diagnostic_cpu_persistent_bytes"] == s.cpu_oracle_capacity_bytes()
+    assert len(shadow.entries) == capacity
+    assert result["diagnostic_live_rows"] == active
+    assert result["diagnostic_graph_capacity"] == capacity
+    assert result["diagnostic_request_owner_capacity"] == capacity
     assert (result["opposite_slot_layer_states_checked"] > 0) == (slots == 2)
     assert addresses == {
         name: value.data_ptr() for name, value in shadow.buffers.items()

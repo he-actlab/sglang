@@ -144,10 +144,15 @@ class NativeDenseShadow:
         buf["indices"][i, :n].copy_(indices[:n])
         buf["cu_seqlens"][i, : n + 1].copy_(cu[: n + 1])
         torch.clamp(indices[:n], min=0, out=buf["normalized_indices"][:n])
-        torch.index_select(
-            states, 0, buf["normalized_indices"][:n], out=buf["base"][i, :n]
-        )
+        self._capture_base(states, i, n)
         buf["epochs"][i, 0].add_(1)
+
+    def _capture_base(self, states, layer_index, n):
+        """Copy the same-input initial state; default keeps every graph row."""
+        buf = self.buffers
+        torch.index_select(
+            states, 0, buf["normalized_indices"][:n], out=buf["base"][layer_index, :n]
+        )
 
     def output(self, layer_id, output):
         i = self.layer_map[layer_id]
