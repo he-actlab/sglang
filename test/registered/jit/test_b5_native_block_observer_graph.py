@@ -167,10 +167,28 @@ def test_b5_two32_payloads_preserve_native_fence_and_delayed_readback(monkeypatc
     graph = _capture_on(large, lambda: scratch.copy_(source))
     small.wait_stream(torch.cuda.current_stream())
     payloads = []
-    # Warm the actual mailbox operations before testing delayed readiness.
-    s.mailboxes[0][:9].copy_(
-        torch.zeros(9, dtype=torch.int64, device="cuda"), non_blocking=True
-    )
+    # Warm the complete publication path, not just its D2H copy: first-use
+    # reductions/stack/event allocation must precede the pending-event check.
+    # This disposable B32 ticket has the same two checks and eight counts.
+    warm = s.ledger.begin(0, requests(0))
+    warm.mailbox_index = s.free.pop(0)
+    with torch.cuda.stream(small):
+        warm.native_locations = torch.arange(1, 257, device="cuda").reshape(32, 8)
+        warm.snapshots.update(
+            hidden=source.clone(),
+            committed=(torch.arange(32, device="cuda") % 8 + 1).int(),
+        )
+        warm.checks = [
+            obs.different(source, warm.snapshots["hidden"]).long() for _ in range(2)
+        ]
+        warm.layers = set(range(6))  # Synthetic markers, not KV computation.
+        obs.finish_append(0)
+    warm.event.synchronize()
+    s.poll()
+    assert s.stats["completed"] == 1 and not s.inflight and s.retained() == 0
+    # Warmup must not contribute to the two-slot ownership/count assertions.
+    s = obs.Session("cuda", 2, [32, 64])
+    monkeypatch.setattr(obs, "_session", s)
     torch.cuda.current_stream().synchronize()
     for slot in (0, 1):
         t = s.ledger.begin(slot, requests(slot))
