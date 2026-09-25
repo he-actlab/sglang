@@ -170,6 +170,10 @@ class NativeDenseShadow:
             allocator_reserved_peak_bytes=torch.cuda.max_memory_reserved(self.device),
         )
 
+    def _after_layer_check(self, layer_index, expected):
+        """Optional diagnostic consumer of the independently computed commit."""
+        pass
+
     def check(self, backend, steps, track_indices, track_steps):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("dense shadow commit must be outside CUDA graph capture")
@@ -266,6 +270,7 @@ class NativeDenseShadow:
                         buf["dense"][row, step],
                         f"layer {i} tracked state",
                     )
+                self._after_layer_check(i, buf["expected"][:n])
                 del dense_output
         except AssertionError as exc:
             self.stats["mismatches"] += 1

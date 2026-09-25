@@ -1,0 +1,49 @@
+# B5-only correctness diagnostic. Supplemental CPU expected-state mirrors are
+# NOT serving offload; native allocation/caps/state/graphs remain unchanged.
+# DUMPER_ENABLE=false DUMPER_SERVER_PORT=reuse DUMPER_NON_INTRUSIVE_MODE=off
+# DUMPER_SOURCE_PATCHER_CONFIG=<this file>. Never a performance measurement.
+patches:
+  - target: sglang.srt.debug_utils.dumper._Dumper.apply_source_patches
+    edits:
+      - match: config_path = self._config.source_patcher_config
+        replacement: return
+  - target: sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs
+    preamble: from sglang.srt.debug_utils.gdn_compact_shadow_b5 import initialize
+    edits:
+      - match: self.eager_runner = EagerRunner(self)
+        prepend: initialize(self)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2.forward_batch_generation
+    preamble: from sglang.srt.debug_utils.gdn_compact_shadow_b5 import worker_shadow
+    edits:
+      - match: batch_output.new_seq_lens = batch.seq_lens
+        append: worker_shadow(self).prefill(batch)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._verify_block
+    preamble: from sglang.srt.debug_utils.gdn_compact_shadow_b5 import worker_shadow
+    edits:
+      - match: 'with spec_stage_span("verify"):'
+        prepend: worker_shadow(self).begin(self.target_worker.model_runner.attn_backend.linear_attn_backend, batch, slot)
+      - match: can_run_cuda_graph = target_out.can_run_cuda_graph
+        append: worker_shadow(self).replay(can_run_cuda_graph)
+      - match: return result
+        prepend: worker_shadow(self).end()
+  - target: sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend.forward_extend
+    preamble: from sglang.srt.debug_utils.gdn_compact_shadow import capture, output
+    edits:
+      - match: mixed_qkv_processed = causal_conv1d_update(
+        prepend: self._native_dense_shadow.capture_conv(layer, mixed_qkv_reshaped, conv_states, cache_indices)
+      - match: core_attn_out = self.kernel_dispatcher.target_verify(
+        prepend: capture(self, layer, query, key, value, a, b, ssm_states, cache_indices, query_start_loc, retrieve_parent_token)
+      - match: return core_attn_out
+        prepend: |
+          if is_target_verify:
+              output(self, layer.layer_id, core_attn_out)
+  - target: sglang.srt.layers.attention.hybrid_linear_attn_backend.HybridLinearAttnBackend.update_mamba_state_after_mtp_verify
+    preamble: from sglang.srt.debug_utils.gdn_compact_shadow import check
+    edits:
+      - match: '# Track indices used for tracking mamba states for prefix cache'
+        prepend: check(self.linear_attn_backend, last_correct_step_indices, mamba_track_indices, mamba_steps_to_track)
+  - target: sglang.srt.managers.scheduler.Scheduler.get_internal_state
+    preamble: from sglang.srt.debug_utils.gdn_compact_shadow_b5 import snapshot
+    edits:
+      - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        append: ret["gdn_compact_shadow_b5"] = snapshot()
