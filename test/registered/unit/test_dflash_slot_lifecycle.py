@@ -2,14 +2,18 @@
 
 import unittest
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers import overlap_utils
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative import dflash_worker_v2 as native
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -33,8 +37,13 @@ class _Event:
     def __init__(self, device, index):
         self.device, self.index = device, index
 
-    def record(self, stream):
+    def record(self, stream=None):
+        if stream is None:
+            stream = self.device.active
         self.device.log.append((stream.name, "record", self.index))
+
+    def wait(self):
+        self.device.current_stream().wait_event(self)
 
 
 class _Device:
@@ -68,7 +77,7 @@ class DFlashSlotLifecycleTests(unittest.TestCase):
         self.device = _Device()
         self.worker = native.DFlashWorkerV2.__new__(native.DFlashWorkerV2)
         self.worker.server_args = SimpleNamespace(
-            enable_spec_pdmux=True, spec_pdmux_slots=2
+            enable_spec_pdmux=True, spec_pdmux_slots=2, speculative_algorithm="DFLASH"
         )
         self.worker.device = "cpu"
         self.worker.block_size = 8
@@ -522,6 +531,109 @@ class DFlashSlotLifecycleTests(unittest.TestCase):
         self.assertFalse(self.worker.spec_pdmux_has_pending_extend(0))
         self.assertEqual(result.next_token_ids.numel(), 0)
         self.assertEqual(self.device.log[-1], ("large", "wait_event", 2))
+
+    def test_actual_future_map_relay_and_gather_keep_two32_slots_disjoint(self):
+        # Exercise native Scheduler -> RelayPayload -> FutureMap stores and
+        # DFlash filter/gather methods, not a replacement relay implementation.
+        # Only device events/record_stream are simulated; tensors are real CPU
+        # buffers. This is not a CUDA concurrency or full-model parity gate.
+        with (
+            patch.object(overlap_utils, "_is_cuda", False),
+            patch.object(overlap_utils, "_DEBUG_ASSERT", False),
+            patch(
+                "sglang.srt.server_args.get_global_server_args",
+                return_value=self.worker.server_args,
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.get_global_server_args",
+                return_value=self.worker.server_args,
+            ),
+            patch.object(torch.Tensor, "record_stream"),
+        ):
+            relay = overlap_utils.FutureMap(
+                device=torch.device("cpu"),
+                spec_algo=SpeculativeAlgorithm.DFLASH,
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.zeros((65, 128), dtype=torch.int32)
+                ),
+            )
+            relay.output_tokens_buf.fill_(-1)
+            relay.new_seq_lens_buf.zero_()
+            scheduler = SimpleNamespace(
+                spec_algorithm=SpeculativeAlgorithm.DFLASH, future_map=relay
+            )
+            rows = [torch.arange(1, 33), torch.arange(33, 65)]
+            results = [self.result(offset=0), self.result(offset=100)]
+            for slot in (0, 1):
+                relay.active_slot = slot
+                relay.publish(rows[slot], results[slot].new_seq_lens)
+                self.defer(
+                    slot,
+                    result=results[slot],
+                    on_relay=partial(
+                        Scheduler._relay_forward_payload, scheduler, rows[slot]
+                    ),
+                )
+                # Scheduler filtering/CPU processing may rebind the public
+                # result after deferral; the queued relay must retain its data.
+                results[slot].next_draft_input.bonus_tokens = torch.full((32,), -99)
+
+            self.worker.flush_spec_pdmux_pending(0)
+            torch.testing.assert_close(
+                relay.output_tokens_buf[rows[0]], torch.arange(32)
+            )
+            self.assertTrue(torch.all(relay.output_tokens_buf[rows[1]] == -1))
+            self.assertFalse(relay.need_topk)
+            self.assertFalse(relay.need_hidden_states)
+
+            draft_input = results[0].next_draft_input
+            draft_input.future_indices = rows[0]
+            draft_input.filter_batch(torch.arange(31, -1, -1))
+            batch = SimpleNamespace(
+                spec_info=draft_input,
+                req_pool_indices=draft_input.future_indices,
+                prefill_input_ids_cpu=None,
+                input_ids=None,
+                enable_overlap=True,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            )
+            relay.active_slot = 0
+            relay.resolve_seq_lens_cpu(batch)
+            with self.device.stream(self.device.small):
+                overlap_utils.resolve_forward_inputs(batch, relay)
+            torch.testing.assert_close(
+                draft_input.bonus_tokens, torch.arange(31, -1, -1)
+            )
+            torch.testing.assert_close(batch.seq_lens, torch.arange(31, -1, -1) + 10)
+            self.assertEqual(batch.seq_lens_sum, int(batch.seq_lens.sum()))
+
+            self.worker.flush_spec_pdmux_pending(1)
+            torch.testing.assert_close(
+                relay.output_tokens_buf[rows[1]], torch.arange(32) + 100
+            )
+            torch.testing.assert_close(
+                relay.output_tokens_buf[rows[0]], torch.arange(32)
+            )
+
+    def test_actual_scheduler_preparation_flushes_before_retraction(self):
+        self.defer(0)
+        batch = SimpleNamespace(is_empty=lambda: False)
+
+        def update_running_batch(value):
+            self.assertFalse(self.worker.spec_pdmux_has_pending_extend(0))
+            self.assertIn(("small", "relay", 0), self.device.log)
+            self.device.log.append(("schedule", "filter_retract_allocate"))
+            return value
+
+        scheduler = SimpleNamespace(
+            model_worker=self.worker,
+            spec_pdmux_slots=[batch, None],
+            update_running_batch=update_running_batch,
+            _refresh_spec_pdmux_union=lambda: None,
+        )
+        self.assertIs(Scheduler._spec_pdmux_prepare_slot(scheduler, 0), batch)
+        self.assertEqual(batch.spec_pdmux_slot, 0)
+        self.assertEqual(self.device.log[-1], ("schedule", "filter_retract_allocate"))
 
 
 if __name__ == "__main__":
