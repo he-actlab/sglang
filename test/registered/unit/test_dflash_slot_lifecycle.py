@@ -339,7 +339,7 @@ class DFlashSlotLifecycleTests(unittest.TestCase):
             [("large", "wait_event", 3), ("small", "wait_event", 3)],
         )
 
-    def verify(self, bs, *, slot):
+    def verify(self, bs, *, slot, host=True, reserved=False):
         tokens = torch.arange(8).expand(bs, 8).clone()
         target_predict = torch.cat((tokens[:, 1:], torch.full((bs, 1), 9)), dim=1)
         for row in range(bs):
@@ -371,7 +371,7 @@ class DFlashSlotLifecycleTests(unittest.TestCase):
         seq_lens = torch.arange(bs, dtype=torch.int64) + 10
         batch = SimpleNamespace(
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens.clone(),
+            seq_lens_cpu=seq_lens.clone() if host else None,
             seq_lens_sum=int(seq_lens.sum()),
             sampling_info=None,
         )
@@ -384,10 +384,29 @@ class DFlashSlotLifecycleTests(unittest.TestCase):
         draft_input = self.worker._make_next_draft_input_decode(
             bonus_tokens=tokens[:, 0], new_seq_lens=seq_lens
         )
+        original_host = batch.seq_lens_cpu
+        if reserved:
+            draft_input.reserved_seq_lens_cpu = seq_lens + 16
+            draft_input.reserved_seq_lens_sum = int(
+                draft_input.reserved_seq_lens_cpu.sum()
+            )
+
+        def prepare(verify_input, batch, target):
+            self.assertEqual(verify_input.draft_token_num, 8)
+            self.assertIs(verify_input.seq_lens_cpu_is_exact, host)
+            expected = seq_lens if host else draft_input.reserved_seq_lens_cpu
+            if expected is None:
+                self.assertIsNone(batch.seq_lens_cpu)
+            else:
+                torch.testing.assert_close(batch.seq_lens_cpu, expected)
+                self.assertEqual(batch.seq_lens_sum, int(expected.sum()))
+            return object(), True
+
         with patch.object(
             native.DFlashVerifyInput,
             "prepare_for_verify",
-            return_value=(object(), True),
+            autospec=True,
+            side_effect=prepare,
         ):
             result = self.worker._verify_block(
                 batch,
@@ -401,7 +420,14 @@ class DFlashSlotLifecycleTests(unittest.TestCase):
                     ("small", "relay", slot)
                 ),
             )
+        self.assertIs(batch.seq_lens_cpu, original_host)
         return result, hidden
+
+    def test_verify_marks_reserved_or_missing_host_prefix(self):
+        for reserved in (False, True):
+            with self.subTest(reserved=reserved):
+                self.verify(32, slot=0, host=False, reserved=reserved)
+                self.worker.flush_spec_pdmux_pending(0)
 
     def test_native_block8_acceptance_and_commit_before_publication_batch32(self):
         result, hidden = self.verify(32, slot=0)

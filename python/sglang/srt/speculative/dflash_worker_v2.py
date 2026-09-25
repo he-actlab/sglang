@@ -1757,6 +1757,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+        self._draft_block_spec_info.seq_lens_cpu_is_exact = True
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
@@ -1794,16 +1795,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
             # Non-windowed path uses the shared overallocated mapping directly.
-            # Backend planning only needs a safe upper bound for the committed
-            # prefix lengths, not the full allocator reservation length.
+            # Keep the host prefix identical to the device prefix. Attention
+            # metadata adds the current block once, including graph padding.
             draft_seq_lens = prefix_lens
             if batch.seq_lens_cpu is not None:
-                # Host bound = committed prefix + one verify block.
                 seq_lens_cpu.copy_(batch.seq_lens_cpu)
-                seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
             elif draft_input.reserved_seq_lens_cpu is not None:
-                # GPU-only backend: reserved is a safe over-estimate.
+                # GPU-only backend allocation bound, not an exact host prefix.
+                self._draft_block_spec_info.seq_lens_cpu_is_exact = False
                 seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
                 draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
             else:
@@ -1880,6 +1880,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_token_num=int(self.block_size),
                 custom_mask=custom_mask,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_cpu_is_exact=batch.seq_lens_cpu is not None,
             )
 
             batch.out_cache_loc = verify_out_cache_loc
@@ -1894,12 +1895,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             seq_lens_cpu_backup = batch.seq_lens_cpu
             seq_lens_sum_backup = batch.seq_lens_sum
-            if seq_lens_cpu_backup is not None:
-                # Verify host bound = committed prefix + one verify block (matches draft).
-                verify_host_seq_lens = seq_lens_cpu_backup + block_size
-                batch.seq_lens_cpu = verify_host_seq_lens
-                batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
+            # FlashInfer consumes the exact prefix, then adds the verify width.
+            # Keep a GPU-only reservation bound explicitly marked as nonexact.
+            if (
+                seq_lens_cpu_backup is None
+                and draft_input.reserved_seq_lens_cpu is not None
+            ):
                 batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
                 batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 

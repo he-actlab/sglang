@@ -2991,11 +2991,11 @@ class FlashInferIndicesUpdaterPrefill:
         if (
             uses_fast_prefill
             and spec_info is not None
-            # EAGLE_VERIFY only: the host layout below replicates
-            # EagleVerifyInput.generate_attn_arg_prefill (dtn-strided qo,
-            # kv = seq + dtn). Other verify types (DFLASH/NGRAM) have their
-            # own layouts and are not spec-pdmux configs anyway.
-            and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            # Both generators use dtn-strided qo and kv = prefix + dtn.
+            # Native DFlash/DSpark workers carry prefix-only host lengths,
+            # matching capture and the graph registry's padded sentinel rows.
+            and spec_info.spec_input_type
+            in (SpecInputType.EAGLE_VERIFY, SpecInputType.DFLASH_VERIFY)
         ):
             # spec-pdmux M2.6: sync-free TARGET_VERIFY plan. Upstream plan()
             # costs two full large-stream drains per decode tick (segment_
@@ -3015,6 +3015,10 @@ class FlashInferIndicesUpdaterPrefill:
             assert (
                 seq_lens_cpu is not None
             ), "fast_prefill_plan verify replay requires host-known seq_lens_cpu"
+            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+                assert (
+                    spec_info.seq_lens_cpu_is_exact
+                ), "fast_prefill_plan native verify requires an exact host prefix, not an allocator reservation bound"
             dtn = spec_info.draft_token_num
             assert dtn is not None and dtn > 0
             kv_lens_host_i64 = seq_lens_cpu.to(torch.int64) + dtn

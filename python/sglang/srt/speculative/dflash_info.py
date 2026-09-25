@@ -41,6 +41,11 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
+    # Native graph planning uses the exact committed prefix on host, matching
+    # ForwardBatch.seq_lens. GPU-only backends may instead carry an allocator
+    # reservation bound; that bound must not drive FlashInfer's exact fast plan.
+    seq_lens_cpu_is_exact: bool = True
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
@@ -69,6 +74,8 @@ class DFlashVerifyInput(SpecInput):
             else ForwardMode.TARGET_VERIFY
         )
         batch.capture_hidden_mode = self.capture_hidden_mode
+        if batch.seq_lens_cpu is None:
+            self.seq_lens_cpu_is_exact = False
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         can_run_cuda_graph = bool(

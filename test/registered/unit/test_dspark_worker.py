@@ -261,18 +261,79 @@ def test_batch32_native_head_wiring_and_seven_backbone_positions(worker, can_run
 @pytest.mark.parametrize(
     "host,reserved", [(True, False), (False, True), (False, False)]
 )
-def test_draft_planning_uses_seven_position_bound_without_changing_prefix(
+def test_draft_planning_uses_exact_prefix_or_marks_reserved_bound(
     worker, host, reserved
 ):
     batch, draft_input = _batch(worker, bs=3, host=host, reserved=reserved)
     original = batch.seq_lens.clone()
     worker._draft_block(batch, draft_input)
     forward = worker.draft_model_runner.calls[-1]
-    expected = original + (7 if host else 16 if reserved else 0)
+    expected = original + (16 if reserved and not host else 0)
     torch.testing.assert_close(forward.seq_lens_cpu.to(torch.int64), expected)
     assert forward.seq_lens_sum == int(expected.sum())
+    assert forward.spec_info.seq_lens_cpu_is_exact is (host or not reserved)
     torch.testing.assert_close(forward.seq_lens, original)
     torch.testing.assert_close(batch.seq_lens, original)
+
+
+def test_reserved_only_flag_does_not_leak_into_next_exact_draft(worker):
+    batch, draft_input = _batch(worker, bs=3, host=False, reserved=True)
+    worker._draft_block(batch, draft_input)
+    assert not worker._draft_block_spec_info.seq_lens_cpu_is_exact
+    batch, draft_input = _batch(worker, bs=3)
+    worker._draft_block(batch, draft_input)
+    assert worker._draft_block_spec_info.seq_lens_cpu_is_exact
+    torch.testing.assert_close(
+        worker.draft_model_runner.calls[-1].seq_lens_cpu, batch.seq_lens_cpu
+    )
+
+
+@pytest.mark.parametrize(
+    "host,reserved,compact",
+    [
+        (True, False, False),
+        (False, True, False),
+        (False, False, False),
+        (True, False, True),
+    ],
+)
+def test_shared_dflash_draft8_produces_prefix_only_metadata(
+    worker, host, reserved, compact
+):
+    # Invoke the real DFlash draft implementation using the tiny CPU worker
+    # fixture. Token allocation kernels are replaced; no attention is run.
+    batch, draft_input = _batch(worker, bs=3, host=host, reserved=reserved)
+    worker.target_worker.model_runner.model = SimpleNamespace(
+        get_input_embeddings=worker.draft_model.get_input_embeddings,
+        lm_head=worker.draft_model.lm_head,
+    )
+    worker._draft_block_spec_info.draft_token_num = 8
+    worker.draft_num_tokens = 8
+    worker.use_compact_draft_cache = compact
+    worker.draft_window_size = 6 if compact else None
+    worker._use_triton_prepare_block = False
+    worker._draft_sampler = None
+    worker.draft_model_runner.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.zeros(64, 64, dtype=torch.int64)
+    )
+
+    def cache_locs(**kwargs):
+        return torch.arange(3 * 8)
+
+    with patch.object(
+        shared, "assign_extend_cache_locs_func", side_effect=cache_locs
+    ), patch.object(shared, "assign_req_to_token_pool_func"):
+        shared.DFlashWorkerV2._draft_block(worker, batch, draft_input)
+    forward = worker.draft_model_runner.calls[-1]
+    expected_prefix = (
+        torch.minimum(batch.seq_lens, torch.tensor(6)) if compact else batch.seq_lens
+    )
+    expected_host = expected_prefix + (16 if reserved and not host else 0)
+    torch.testing.assert_close(forward.seq_lens.to(torch.int64), expected_prefix)
+    torch.testing.assert_close(forward.seq_lens_cpu.to(torch.int64), expected_host)
+    assert forward.seq_lens_sum == int(expected_host.sum())
+    assert forward.spec_info.draft_token_num == 8
+    assert forward.spec_info.seq_lens_cpu_is_exact is (compact or host or not reserved)
 
 
 def test_owned_slot_blocks_survive_scratch_and_row_reuse(worker):

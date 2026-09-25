@@ -139,14 +139,15 @@ class DSparkWorkerV2(DFlashWorkerV2):
         block_ids[:, 0].copy_(draft_input.bonus_tokens)
         noise_embedding = self.draft_model.get_input_embeddings()(block_ids)
 
-        # As in the shared block worker, host planning may use a conservative
-        # committed-prefix bound. The actual device prefix remains unchanged.
+        # Host and device lengths both describe the committed prefix; native
+        # attention metadata adds this seven-position block exactly once.
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+        self._draft_block_spec_info.seq_lens_cpu_is_exact = True
         if batch.seq_lens_cpu is not None:
             seq_lens_cpu.copy_(batch.seq_lens_cpu)
-            seq_lens_cpu.add_(draft_width)
             seq_lens_sum = int(seq_lens_cpu.sum())
         elif draft_input.reserved_seq_lens_cpu is not None:
+            self._draft_block_spec_info.seq_lens_cpu_is_exact = False
             seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
             seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
         else:
