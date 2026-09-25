@@ -7096,6 +7096,39 @@ class ServerArgs:
             self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
         return self._mamba_cache_chunk_size
 
+    def _check_dflash_spec_partition(self):
+        # The native DFlash worker has a separate two-slot protocol, not the
+        # EAGLE multi-slot tree/duplicate-TP path. Keep its initial supported
+        # envelope explicit. Ordinary full-chip DFlash remains unchanged.
+        if self.speculative_algorithm.upper() != "DFLASH":
+            return
+        if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+            raise AssertionError(
+                "Partitioned DFLASH does not support SGLANG_ENABLE_OVERLAP_PLAN_STREAM; "
+                "native verify preparation must remain on its owning stream."
+            )
+        if (
+            self.tp_size != 1
+            or self.dp_size != 1
+            or self.spec_pdmux_slots != 2
+            or self.page_size != 1
+            or not self.disable_radix_cache
+            or self.speculative_adaptive
+            or self.speculative_use_rejection_sampling
+            or self.spec_pdmux_draft_mode != "shard"
+            or (
+                self.speculative_num_steps,
+                self.speculative_eagle_topk,
+                self.speculative_num_draft_tokens,
+            )
+            != (1, 1, 8)
+        ):
+            raise AssertionError(
+                "Partitioned DFLASH requires TP1/DP1, two slots, page1, cache off, "
+                "fixed native block8 (steps1/topk1), sharded draft mode and "
+                "no rejection sampling."
+            )
+
     def _check_spec_sm_partition(self):
         # Baseline 2: SM partitioning WITHOUT the co-location slot pool. Stock
         # scheduling is inherited by construction -- every slot/ping-pong/
@@ -7121,10 +7154,15 @@ class ServerArgs:
                     "--enable-spec-sm-partition requires a speculative algorithm."
                 )
             # The drafter reaches the SMALL partition through
-            # EAGLEWorkerV2._draft_stream_region; only workers deriving from it
-            # have that region, so anything else would silently run the whole
-            # forward on LARGE and quietly produce a non-partitioned "control".
-            _spec_sm_partition_supported_algos = ("EAGLE", "EAGLE3", "STANDALONE")
+            # each supported worker's _draft_stream_region; anything else
+            # would run the whole forward on LARGE and quietly produce a
+            # non-partitioned "control".
+            _spec_sm_partition_supported_algos = (
+                "EAGLE",
+                "EAGLE3",
+                "STANDALONE",
+                "DFLASH",
+            )
             if (
                 self.speculative_algorithm.upper()
                 not in _spec_sm_partition_supported_algos
@@ -7135,6 +7173,7 @@ class ServerArgs:
                     "drafter inside _draft_stream_region). Got: "
                     f"{self.speculative_algorithm}."
                 )
+            ServerArgs._check_dflash_spec_partition(self)
             if self.enable_multi_layer_eagle:
                 raise AssertionError(
                     "--enable-spec-sm-partition is incompatible with "
@@ -7274,10 +7313,15 @@ class ServerArgs:
             # spec_pdmux_invalidate_ready_draft / flush_spec_pdmux_pending).
             # Only workers that implement it are supported; any other
             # algorithm passes startup and dies with AttributeError on its
-            # first decode tick (NGRAM/DFLASH/multi-layer), or inherits the
+            # first decode tick (NGRAM/multi-layer), or inherits the
             # methods without maintaining the slot state (FROZEN_KV_MTP —
             # unvalidated). Reject at startup instead.
-            _spec_pdmux_supported_algos = ("EAGLE", "EAGLE3", "STANDALONE")
+            _spec_pdmux_supported_algos = (
+                "EAGLE",
+                "EAGLE3",
+                "STANDALONE",
+                "DFLASH",
+            )
             if self.speculative_algorithm.upper() not in _spec_pdmux_supported_algos:
                 raise AssertionError(
                     "--enable-spec-pdmux supports speculative algorithms "
@@ -7285,6 +7329,7 @@ class ServerArgs:
                     "the spec-pdmux slot/pending/relay protocol). Got: "
                     f"{self.speculative_algorithm}."
                 )
+            ServerArgs._check_dflash_spec_partition(self)
             if self.enable_multi_layer_eagle:
                 raise AssertionError(
                     "--enable-spec-pdmux is incompatible with "
