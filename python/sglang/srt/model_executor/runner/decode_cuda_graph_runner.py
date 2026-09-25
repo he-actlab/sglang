@@ -203,8 +203,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Target graphs use LARGE; native DFlash draft graphs also use this
         # runner and must capture on SMALL to match their replay affinity.
         # None retains stock behavior (graph_capture allocates its own stream).
-        is_dflash_draft = (
-            model_runner.is_draft_worker and model_runner.spec_algorithm.is_dflash()
+        is_block_draft = (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.supports_target_verify_for_draft()
         )
         self.capture_stream_override = None
         from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
@@ -212,7 +213,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if spec_sm_partition_enabled(model_runner.server_args):
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
-            self.capture_stream_override = get_spec_streams()[1 if is_dflash_draft else 0]
+            self.capture_stream_override = get_spec_streams()[
+                1 if is_block_draft else 0
+            ]
             logger.info(
                 "[%s] %s: graph capture on %s green-ctx stream",
                 (
@@ -221,7 +224,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else "spec-sm-partition"
                 ),
                 type(self).__name__,
-                "SMALL" if is_dflash_draft else "LARGE",
+                "SMALL" if is_block_draft else "LARGE",
             )
 
         self.attn_tp_size = get_attention_tp_size()
@@ -354,7 +357,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # the namespace already used by draft eager/Eagle graph runners.
         buffer_namespace = ""
         if (
-            is_dflash_draft
+            is_block_draft
             and model_runner.server_args.enable_spec_pdmux
             and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
         ):
@@ -442,7 +445,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.supports_target_verify_for_draft()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -727,15 +730,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # captures on the full-device stream and is never hinted.
         from sglang.srt.multiplex.pdmux_context import spec_pdmux_sm_hint_capture
 
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc), \
-                spec_pdmux_sm_hint_capture(self.model_runner):
+        with (
+            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            spec_pdmux_sm_hint_capture(self.model_runner),
+        ):
             if not self.enable_pdmux:
                 # capture_stream_override (spec-pdmux): capture on the given
                 # (green-ctx) stream; getattr because EAGLE subclasses set up
                 # their own state without calling our __init__.
-                with graph_capture(
-                    stream=getattr(self, "capture_stream_override", None)
-                ) as graph_capture_context, profile_context as prof:
+                with (
+                    graph_capture(
+                        stream=getattr(self, "capture_stream_override", None)
+                    ) as graph_capture_context,
+                    profile_context as prof,
+                ):
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
@@ -847,7 +855,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash()
+                    self.model_runner.spec_algorithm.supports_target_verify_for_draft()
                     and self.model_runner.is_draft_worker
                     and "input_embeds" in inspect.signature(forward).parameters
                 ):
@@ -874,6 +882,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             "hidden_states to capture into the graph."
                         )
                     dflash_sampler(out.hidden_states)
+                block_sampler = getattr(self.model_runner, "draft_block_sampler", None)
+                if block_sampler is not None:
+                    if dflash_sampler is not None:
+                        raise RuntimeError(
+                            "Draft graph cannot have two proposal samplers."
+                        )
+                    if (
+                        not isinstance(out, LogitsProcessorOutput)
+                        or out.hidden_states is None
+                    ):
+                        raise RuntimeError(
+                            "Native block sampler requires draft hidden states."
+                        )
+                    block_sampler(out.hidden_states, forward_batch)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -941,7 +963,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                self.model_runner.spec_algorithm.supports_target_verify_for_draft()
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
@@ -967,7 +989,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.supports_target_verify_for_draft()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -984,7 +1006,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         if (
-            self.model_runner.spec_algorithm.is_dflash()
+            self.model_runner.spec_algorithm.supports_target_verify_for_draft()
             and self.model_runner.is_draft_worker
             and forward_batch.input_embeds is not None
         ):
@@ -1049,7 +1071,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
             if forward_batch.forward_mode.is_decode() or (
                 forward_batch.forward_mode.is_target_verify()
-                and self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.spec_algorithm.supports_target_verify_for_draft()
             ):
                 read_done = self.device_module.Event()
                 read_done.record()
@@ -1124,7 +1146,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=self.model_runner.dtype,
                     device=self.model_runner.device,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash():
+        elif self.model_runner.spec_algorithm.supports_target_verify_for_draft():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,
@@ -1138,7 +1160,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=self.num_tokens_per_bs,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

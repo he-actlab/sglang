@@ -243,6 +243,63 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_dspark(server_args: ServerArgs) -> None:
+    """Admit the released native block7 path without DFlash's block alias."""
+    if (
+        server_args.tp_size != 1
+        or server_args.pp_size != 1
+        or server_args.dp_size != 1
+        or server_args.enable_dp_attention
+        or server_args.device not in (None, "cuda")
+        or server_args.dtype not in ("auto", "bfloat16")
+        or server_args.quantization is not None
+        or server_args.speculative_draft_model_quantization is not None
+        or server_args.kv_cache_dtype not in ("auto", "bfloat16")
+    ):
+        raise ValueError(
+            "DSPARK currently requires CUDA TP1/PP1/DP1 and native BF16 without quantization."
+        )
+    if (
+        not server_args.disable_radix_cache
+        or server_args.page_size != 1
+        or server_args.speculative_adaptive
+        or server_args.speculative_use_rejection_sampling
+        or server_args.enable_mixed_chunk
+        or server_args.speculative_dflash_block_size is not None
+        or server_args.speculative_draft_window_size is not None
+    ):
+        raise ValueError(
+            "DSPARK requires page1, cache off, full draft context and a fixed native block; DFlash block aliases are not supported."
+        )
+    if server_args.speculative_draft_model_path is None:
+        raise ValueError("DSPARK requires --speculative-draft-model-path.")
+    for field in ("speculative_num_steps", "speculative_eagle_topk"):
+        value = getattr(server_args, field)
+        if value not in (None, 1):
+            raise ValueError(
+                f"DSPARK requires {field}=1, not a sequential draft chain."
+            )
+        setattr(server_args, field, 1)
+
+    from sglang.srt.configs.dspark import parse_dspark_draft_config
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    config = get_config(
+        server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        model_override_args=json.loads(server_args.json_model_override_args),
+    )
+    native = parse_dspark_draft_config(config)
+    if native.block_size != 7:
+        raise ValueError("DSPARK currently supports the native block7 checkpoint.")
+    if server_args.speculative_num_draft_tokens not in (None, native.verify_num_tokens):
+        raise ValueError(
+            "DSPARK block7 requires eight verifier positions: seed plus seven proposals."
+        )
+    server_args.speculative_num_draft_tokens = native.verify_num_tokens
+
+
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48

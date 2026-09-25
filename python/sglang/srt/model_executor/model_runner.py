@@ -518,6 +518,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 draft_num_layers=int(draft_num_layers),
             )
 
+        if self.spec_algorithm.is_dspark() and not self.is_draft_worker:
+            from sglang.srt.configs.dspark import parse_dspark_draft_config
+
+            draft_config = self._build_model_config(
+                server_args,
+                model_path=server_args.speculative_draft_model_path,
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            native = parse_dspark_draft_config(draft_config.hf_config)
+            target_config = self.model_config.hf_text_config
+            if native.num_target_layers != target_config.num_hidden_layers:
+                raise ValueError("DSPARK requires its trained target layer count.")
+            # The shared pool scaler assumes equal KV bytes per attention layer.
+            # Do not silently borrow DFlash's ratio for an incompatible target.
+            for field in (
+                "hidden_size",
+                "vocab_size",
+                "head_dim",
+                "num_key_value_heads",
+            ):
+                if getattr(target_config, field, None) != getattr(
+                    draft_config.hf_config, field, None
+                ):
+                    raise ValueError(f"DSPARK target/draft config.{field} mismatch.")
+            self.dflash_use_aux_hidden_state = True
+            self.dflash_draft_num_layers = native.num_hidden_layers
+            self.dflash_target_layer_ids = list(native.target_layer_ids)
+
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()

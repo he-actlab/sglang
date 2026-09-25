@@ -122,7 +122,7 @@ class TestDFlashPartitionGuard(unittest.TestCase):
             )
 
     def test_unimplemented_workers_and_conflicting_modes_still_fail(self):
-        for algorithm in ("DSPARK", "NGRAM", "FROZEN_KV_MTP"):
+        for algorithm in ("NGRAM", "FROZEN_KV_MTP"):
             with self.assertRaisesRegex(
                 AssertionError, "supports speculative algorithms"
             ):

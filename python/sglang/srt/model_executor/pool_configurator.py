@@ -165,7 +165,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 self._cell_size = int(self._cell_size * (1 + draft_ratio))
 
         # DFLASH: scale cell_size to account for draft model KV cache
-        if mr.spec_algorithm.is_dflash() and not mr.is_draft_worker:
+        if (
+            mr.spec_algorithm.supports_target_verify_for_draft()
+            and not mr.is_draft_worker
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
