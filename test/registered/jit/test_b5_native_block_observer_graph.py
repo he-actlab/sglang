@@ -30,6 +30,37 @@ def requests(slot):
 
 
 @CUDA
+@torch.inference_mode()
+def test_b5_singleton_seed_byte_comparison_cuda_graph_replay():
+    """Actual warmup layout; diagnostic helper only, not full-model proof."""
+    tokens = torch.arange(8, device="cuda", dtype=torch.int64).reshape(1, 8)
+    seed = torch.zeros(1, device="cuda", dtype=torch.int64)
+    mismatch = torch.empty((), device="cuda", dtype=torch.bool)
+    column = tokens[:, 0]
+    assert column.shape == (1,) and column.stride() == (8,)
+    assert column.is_contiguous() and column.contiguous().data_ptr() == column.data_ptr()
+    pointers = [value.data_ptr() for value in (tokens, seed, mismatch)]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = _capture_on(stream, lambda: mismatch.copy_(obs.different(column, seed)))
+    with torch.cuda.stream(stream):
+        graph.replay()
+    stream.synchronize()
+    assert not mismatch.item()
+    with torch.cuda.stream(stream):
+        tokens[0, 0].add_(1)
+        graph.replay()
+    stream.synchronize()
+    assert mismatch.item()
+    with torch.cuda.stream(stream):
+        seed.copy_(column)
+        graph.replay()
+    stream.synchronize()
+    assert not mismatch.item()
+    assert pointers == [value.data_ptr() for value in (tokens, seed, mismatch)]
+
+
+@CUDA
 @pytest.mark.parametrize("slots", [1, 2])
 @torch.inference_mode()
 def test_native_b5_graph_inputs_head_and_owned_two32_banks(slots, monkeypatch):

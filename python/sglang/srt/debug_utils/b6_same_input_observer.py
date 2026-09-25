@@ -30,7 +30,12 @@ _session = None
 def different(a, b):
     if a.shape != b.shape or a.dtype != b.dtype or a.device != b.device:
         raise ValueError("same-input comparison shape/dtype/device changed")
-    return (a.contiguous().view(torch.uint8) != b.contiguous().view(torch.uint8)).any()
+    # Singleton/empty tensors may be contiguous with a nonunit final stride.
+    # Append a unit-stride axis for the byte view, including scalar inputs.
+    return (
+        a.contiguous().unsqueeze(-1).view(torch.uint8)
+        != b.contiguous().unsqueeze(-1).view(torch.uint8)
+    ).any()
 
 
 def disjoint(a, b):

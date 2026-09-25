@@ -546,6 +546,102 @@ def test_byte_comparison_rejects_alias_and_detects_signed_zero():
         obs.independent_storage([x.float()], [])
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bool,
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    ],
+)
+@pytest.mark.parametrize("batch", [0, 1, 2, 32, 64])
+def test_byte_comparison_native_block_seed_column(dtype, batch):
+    tokens = torch.arange(batch * 8).to(dtype).reshape(batch, 8)
+    actual = tokens[:, 0]
+    expected = torch.empty((batch,), dtype=dtype).copy_(actual)
+    before = tokens.clone()
+    assert actual.stride() == (8,)
+    if batch == 1:
+        # PyTorch considers singleton stride8 contiguous and returns it as-is.
+        assert actual.is_contiguous()
+        assert actual.contiguous().data_ptr() == actual.data_ptr()
+    result = obs.different(actual, expected)
+    assert result.shape == () and result.dtype == torch.bool
+    assert not result and not obs.different(expected, actual)
+    if batch:
+        changed = expected.clone()
+        changed[0] = 1
+        assert obs.different(actual, changed)
+        assert obs.different(changed, actual)
+    assert torch.equal(tokens, before)
+    assert actual.stride() == (8,)
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "layout", ["scalar", "transpose", "singleton_matrix", "offset_stride"]
+)
+def test_byte_comparison_scalar_and_noncontiguous_layouts(dtype, layout):
+    base = torch.arange(24).to(dtype).reshape(3, 8)
+    actual = {
+        "scalar": base[1, 2],
+        "transpose": base.t(),
+        "singleton_matrix": base[:1, 0].unsqueeze(0),
+        "offset_stride": base[1:, 1::2],
+    }[layout]
+    expected = torch.empty(actual.shape, dtype=dtype).copy_(actual)
+    assert not obs.different(actual, expected)
+    assert not obs.different(expected, actual)
+    changed = expected.clone()
+    changed.reshape(-1)[0] += 1
+    assert obs.different(actual, changed)
+
+
+@pytest.mark.parametrize(
+    "dtype,bits_dtype,nan_bits",
+    [
+        (torch.float16, torch.int16, 0x7E01),
+        (torch.bfloat16, torch.int16, 0x7FC1),
+        (torch.float32, torch.int32, 0x7FC00001),
+        (torch.float64, torch.int64, 0x7FF8000000000001),
+    ],
+)
+def test_byte_comparison_preserves_nan_payloads_and_signed_zero(
+    dtype, bits_dtype, nan_bits
+):
+    storage = torch.zeros((1, 8), dtype=bits_dtype)
+    storage[0, 0] = nan_bits
+    actual = storage.view(dtype)[:, 0]
+    same = torch.tensor([nan_bits], dtype=bits_dtype).view(dtype)
+    other = torch.tensor([nan_bits + 1], dtype=bits_dtype).view(dtype)
+    assert torch.isnan(actual).all() and torch.isnan(other).all()
+    assert not obs.different(actual, same)
+    assert obs.different(actual, other)
+    assert storage[0, 0] == nan_bits
+    positive = torch.zeros((1, 8), dtype=dtype)[:, 0]
+    negative = torch.tensor([-0.0], dtype=dtype)
+    assert torch.equal(positive, negative)
+    assert obs.different(positive, negative)
+
+
+def test_byte_comparison_shape_dtype_device_guards_remain_strict():
+    value = torch.ones(1, dtype=torch.int64)
+    for other in (
+        torch.ones((1, 1), dtype=value.dtype),
+        value.to(torch.int32),
+        torch.empty(1, dtype=value.dtype, device="meta"),
+    ):
+        with pytest.raises(ValueError, match="shape/dtype/device changed"):
+            obs.different(value, other)
+
+
 def test_acceptance_path_requires_a_bound_worker_boolean():
     s = obs.Session("cpu")
     s.arm = "prior"
