@@ -109,7 +109,9 @@ def _expected(
 
 
 @CUDA
-@pytest.mark.parametrize("lengths", [[7] * 8, [1, 2, 3, 4, 5, 6, 7, 7]])
+@pytest.mark.parametrize(
+    "lengths", [[7] * 8, [1, 2, 3, 4, 5, 6, 7, 7], [8] * 8]
+)
 def test_all_accepted_prefixes_match_dense_bitwise(lengths):
     state, inputs, dense, compact = _case(lengths)
     indices = inputs["initial_state_indices"]
@@ -124,7 +126,7 @@ def test_all_accepted_prefixes_match_dense_bitwise(lengths):
     track_indices = torch.arange(
         len(lengths) + 1, 2 * len(lengths) + 1, dtype=torch.int32, device="cuda"
     )
-    for requested_prefix in range(-1, 7):
+    for requested_prefix in range(-1, max(lengths)):
         accepted = torch.tensor(
             [min(requested_prefix, length - 1) for length in lengths],
             dtype=torch.int32,
@@ -151,9 +153,9 @@ def test_all_accepted_prefixes_match_dense_bitwise(lengths):
 
 
 @CUDA
-@pytest.mark.parametrize("hv,steps", [(32, 7), (48, 7), (32, 5)])
+@pytest.mark.parametrize("hv,steps", [(32, 7), (48, 7), (32, 5), (48, 8)])
 def test_model_head_shapes_at_batch32(hv, steps):
-    # B3 target/draft D7 and the B4 target's native D5 verifier width.
+    # B3 target/draft D7, B4 target D5 and B5 DFlash target block8.
     state, inputs, dense, compact = _case([steps] * 32, layers=1, hv=hv, h=16)
     control = _forward(state, inputs, dense=dense)
     candidate = _forward(state, inputs, compact=compact)
@@ -228,19 +230,22 @@ def test_compact_component_peak_memory(capsys):
 
 
 @CUDA
-def test_two_slot_factor_banks_and_rejected_suffix_isolation():
-    state, inputs, dense, compact = _case([7] * 4)
+@pytest.mark.parametrize("steps", [7, 8])
+def test_two_slot_factor_banks_and_rejected_suffix_isolation(steps):
+    state, inputs, dense, compact = _case([steps] * 4)
     before = state.clone()
     _forward(state, inputs, dense=dense)
     _forward(state, inputs, compact=compact)
     # A second slot has an independent bank. Running it cannot invalidate the
     # first slot's factors or starting states before first-slot acceptance.
-    other_state, other_inputs, _, other_compact = _case([7] * 4, seed=17)
+    other_state, other_inputs, _, other_compact = _case([steps] * 4, seed=17)
     saved_factors = [factor.clone() for factor in compact]
     _forward(other_state, other_inputs, compact=other_compact)
     for factor, saved in zip(compact, saved_factors):
         torch.testing.assert_close(factor, saved, rtol=0, atol=0, equal_nan=True)
-    accepted = torch.tensor([0, 2, 5, 6], dtype=torch.int32, device="cuda")
+    accepted = torch.tensor(
+        [0, 2, steps - 2, steps - 1], dtype=torch.int32, device="cuda"
+    )
     expected = _expected(
         before,
         dense,
@@ -264,10 +269,13 @@ def test_two_slot_factor_banks_and_rejected_suffix_isolation():
 
 
 @CUDA
-def test_static_graph_replay_refreshes_inputs_and_prefix_lengths():
-    state, inputs, dense, compact = _case([7] * 4, layers=1)
+@pytest.mark.parametrize("steps", [7, 8])
+def test_static_graph_replay_refreshes_inputs_and_prefix_lengths(steps):
+    state, inputs, dense, compact = _case([steps] * 4, layers=1)
     before = state.clone()
-    accepted = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device="cuda")
+    accepted = torch.tensor(
+        [0, 2, 4, steps - 1], dtype=torch.int32, device="cuda"
+    )
 
     def candidate():
         out = _forward(state, inputs, compact=compact)
@@ -290,11 +298,13 @@ def test_static_graph_replay_refreshes_inputs_and_prefix_lengths():
     with torch.cuda.graph(graph):
         graph_output = candidate()
     addresses = [t.data_ptr() for t in (state, *compact, accepted)]
-    for seed, steps in [(21, [6, 3, 1, 0]), (22, [1, 5, 2, 4])]:
-        new_state, new_inputs, _, _ = _case([7] * 4, layers=1, seed=seed)
+    for seed, accepted_steps in [
+        (21, [steps - 1, 3, 1, 0]), (22, [1, steps - 2, 2, 4])
+    ]:
+        new_state, new_inputs, _, _ = _case([steps] * 4, layers=1, seed=seed)
         for name in ("q", "k", "v", "a", "b", "A_log", "dt_bias"):
             inputs[name].copy_(new_inputs[name])
-        accepted.copy_(torch.tensor(steps, dtype=torch.int32, device="cuda"))
+        accepted.copy_(torch.tensor(accepted_steps, dtype=torch.int32, device="cuda"))
         state.copy_(new_state)
         control = _forward(new_state, inputs, dense=dense)
         expected = _expected(
