@@ -1,6 +1,9 @@
+import functools
 import logging
 import math
+from contextlib import contextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -32,7 +35,12 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    record_stream_each,
+    spec_pdmux_concurrent_enabled,
+    spec_stage_span,
+)
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -504,12 +512,187 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @functools.cached_property
+    def _spec_pdmux_small_stream(self):
+        from sglang.srt.multiplex.pdmux_context import (
+            get_spec_streams,
+            spec_sm_partition_enabled,
+        )
+
+        if not spec_sm_partition_enabled(self.server_args):
+            return None
+        return get_spec_streams()[1]
+
+    @functools.cached_property
+    def _spec_pdmux_concurrent(self):
+        return spec_pdmux_concurrent_enabled(self.server_args)
+
+    @functools.cached_property
+    def _spec_pdmux_state(self):
+        # DFlash uses the existing two-slot ping-pong scheduler, not the
+        # multi-slot fused EAGLE tree path. Each parked object owns its tensors.
+        if self.server_args.spec_pdmux_slots != 2:
+            raise ValueError("DFLASH co-location requires exactly two slots")
+        return {
+            "ready_draft": [None, None],
+            "pending": [None, None],
+            "flush_done": [None, None],
+        }
+
+    def spec_pdmux_has_ready_draft(self, slot: int) -> bool:
+        return self.server_args.enable_spec_pdmux and (
+            self._spec_pdmux_state["ready_draft"][slot] is not None
+        )
+
+    def spec_pdmux_ready_draft_bs(self, slot: int) -> int:
+        if not self.spec_pdmux_has_ready_draft(slot):
+            return -1
+        return self._spec_pdmux_state["ready_draft"][slot].block.tokens.shape[0]
+
+    def spec_pdmux_invalidate_ready_draft(self, slot: int) -> None:
+        if self.server_args.enable_spec_pdmux:
+            self._spec_pdmux_state["ready_draft"][slot] = None
+
+    def spec_pdmux_has_pending_extend(self, slot: int) -> bool:
+        return self.server_args.enable_spec_pdmux and (
+            self._spec_pdmux_state["pending"][slot] is not None
+        )
+
+    def spec_pdmux_has_prefill_pending(self) -> bool:
+        # Prompt features are materialized before prefill returns, retaining
+        # native DFlash's immediate cache-publication contract.
+        return False
+
+    def flush_spec_pdmux_pending(
+        self, slot: Optional[int] = None, decode_only: bool = False
+    ) -> None:
+        if not self.server_args.enable_spec_pdmux:
+            return
+        state = self._spec_pdmux_state
+        dev = torch.get_device_module(self.device)
+        small = self._spec_pdmux_small_stream
+        for index in (range(2) if slot is None else (slot,)):
+            pending = state["pending"][index]
+            if pending is None:
+                continue
+            # The scheduler flushes before same-slot gathers, retraction,
+            # retirement and prefill. KV and relay writes share SMALL's FIFO.
+            small.wait_event(pending.verify_done)
+            with dev.stream(small), spec_stage_span("draft_extend"):
+                record_stream_each(pending.used_tensors, small)
+                self._append_target_hidden_to_draft_kv_by_loc(**pending.materialize)
+                pending.on_relay(pending.relay_result)
+                done = dev.Event()
+                done.record(small)
+            state["flush_done"][index] = done
+            state["pending"][index] = None
+
+    def _spec_pdmux_join_flush_done(self) -> None:
+        if not self.server_args.enable_spec_pdmux:
+            return
+        current = torch.get_device_module(self.device).current_stream()
+        for event in self._spec_pdmux_state["flush_done"]:
+            if event is not None:
+                current.wait_event(event)
+
+    @contextmanager
+    def _draft_stream_region(self, *, concurrent: bool = False):
+        small = self._spec_pdmux_small_stream
+        if small is None:
+            yield
+            return
+        dev = torch.get_device_module(self.device)
+        current = dev.current_stream()
+        if not concurrent:
+            small.wait_stream(current)
+        try:
+            with dev.stream(small):
+                yield
+        finally:
+            if not concurrent:
+                current.wait_stream(small)
+
+    @contextmanager
+    def _target_prefill_region(self):
+        if not self.server_args.enable_spec_pdmux:
+            yield
+            return
+        from sglang.srt.multiplex.pdmux_context import get_spec_prefill_stream
+
+        self.flush_spec_pdmux_pending()
+        self._spec_pdmux_join_flush_done()
+        dev = torch.get_device_module(self.device)
+        large = dev.current_stream()
+        small = self._spec_pdmux_small_stream
+        prefill = get_spec_prefill_stream()
+        prefill.wait_stream(large)
+        prefill.wait_stream(small)
+        try:
+            with dev.stream(prefill):
+                yield
+        finally:
+            done = dev.Event()
+            done.record(prefill)
+            large.wait_event(done)
+            small.wait_event(done)
+
+    @staticmethod
+    def _make_draft_block(tokens, positions, cache_locs, *, own_outputs):
+        # Native graph/scratch outputs are reused by the next SMALL forward,
+        # while LARGE still needs candidates for acceptance after verification.
+        if own_outputs:
+            tokens = tokens.clone()
+            positions = positions.clone()
+            cache_locs = cache_locs.clone()
+        return SimpleNamespace(
+            tokens=tokens, positions=positions, cache_locs=cache_locs
+        )
+
+    def _defer_draft_materialization(
+        self, *, slot, result, hidden, block, on_relay
+    ) -> None:
+        state = self._spec_pdmux_state
+        if state["pending"][slot] is not None:
+            raise RuntimeError("DFLASH cannot overwrite an unflushed slot")
+        if on_relay is None:
+            raise RuntimeError("DFLASH deferred materialization requires a relay")
+        # Target hidden is a graph output, not owned by the result. Clone it
+        # before the next LARGE replay overwrites it. Freeze the relay shell
+        # too: scheduler D2H/filtering can rebind the public result's fields.
+        materialize = {
+            "target_hidden": hidden.clone(),
+            "cache_loc": block.cache_locs.reshape(-1),
+            "cache_loc_2d": block.cache_locs,
+            "positions": block.positions,
+            "commit_lens": result.accept_lens,
+        }
+        relay_input = self._make_next_draft_input_decode(
+            bonus_tokens=result.next_draft_input.bonus_tokens,
+            new_seq_lens=result.new_seq_lens,
+        )
+        dev = torch.get_device_module(self.device)
+        verify_done = dev.Event()
+        verify_done.record(dev.current_stream())
+        state["pending"][slot] = SimpleNamespace(
+            materialize=materialize,
+            relay_result=SimpleNamespace(next_draft_input=relay_input),
+            on_relay=on_relay,
+            verify_done=verify_done,
+            used_tensors=tuple(materialize.values())
+            + (relay_input.bonus_tokens, relay_input.new_seq_lens),
+        )
+        result.spec_pdmux_relay_deferred = True
+
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
         # sliding-window path, the draft req->token view is rebuilt from committed
-        # target state before each draft forward, so there is nothing persistent
-        # to flush here.
-        pass
+        # target state before each draft forward. Drain deferred writes before
+        # allowing those shared rows to be recycled by a cache reset.
+        if self.server_args.enable_spec_pdmux:
+            self.flush_spec_pdmux_pending()
+            self._spec_pdmux_small_stream.synchronize()
+            for slot in range(2):
+                self.spec_pdmux_invalidate_ready_draft(slot)
 
     def _gather_req_to_token_masked(
         self,
@@ -1264,6 +1447,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        on_relay=None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
@@ -1274,7 +1458,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            with self._target_prefill_region(), spec_stage_span("target_prefill"):
+                batch_output = self.target_worker.forward_batch_generation(batch)
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -1314,11 +1499,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
+            with self._draft_stream_region(), spec_stage_span("draft_extend"):
+                if self._spec_pdmux_small_stream is not None:
+                    record_stream_each(
+                        (logits_output.hidden_states, batch.out_cache_loc, positions),
+                        self._spec_pdmux_small_stream,
+                    )
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=logits_output.hidden_states,
+                    cache_loc=batch.out_cache_loc,
+                    positions=positions,
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -1340,6 +1531,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
+            self.flush_spec_pdmux_pending()
+            self._spec_pdmux_join_flush_done()
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -1364,6 +1557,61 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.get_device_module(self.device).current_stream()
         )
 
+        slot = getattr(batch, "spec_pdmux_slot", None)
+        concurrent = (
+            self._spec_pdmux_concurrent and slot is not None and batch.enable_overlap
+        )
+        if concurrent:
+            pool = getattr(batch, "_spec_pdmux_draft_pool", None)
+            if (
+                self.server_args.spec_pdmux_slots != 2
+                or slot not in (0, 1)
+                or pool is None
+                or len(pool) != 1
+                or pool[0] is not batch
+                or on_relay is None
+            ):
+                raise RuntimeError(
+                    "DFLASH co-location requires the two-slot same-tick draft/relay protocol"
+                )
+            if self.spec_pdmux_has_pending_extend(slot):
+                raise RuntimeError("DFLASH slot must flush before its input gathers")
+
+        with (
+            self._draft_stream_region(concurrent=concurrent),
+            spec_stage_span("draft"),
+        ):
+            if self._spec_pdmux_small_stream is not None:
+                record_stream_each(
+                    (batch.seq_lens, batch.req_pool_indices, draft_input.bonus_tokens),
+                    self._spec_pdmux_small_stream,
+                )
+            block = self._draft_block(batch, draft_input, own_outputs=concurrent)
+        if concurrent:
+            dev = torch.get_device_module(self.device)
+            ready_event = dev.Event()
+            ready_event.record(self._spec_pdmux_small_stream)
+            self._spec_pdmux_state["ready_draft"][slot] = SimpleNamespace(
+                block=block, event=ready_event
+            )
+            dev.current_stream().wait_event(ready_event)
+            self.spec_pdmux_invalidate_ready_draft(slot)
+            record_stream_each(
+                (block.tokens, block.positions, block.cache_locs), dev.current_stream()
+            )
+            # Queue the other slot's accepted-feature append after this draft,
+            # so it can run under this slot's target verification.
+            self.flush_spec_pdmux_pending(decode_only=True)
+        return self._verify_block(
+            batch,
+            draft_input,
+            block,
+            on_publish=on_publish,
+            on_relay=on_relay,
+            slot=slot if concurrent else None,
+        )
+
+    def _draft_block(self, batch, draft_input, *, own_outputs=False):
         bs = len(batch.seq_lens)
         device = self.device
 
@@ -1545,6 +1793,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
+        return self._make_draft_block(
+            draft_tokens, positions, verify_out_cache_loc_2d, own_outputs=own_outputs
+        )
+
+    def _verify_block(
+        self, batch, draft_input, block, *, on_publish=None, on_relay=None, slot=None
+    ):
+        bs = len(batch.seq_lens)
+        device = self.device
+        block_size = int(self.block_size)
+        prefix_lens = batch.seq_lens
+        draft_tokens = block.tokens
+        positions = block.positions
+        verify_out_cache_loc_2d = block.cache_locs
+        verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
@@ -1585,12 +1849,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
+        with spec_stage_span("verify"):
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
@@ -1696,6 +1961,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if slot is not None:
+            # Native greedy verification rotates two global scratch buffers.
+            # Co-location must own each result across deferred relay and D2H.
+            commit_lens = commit_lens.clone()
+            bonus = bonus.clone()
+            out_tokens = out_tokens.clone()
+            new_seq_lens = new_seq_lens.clone()
         if on_publish is not None:
             on_publish(new_seq_lens)
 
@@ -1707,23 +1979,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
-            commit_lens=commit_lens,
-        )
-
-        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        logits_output.hidden_states = None
-
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
 
-        return GenerationBatchResult(
+        result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
@@ -1734,3 +1995,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
         )
+        if slot is not None:
+            self._defer_draft_materialization(
+                slot=slot,
+                result=result,
+                hidden=hidden.reshape(-1, hidden.shape[-1]),
+                block=block,
+                on_relay=on_relay,
+            )
+        else:
+            with self._draft_stream_region(), spec_stage_span("draft_extend"):
+                if self._spec_pdmux_small_stream is not None:
+                    record_stream_each(
+                        (hidden, verify_out_cache_loc, positions, commit_lens),
+                        self._spec_pdmux_small_stream,
+                    )
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                    cache_loc=verify_out_cache_loc,
+                    cache_loc_2d=verify_out_cache_loc_2d,
+                    positions=positions,
+                    commit_lens=commit_lens,
+                )
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+        logits_output.hidden_states = None
+        return result
