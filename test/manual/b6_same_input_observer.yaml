@@ -23,10 +23,12 @@ patches:
       - match: self.eager_runner = EagerRunner(self)
         prepend: initialize(self)
   - target: sglang.srt.speculative.dspark_worker_v2.DSparkWorkerV2._draft_block
-    preamble: from sglang.srt.debug_utils.b6_same_input_observer import begin_draft, draft_graph
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import begin_draft, draft_graph, before_first_layer_forward
     edits:
       - match: bs = len(batch.seq_lens)
         prepend: begin_draft(self, batch, own_outputs)
+      - match: draft_out = self.draft_model_runner.forward(forward_batch)
+        prepend: before_first_layer_forward(self, forward_batch)
       - match: draft_out = self.draft_model_runner.forward(forward_batch)
         append: draft_graph(draft_out.can_run_graph)
   - target: sglang.srt.models.dspark.Qwen3DSparkModel.propose
@@ -52,12 +54,39 @@ patches:
           )
           return observed_proposal(self, hidden_states, first_prev_token_ids, proposal, confidence_threshold)
   - target: sglang.srt.models.dspark.Qwen3DSparkModel.forward
-    preamble: from sglang.srt.debug_utils.b6_same_input_observer import capture_draft_hidden
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import capture_draft_hidden, capture_first_layer_entry
     edits:
+      - match: hidden_states = input_embeds
+        append: capture_first_layer_entry(input_ids, positions, hidden_states, forward_batch)
       - match: hidden_states = layer(positions, hidden_states, forward_batch)
         append: capture_draft_hidden(layer.self_attn.attn.layer_id, hidden_states, forward_batch)
       - match: hidden_states = self.norm(hidden_states)
         append: capture_draft_hidden(5, hidden_states, forward_batch)
+  - target: sglang.srt.models.dspark.DSparkAttention.forward
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import capture_first_layer_stage, capture_first_layer_qk
+    edits:
+      - match: qkv = self._forward_qkv(hidden_states, forward_batch)
+        prepend: capture_first_layer_stage(self, "input_norm", hidden_states)
+      - match: qkv = self._forward_qkv(hidden_states, forward_batch)
+        append: capture_first_layer_stage(self, "qkv", qkv)
+      - match: k = self.k_norm(k.reshape(-1, self.head_dim)).view_as(k)
+        append: capture_first_layer_qk(self, "qk_norm", q, k)
+      - match: k = self.apply_native_rope(positions, k)
+        append: capture_first_layer_qk(self, "qk_rope", q, k)
+      - match: output, _ = self.o_proj(self.attn(q, k, v, forward_batch))
+        replacement: |
+          _b6_attention = self.attn(q, k, v, forward_batch)
+          capture_first_layer_stage(self, "attention", _b6_attention)
+          output, _ = self.o_proj(_b6_attention)
+          capture_first_layer_stage(self, "output_projection", output)
+  - target: sglang.srt.layers.attention.flashinfer_backend.FlashInferAttnBackend.forward_extend
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import capture_first_layer_plan
+    edits:
+      - match: |
+          prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
+              self._get_wrapper_idx(layer)
+          ]
+        append: capture_first_layer_plan(self, prefill_wrapper_paged, layer, forward_batch)
   - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2.forward_batch_generation
     preamble: from sglang.srt.debug_utils.b6_same_input_observer import prefill_context
     edits:

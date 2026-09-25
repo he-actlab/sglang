@@ -128,7 +128,7 @@ def test_fixture_exact_source_matches_and_compiles_without_runtime_import():
     config = PatchConfig(
         **yaml.safe_load((ROOT / "test/manual/b6_same_input_observer.yaml").read_text())
     )
-    assert len(config.patches) == 15
+    assert len(config.patches) == 17
     for spec in config.patches:
         pieces = spec.target.split(".")
         for split in range(len(pieces), 0, -1):
@@ -155,6 +155,25 @@ def test_fixture_exact_source_matches_and_compiles_without_runtime_import():
                 immediate.index("begin_immediate_append(")
                 < immediate.index("self._append_target_hidden_to_draft_kv_by_loc(")
                 < immediate.index("finish_append(0)")
+            )
+        if spec.target.endswith("DSparkAttention.forward"):
+            for call in (
+                "self._forward_qkv(",
+                "self.q_norm(",
+                "self.k_norm(",
+                "self.attn(",
+                "self.o_proj(",
+            ):
+                assert edited.count(call) == 1
+        if spec.target.endswith("FlashInferAttnBackend.forward_extend"):
+            assert edited.index(
+                "capture_first_layer_plan(self, prefill_wrapper_paged,"
+            ) < edited.index("self.token_to_kv_pool.set_kv_buffer(")
+        if spec.target.endswith("DSparkWorkerV2._draft_block"):
+            assert edited.index(
+                "before_first_layer_forward(self, forward_batch)"
+            ) < edited.index(
+                "draft_out = self.draft_model_runner.forward(forward_batch)"
             )
     assert (
         not (ROOT / "test/manual/b6_same_input_observer.yaml")
@@ -551,7 +570,7 @@ def test_native_proposal_clone_pointer_guard_and_replay_survival():
     ticket = ledger.begin(0, reqs())
     watch.activate(ticket)
     watch.record(torch.zeros(32, 5, dtype=torch.int64))
-    obs._session = NS(current_draft=ticket, draft=watch)
+    obs._session = NS(current_draft=ticket, draft=watch, first_layer=None)
     original = (
         torch.arange(256).view(32, 8),
         torch.arange(256),
@@ -753,3 +772,251 @@ def test_deferred_payload_owns_storage_and_survives_graph_reuse():
         obs.deferred(
             0, graph_output, worker._spec_pdmux_state["pending"][0].materialize
         )
+
+
+def first_layer_component(n=32, graph_rows=64, slot=0):
+    """Small staged CPU boundaries, not a production-attention/math oracle."""
+    torch.manual_seed(928)
+    h, kv, dim = 8, 4, 4
+    session = obs.Session("cpu", hidden_size=h)
+    session.first_layer = obs.FirstLayerTrace(session.draft, h, kv, 1200)
+    session.arm = "prior"
+    obs._session = session
+    ticket = session.ledger.begin(slot, reqs(1 + 32 * slot, n))
+    session.current_draft = ticket
+    session.draft.activate(ticket)
+    lengths = tuple(1 + row % 3 for row in range(n))
+    mapping = torch.arange(65 * 16).reshape(65, 16)
+    kpool = torch.arange(1100 * kv).reshape(1100, 1, dim).remainder(8).bfloat16()
+    vpool = -kpool
+    pool = NS(
+        k_buffer=[kpool],
+        v_buffer=[vpool],
+        page_size=1,
+        _get_key_buffer=lambda index: kpool,
+        _get_value_buffer=lambda index: vpool,
+    )
+    worker = NS(
+        draft_model_runner=NS(token_to_kv_pool=pool),
+        model_runner=NS(req_to_token_pool=NS(req_to_token=mapping)),
+    )
+    rows = torch.tensor(ticket.rows)
+    forward = NS(
+        seq_lens_cpu=torch.tensor(lengths, dtype=torch.int32),
+        spec_info=NS(seq_lens_cpu_is_exact=True),
+        req_pool_indices=rows,
+    )
+    obs.before_first_layer_forward(worker, forward)
+
+    def linear(out, inp):
+        result = torch.nn.Linear(inp, out, bias=False, dtype=torch.bfloat16)
+        result.weight.data.fill_(0.125)
+        return result
+
+    norm = lambda size: NS(
+        weight=torch.ones(size, dtype=torch.bfloat16), variance_epsilon=1e-6
+    )
+    attn = NS(
+        q_size=h,
+        kv_size=kv,
+        head_dim=dim,
+        num_heads=2,
+        num_kv_heads=1,
+        qkv_proj=linear(h + 2 * kv, h),
+        o_proj=linear(h, h),
+        q_norm=norm(dim),
+        k_norm=norm(dim),
+    )
+    embedding = torch.nn.Embedding(32, h, dtype=torch.bfloat16)
+    embedding.weight.data.fill_(0.5)
+    layer = NS(self_attn=attn, input_layernorm=norm(h))
+    prefixes = {}
+    cursor = 0
+    for key, length in zip(zip(ticket.rows, ticket.generations), lengths):
+        prefixes[key] = NS(
+            keys=(
+                ticket.snapshots["layer0_prefix_k"][cursor : cursor + length].clone(),
+            ),
+            values=(
+                ticket.snapshots["layer0_prefix_v"][cursor : cursor + length].clone(),
+            ),
+        )
+        cursor += length
+    session.reference = NS(
+        model=NS(layers=[layer], embed_tokens=embedding),
+        hidden_size=h,
+        num_kv_heads=1,
+        num_heads=2,
+        head_dim=dim,
+        mask_token_id=31,
+        _prefixes=prefixes,
+        # Identity staging tests capture/ownership, not RoPE mathematics.
+        _rotary=lambda value, positions: value,
+    )
+    ids = torch.full((graph_rows, 7), 31, dtype=torch.int64)
+    ids[:, 0] = 3
+    positions = torch.ones((graph_rows, 7), dtype=torch.int64)
+    positions[:n] = torch.tensor(lengths)[:, None] + torch.arange(7)[None]
+    graph_req = torch.zeros(graph_rows, dtype=torch.int64)
+    graph_req[:n] = rows
+    graph_prefix = torch.ones(graph_rows, dtype=torch.int64)
+    graph_prefix[:n] = torch.tensor(lengths)
+    locations = torch.zeros((n, 8), dtype=torch.int64)
+    for row, length in enumerate(lengths):
+        locations[row] = mapping[rows[row], length : length + 8]
+    graph_locations = torch.zeros((graph_rows, 7), dtype=torch.int64)
+    graph_locations[:n] = locations[:, :7]
+    batch = NS(
+        out_cache_loc=graph_locations.flatten(),
+        req_pool_indices=graph_req,
+        seq_lens=graph_prefix,
+    )
+    trace = session.first_layer
+    entry = embedding(ids)
+    # Poison unused rows with FINITE distinct data. Their values must be
+    # retained to preserve the true native GEMM M, not reconstructed from IDs.
+    entry[n:] = 6.0
+    trace.entry(ids.flatten(), positions.flatten(), entry.flatten(0, 1), batch)
+    x = obs.native_norm(entry, layer.input_layernorm)
+    packed = torch.nn.functional.linear(x.flatten(0, 1), attn.qkv_proj.weight)
+    q, k, _ = packed.split([h, kv, kv], -1)
+    q = obs.native_norm(q.reshape(-1, dim), attn.q_norm).reshape(graph_rows * 7, h)
+    k = obs.native_norm(k.reshape(-1, dim), attn.k_norm).reshape(graph_rows * 7, kv)
+    attention = torch.ones((graph_rows * 7, h), dtype=torch.bfloat16)
+    for name, tensor in (
+        ("input_norm", x.flatten(0, 1)),
+        ("qkv", packed),
+        ("qk_norm", torch.cat([q, k], -1)),
+        ("qk_rope", torch.cat([q, k], -1)),
+        ("attention", attention),
+        (
+            "output_projection",
+            torch.nn.functional.linear(attention, attn.o_proj.weight),
+        ),
+    ):
+        trace.stage(name, tensor)
+    indptr = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32),
+            (graph_prefix.int() + 7).cumsum(0, dtype=torch.int32),
+        ]
+    )
+    indices = torch.zeros(1200, dtype=torch.int32)
+    indices[: sum(lengths) + 7 * n] = ticket.snapshots["layer0_expected_plan"].int()
+    wrapper = NS(
+        _qo_indptr_buf=torch.arange(graph_rows + 1, dtype=torch.int32) * 7,
+        _paged_kv_indptr_buf=indptr,
+        _paged_kv_indices_buf=indices,
+        _paged_kv_last_page_len_buf=torch.ones(graph_rows, dtype=torch.int32),
+    )
+    trace.plan(wrapper, graph_rows)
+    trace.own(ticket)
+    ticket.snapshots.update(
+        tokens=torch.full((n, 8), 3, dtype=torch.int64),
+        locations=locations,
+        draft_hidden=torch.zeros((6, n, 7, h), dtype=torch.bfloat16),
+    )
+    ticket.reference_block = NS(
+        layer_hidden=(torch.ones((n, 7, h), dtype=torch.bfloat16),)
+    )
+    return session, ticket, wrapper, worker, forward
+
+
+@pytest.mark.parametrize("n,graph_rows", [(31, 32), (32, 64)])
+@pytest.mark.parametrize("slot", [0, 1])
+@torch.inference_mode()
+def test_first_layer_owns_actual_padded_m_prefix_and_selected_plan(n, graph_rows, slot):
+    session, ticket, wrapper, worker, forward = first_layer_component(
+        n, graph_rows, slot
+    )
+    before = {name: value.clone() for name, value in ticket.snapshots.items()}
+    wrapper._paged_kv_indices_buf.fill_(-8)
+    worker.draft_model_runner.token_to_kv_pool.k_buffer[0].fill_(float("nan"))
+    session.first_layer.tensors["entry"].fill_(float("nan"))
+    evidence, expected = obs.first_layer_evidence(session, ticket)
+    assert all(evidence["exact"].values())
+    assert all(
+        p["key_bytes_equal"] and p["value_bytes_equal"]
+        for p in evidence["independent_prefix"]
+    )
+    assert evidence["primitive_gemm_m"] == graph_rows * 7
+    assert evidence["live_rows"] == n
+    assert expected["qkv_packed_same_input"].shape[0] == graph_rows
+    assert torch.all(ticket.snapshots["layer0_entry"][n:graph_rows] == 6)
+    for name, tensor in before.items():
+        assert not obs.different(tensor, ticket.snapshots[name])
+    other = 1 - slot
+    assert not session.first_layer.stamps[other].any()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "entry",
+        "positions",
+        "prefix",
+        "rows",
+        "out_cache_loc",
+        "kv_indices",
+        "input_norm",
+        "qkv",
+        "qk_norm",
+        "qk_rope",
+        "output_projection",
+    ],
+)
+@torch.inference_mode()
+def test_first_layer_discriminates_actual_input_and_stage_corruption(field):
+    session, ticket, *_ = first_layer_component()
+    ticket.snapshots["layer0_" + field].flatten()[0] += 1
+    evidence, _ = obs.first_layer_evidence(session, ticket)
+    assert not all(evidence["exact"].values())
+    assert evidence["scope"] == "FIRST_LAYER_SAME_INPUT_DIAGNOSTIC_ONLY"
+
+
+@torch.inference_mode()
+def test_first_layer_missing_metadata_and_stale_epoch_fail_closed():
+    session, ticket, wrapper, worker, forward = first_layer_component()
+    del wrapper._qo_indptr_buf
+    with pytest.raises(ValueError, match="planner buffer"):
+        session.first_layer.plan(wrapper, 64)
+    forward.spec_info.seq_lens_cpu_is_exact = False
+    with pytest.raises(ValueError, match="exact native host"):
+        obs.before_first_layer_forward(worker, forward)
+    ticket.snapshots["layer0_stamps"][0] -= 1
+    with pytest.raises(AssertionError, match="stamp"):
+        obs.first_layer_evidence(session, ticket)
+
+
+@torch.inference_mode()
+def test_first_layer_failure_retains_original_error_and_exclusive_raw_artifact(
+    tmp_path,
+):
+    session, ticket, *_ = first_layer_component()
+    session.failure_artifact_dir = str(tmp_path)
+    with pytest.raises(AssertionError, match="draft hidden boundary 0"):
+        session.fail("draft hidden boundary 0", ticket)
+    path = Path(ticket.first_layer_artifact)
+    payload = torch.load(path, weights_only=True)
+    assert payload["original_failure"] == {
+        "stage": "draft hidden boundary 0",
+        "slot": 0,
+        "epoch": 1,
+    }
+    assert payload["evidence"]["primitive_gemm_m"] == 448
+    assert (
+        not payload["full_checkpoint_native_semantics"] and not payload["timing_valid"]
+    )
+    assert len(payload["tensors"]["layer0_kv_indices"]) == int(
+        payload["tensors"]["layer0_kv_indptr"][-1]
+    )
+    assert not obs.different(
+        payload["tensors"]["native_layer0_output"], ticket.snapshots["draft_hidden"][0]
+    )
+    assert "reference_prefix_k_0" in payload["tensors"]
+    original_bytes = path.read_bytes()
+    del ticket.first_layer_artifact
+    with pytest.raises(AssertionError, match="draft hidden boundary 0"):
+        session.fail("draft hidden boundary 0", ticket)
+    assert "FileExistsError" in session.failure["first_layer_artifact_error"]
+    assert path.read_bytes() == original_bytes

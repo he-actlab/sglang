@@ -534,3 +534,129 @@ def test_integrated_reference_graph_traces_packed_prefix_events_and_corruption(
         receipt = session.snapshot()
         assert receipt["diagnostic_failure"] is not None
         assert receipt["full_checkpoint_native_semantics"] is False
+
+
+@CUDA
+@pytest.mark.parametrize("live_rows,graph_rows", [(31, 32), (32, 64)])
+@torch.inference_mode()
+def test_first_layer_actual_graph_m_two_slot_owned_prefix_and_planner(
+    monkeypatch, live_rows, graph_rows
+):
+    """Real CUDA graph/lifetime staging only, not native attention numerics."""
+    small = torch.cuda.Stream()
+    session = obs.Session("cuda", hidden_size=8)
+    session.arm, session.small_stream = "prior", small
+    session.first_layer = obs.FirstLayerTrace(session.draft, 8, 4, 2048)
+    monkeypatch.setattr(obs, "_session", session)
+    rows = torch.zeros(graph_rows, dtype=torch.int64, device="cuda")
+    lens = torch.ones(graph_rows, dtype=torch.int32, device="cuda")
+    ids = torch.full((graph_rows, 7), 3, dtype=torch.int64, device="cuda")
+    positions = torch.arange(7, device="cuda").expand(graph_rows, -1).clone()
+    locations = torch.zeros_like(positions)
+    entry = torch.zeros((graph_rows, 7, 8), dtype=torch.bfloat16, device="cuda")
+    stages = {
+        name: torch.zeros((graph_rows * 7, width), dtype=torch.bfloat16, device="cuda")
+        for name, width in session.first_layer.widths.items()
+        if name != "entry"
+    }
+    wrapper = NS(
+        _qo_indptr_buf=torch.arange(graph_rows + 1, dtype=torch.int32, device="cuda")
+        * 7,
+        _paged_kv_indptr_buf=torch.arange(
+            graph_rows + 1, dtype=torch.int32, device="cuda"
+        )
+        * 8,
+        _paged_kv_indices_buf=torch.zeros(2048, dtype=torch.int32, device="cuda"),
+        _paged_kv_last_page_len_buf=torch.ones(
+            graph_rows, dtype=torch.int32, device="cuda"
+        ),
+    )
+    batch = NS(req_pool_indices=rows, seq_lens=lens, out_cache_loc=locations.flatten())
+    mapping = torch.arange(65 * 16, device="cuda").reshape(65, 16)
+    keys = (
+        torch.arange(1100 * 4, device="cuda")
+        .reshape(1100, 1, 4)
+        .remainder(8)
+        .bfloat16()
+    )
+    values = -keys
+    pool = NS(
+        k_buffer=[keys],
+        v_buffer=[values],
+        _get_key_buffer=lambda index: keys,
+        _get_value_buffer=lambda index: values,
+    )
+    worker = NS(
+        draft_model_runner=NS(token_to_kv_pool=pool),
+        model_runner=NS(req_to_token_pool=NS(req_to_token=mapping)),
+    )
+    small.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=small):
+        session.first_layer.entry(
+            ids.flatten(), positions.flatten(), entry.flatten(0, 1), batch
+        )
+        for name, tensor in stages.items():
+            session.first_layer.stage(name, tensor)
+        session.first_layer.plan(wrapper, graph_rows)
+    owned = []
+    for slot in (0, 1):
+        with torch.cuda.stream(small):
+            ticket = session.ledger.begin(slot, _reqs(slot)[:live_rows])
+            session.current_draft = ticket
+            session.draft.activate(ticket)
+            rows.zero_()
+            rows[:live_rows] = torch.tensor(ticket.rows, device="cuda")
+            entry.fill_(10 + slot)
+            entry[live_rows:].fill_(90 + slot)
+            for tensor in stages.values():
+                tensor.fill_(20 + slot)
+            forward = NS(
+                seq_lens_cpu=torch.ones(live_rows, dtype=torch.int32),
+                spec_info=NS(seq_lens_cpu_is_exact=True),
+                req_pool_indices=rows[:live_rows],
+            )
+            obs.before_first_layer_forward(worker, forward)
+            wrapper._paged_kv_indices_buf[: 8 * live_rows].copy_(
+                ticket.snapshots["layer0_expected_plan"].int()
+            )
+            graph.replay()
+            session.first_layer.own(ticket)
+            ticket.event = torch.cuda.Event()
+            ticket.event.record(small)
+        ticket.event.synchronize()
+        assert not torch.stack(ticket.checks).any()
+        assert torch.all(ticket.snapshots["layer0_graph_rows"] == graph_rows)
+        assert torch.all(ticket.snapshots["layer0_entry"][:live_rows] == 10 + slot)
+        assert torch.all(
+            ticket.snapshots["layer0_entry"][live_rows:graph_rows] == 90 + slot
+        )
+        assert (
+            ticket.snapshots["layer0_entry"].data_ptr()
+            != session.first_layer.tensors["entry"][slot].data_ptr()
+        )
+        owned.append(ticket)
+    with torch.cuda.stream(small):
+        keys.fill_(float("nan"))
+        wrapper._paged_kv_indices_buf.fill_(-1)
+        entry.fill_(float("nan"))
+        # Replay with the other device slot/epoch; Python capture had no ticket.
+        session.draft.control[0].fill_(1)
+        session.draft.control[1].fill_(9)
+        graph.replay()
+        ready = torch.cuda.Event()
+        ready.record(small)
+    ready.synchronize()
+    for slot, ticket in enumerate(owned):
+        assert torch.isfinite(ticket.snapshots["layer0_prefix_k"]).all()
+        assert torch.all(ticket.snapshots["layer0_entry"][:live_rows] == 10 + slot)
+        assert torch.all(ticket.snapshots["layer0_stamps"] == 1)
+    # A stale/wrong-epoch bank must not be accepted as slot0's next graph.
+    stale = obs.Ticket(0, 2, owned[0].rows, owned[0].generations)
+    stale.layer0_prefix_lengths = (1,) * live_rows
+    with torch.cuda.stream(small):
+        session.first_layer.own(stale)
+        rejected = torch.cuda.Event()
+        rejected.record(small)
+    rejected.synchronize()
+    assert torch.stack(stale.checks).any()
