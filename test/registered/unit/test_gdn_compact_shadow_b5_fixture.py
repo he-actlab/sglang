@@ -385,7 +385,7 @@ def test_b5_fixture_matches_unique_live_seams_and_compiles():
     config = PatchConfig(
         **yaml.safe_load((ROOT / "test/manual/gdn_compact_shadow_b5.yaml").read_text())
     )
-    assert len(config.patches) == 7
+    assert len(config.patches) == 14
     for spec in config.patches:
         module, cls, fn = spec.target.rsplit(".", 2)
         path = ROOT / "python" / Path(*module.split(".")).with_suffix(".py")

@@ -8,22 +8,39 @@ patches:
       - match: config_path = self._config.source_patcher_config
         replacement: return
   - target: sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs
-    preamble: from sglang.srt.debug_utils.gdn_compact_shadow_b5 import initialize
+    preamble: |
+      from sglang.srt.debug_utils.gdn_compact_shadow_b5 import initialize
+      from sglang.srt.debug_utils.b5_native_block_observer import initialize as initialize_block
     edits:
       - match: self.eager_runner = EagerRunner(self)
-        prepend: initialize(self)
+        prepend: |
+          initialize(self)
+          initialize_block(self)
   - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2.forward_batch_generation
     preamble: from sglang.srt.debug_utils.gdn_compact_shadow_b5 import worker_shadow
     edits:
       - match: batch_output.new_seq_lens = batch.seq_lens
         append: worker_shadow(self).prefill(batch)
   - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._verify_block
-    preamble: from sglang.srt.debug_utils.gdn_compact_shadow_b5 import worker_shadow
+    preamble: |
+      from sglang.srt.debug_utils.gdn_compact_shadow_b5 import worker_shadow
+      from sglang.srt.debug_utils.b5_native_block_observer import begin_verify, bind_locations, verification, result_owned, observed_append
     edits:
       - match: 'with spec_stage_span("verify"):'
-        prepend: worker_shadow(self).begin(self.target_worker.model_runner.attn_backend.linear_attn_backend, batch, slot)
+        prepend: |
+          begin_verify(batch, block, slot)
+          bind_locations(slot, block)
+          worker_shadow(self).begin(self.target_worker.model_runner.attn_backend.linear_attn_backend, batch, slot)
       - match: can_run_cuda_graph = target_out.can_run_cuda_graph
         append: worker_shadow(self).replay(can_run_cuda_graph)
+      - match: 'if on_publish is not None:'
+        prepend: verification(slot, candidates, target_predict, prefix_lens, commit_lens, bonus, out_tokens, new_seq_lens, logits_output.hidden_states, can_run_cuda_graph)
+      - match: |
+          if slot is not None:
+              self._defer_draft_materialization(
+        prepend: result_owned(result, slot)
+      - match: self._append_target_hidden_to_draft_kv_by_loc(
+        replacement: observed_append(self, self._append_target_hidden_to_draft_kv_by_loc,
       - match: return result
         prepend: worker_shadow(self).end()
   - target: sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend.forward_extend
@@ -43,7 +60,52 @@ patches:
       - match: '# Track indices used for tracking mamba states for prefix cache'
         prepend: check(self.linear_attn_backend, last_correct_step_indices, mamba_track_indices, mamba_steps_to_track)
   - target: sglang.srt.managers.scheduler.Scheduler.get_internal_state
-    preamble: from sglang.srt.debug_utils.gdn_compact_shadow_b5 import snapshot
+    preamble: |
+      from sglang.srt.debug_utils.gdn_compact_shadow_b5 import snapshot
+      from sglang.srt.debug_utils.b5_native_block_observer import snapshot as block_snapshot
     edits:
       - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
-        append: ret["gdn_compact_shadow_b5"] = snapshot()
+        append: |
+          ret["gdn_compact_shadow_b5"] = snapshot()
+          ret["b5_native_block_observer"] = block_snapshot()
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._draft_block
+    preamble: from sglang.srt.debug_utils.b5_native_block_observer import begin_draft, draft_graph
+    edits:
+      - match: bs = len(batch.seq_lens)
+        prepend: begin_draft(self, batch, draft_input, own_outputs)
+      - match: draft_out = self.draft_model_runner.forward(forward_batch)
+        append: draft_graph(draft_out.can_run_graph)
+  - target: sglang.srt.models.dflash.DFlashDraftModel.forward
+    preamble: from sglang.srt.debug_utils.b5_native_block_observer import graph_inputs
+    edits:
+      - match: hidden_states = input_embeds
+        prepend: graph_inputs(self, input_ids, positions, input_embeds, forward_batch)
+  - target: sglang.srt.speculative.dflash_worker_v2._DflashDraftSampler.__call__
+    preamble: from sglang.srt.debug_utils.b5_native_block_observer import observed_head
+    edits:
+      - match: 'self.out[: tokens.shape[0]].copy_(tokens)'
+        append: observed_head(self, hidden_states)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._make_draft_block
+    preamble: from sglang.srt.debug_utils.b5_native_block_observer import own_block
+    edits:
+      - match: 'if own_outputs:'
+        prepend: _b5_originals = (tokens, positions, cache_locs)
+      - match: return SimpleNamespace(
+        prepend: own_block(tokens, positions, cache_locs, own_outputs, _b5_originals)
+  - target: sglang.srt.models.qwen3_5.Qwen3_5ForCausalLM.forward
+    preamble: from sglang.srt.debug_utils.b5_native_block_observer import capture_tap
+    edits:
+      - match: layer = self.layers[layer_idx]
+        append: capture_tap(layer_idx, hidden_states, residual, forward_batch)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._defer_draft_materialization
+    preamble: from sglang.srt.debug_utils.b5_native_block_observer import deferred
+    edits:
+      - match: verify_done = dev.Event()
+        prepend: deferred(slot, hidden, materialize)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2.flush_spec_pdmux_pending
+    preamble: from sglang.srt.debug_utils.b5_native_block_observer import observed_append, finish_append
+    edits:
+      - match: self._append_target_hidden_to_draft_kv_by_loc(**pending.materialize)
+        replacement: observed_append(self, self._append_target_hidden_to_draft_kv_by_loc, **pending.materialize)
+      - match: pending.on_relay(pending.relay_result)
+        append: finish_append(index)
