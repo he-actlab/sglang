@@ -253,7 +253,7 @@ class FlashAttentionBackend(AttentionBackend):
         # the GPU-only relay); EAGLE/MTP/standalone/non-spec keep the CPU mirror.
         self.needs_cpu_seq_lens = not SpeculativeAlgorithm.from_string(
             model_runner.server_args.speculative_algorithm
-        ).is_dflash()
+        ).supports_target_verify_for_draft()
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size

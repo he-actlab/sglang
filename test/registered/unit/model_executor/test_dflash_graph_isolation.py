@@ -144,6 +144,19 @@ class TestDFlashGraphIsolation(unittest.TestCase):
         )
         return decode.DecodeCudaGraphRunner(model)
 
+    def test_dspark_owns_separate_seven_token_draft_graph(self):
+        target = self._runner(algorithm=SpeculativeAlgorithm.DSPARK)
+        draft = self._runner(draft=True, algorithm=SpeculativeAlgorithm.DSPARK)
+        self.assertEqual(target.num_tokens_per_bs, 8)
+        self.assertEqual(draft.num_tokens_per_bs, 7)
+        self.assertIs(target.capture_stream_override, self.large)
+        self.assertIs(draft.capture_stream_override, self.small)
+        self.assertNotEqual(
+            target.buffers.input_ids.data_ptr(), draft.buffers.input_ids.data_ptr()
+        )
+        self.assertEqual(draft.get_spec_info(32 * 7).draft_token_num, 7)
+        self.assertEqual(target.get_spec_info(32 * 8).draft_token_num, 8)
+
     def test_draft_captures_small_target_large_and_keeps_native_block(self):
         target, draft = self._runner(), self._runner(draft=True)
         self.assertIs(target.capture_stream_override, self.large)

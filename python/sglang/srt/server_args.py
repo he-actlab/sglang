@@ -1493,7 +1493,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -7100,11 +7100,11 @@ class ServerArgs:
         # The native DFlash worker has a separate two-slot protocol, not the
         # EAGLE multi-slot tree/duplicate-TP path. Keep its initial supported
         # envelope explicit. Ordinary full-chip DFlash remains unchanged.
-        if self.speculative_algorithm.upper() != "DFLASH":
+        if self.speculative_algorithm.upper() not in ("DFLASH", "DSPARK"):
             return
         if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
             raise AssertionError(
-                "Partitioned DFLASH does not support SGLANG_ENABLE_OVERLAP_PLAN_STREAM; "
+                f"Partitioned {self.speculative_algorithm.upper()} does not support SGLANG_ENABLE_OVERLAP_PLAN_STREAM; "
                 "native verify preparation must remain on its owning stream."
             )
         if (
@@ -7124,8 +7124,8 @@ class ServerArgs:
             != (1, 1, 8)
         ):
             raise AssertionError(
-                "Partitioned DFLASH requires TP1/DP1, two slots, page1, cache off, "
-                "fixed native block8 (steps1/topk1), sharded draft mode and "
+                f"Partitioned {self.speculative_algorithm.upper()} requires TP1/DP1, two slots, page1, cache off, "
+                "eight verifier positions (steps1/topk1), sharded draft mode and "
                 "no rejection sampling."
             )
 
@@ -7162,6 +7162,7 @@ class ServerArgs:
                 "EAGLE3",
                 "STANDALONE",
                 "DFLASH",
+                "DSPARK",
             )
             if (
                 self.speculative_algorithm.upper()
@@ -7321,6 +7322,7 @@ class ServerArgs:
                 "EAGLE3",
                 "STANDALONE",
                 "DFLASH",
+                "DSPARK",
             )
             if self.speculative_algorithm.upper() not in _spec_pdmux_supported_algos:
                 raise AssertionError(

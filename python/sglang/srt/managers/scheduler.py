@@ -2297,8 +2297,15 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
+        if self.spec_algorithm.supports_target_verify_for_draft():
             error_msg = validate_dflash_request(req, self.enable_overlap)
+            if self.spec_algorithm.is_dspark():
+                if error_msg is not None:
+                    error_msg = error_msg.replace("DFLASH", "DSPARK")
+                elif req.sampling_params.top_k != 1:
+                    error_msg = (
+                        "DSPARK currently requires native greedy sampling (top_k=1)."
+                    )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)

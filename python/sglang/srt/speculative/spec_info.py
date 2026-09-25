@@ -33,6 +33,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -109,6 +110,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dspark(self) -> bool:
+        return self == SpeculativeAlgorithm.DSPARK
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -116,7 +120,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash()
+        return self.is_dflash() or self.is_dspark()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -166,6 +170,7 @@ class SpeculativeAlgorithm(Enum):
         """
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
+            _handle_dspark,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
@@ -173,6 +178,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_dspark():
+            _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
@@ -188,7 +195,11 @@ class SpeculativeAlgorithm(Enum):
         # graph support. We can use it for target verify, or we can use it for
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
-        return num_draft_tokens
+        return (
+            num_draft_tokens - 1
+            if self.is_dspark() and is_draft_worker
+            else num_draft_tokens
+        )
 
     def create_worker(
         self, server_args: ServerArgs
@@ -203,6 +214,11 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
+
+            return DSparkWorkerV2
 
         if self.is_frozen_kv_mtp():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -324,14 +340,14 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash():
+    elif spec_algorithm.supports_target_verify_for_draft():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
-            draft_token_num=server_args.speculative_num_draft_tokens,
+            draft_token_num=num_tokens_per_bs,
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL

@@ -18,6 +18,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.multiplex.native_block_draft_placement import (
+    mark_native_block_draft_projection_modules,
+    use_native_block_full_device_projection,
+)
+from sglang.srt.multiplex.pdmux_context import spec_pdmux_full_device_operator_region
 from sglang.srt.server_args import (
     ServerArgs,
     get_global_server_args,
@@ -67,6 +72,21 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _native_block_head_matmul(hs, weight, lm_head, placement):
+    use_full_device = use_native_block_full_device_projection(
+        "lm_head", hs, lm_head, None, placement, draft_head=True
+    )
+    with spec_pdmux_full_device_operator_region(
+        use_full_device, source_partition="small"
+    ) as full_device_stream:
+        if full_device_stream is not None:
+            hs.record_stream(full_device_stream)
+        logits = torch.matmul(hs, weight.T)
+    if full_device_stream is not None:
+        logits.record_stream(torch.cuda.current_stream())
+    return logits
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -74,8 +94,20 @@ class _DflashDraftSampler:
     tp=1 / no-added-vocab only; TP>1 stays eager in the worker.
     """
 
-    def __init__(self, *, weight, block_size, num_org, org_vocab_start, max_bs):
+    def __init__(
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        lm_head=None,
+        placement=None,
+    ):
         self.weight = weight
+        self.lm_head = lm_head
+        self.placement = placement
         self.block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
@@ -94,7 +126,9 @@ class _DflashDraftSampler:
         )
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
-        logits = torch.matmul(hs, self.weight[: self.num_org].T)
+        logits = _native_block_head_matmul(
+            hs, self.weight[: self.num_org], self.lm_head, self.placement
+        )
         tokens = torch.argmax(logits, dim=-1).to(torch.long)
         if self.org_vocab_start:
             tokens += self.org_vocab_start
@@ -204,32 +238,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
-        draft_config = parse_dflash_draft_config(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
-        )
-        if server_args.speculative_num_draft_tokens is None:
-            # Should not happen (ServerArgs should have inferred it), but keep a fallback.
-            self.block_size = int(draft_config.resolve_block_size(default=16))
-        else:
-            self.block_size = int(server_args.speculative_num_draft_tokens)
-            model_block_size = draft_config.block_size
-            if model_block_size is None:
-                model_block_size = getattr(self.draft_model, "block_size", None)
-            if model_block_size is not None and int(model_block_size) != int(
-                self.block_size
-            ):
-                logger.warning(
-                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
-                    self.block_size,
-                    model_block_size,
-                )
-        self.speculative_num_draft_tokens = int(self.block_size)
-
-        self._mask_token = draft_config.mask_token
-        self._mask_token_id_override = draft_config.mask_token_id
-        self._mask_token_id = self._resolve_mask_token_id(
-            mask_token=self._mask_token,
-            mask_token_id=self._mask_token_id_override,
+        self._init_draft_model_config()
+        self._native_block_draft_placement = mark_native_block_draft_projection_modules(
+            self.draft_model,
+            server_args,
+            draft_width=self.draft_num_tokens,
+            verify_width=self.block_size,
         )
         if self.tp_rank == 0:
             logger.info(
@@ -265,7 +279,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_spec_info = DFlashVerifyInput(
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
-            draft_token_num=int(self.block_size),
+            draft_token_num=int(self.draft_num_tokens),
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
@@ -294,6 +308,37 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def _init_draft_model_config(self):
+        server_args = self.server_args
+        draft_config = parse_dflash_draft_config(
+            draft_hf_config=self.draft_model_runner.model_config.hf_config
+        )
+        if server_args.speculative_num_draft_tokens is None:
+            # Should not happen (ServerArgs should have inferred it), but keep a fallback.
+            self.block_size = int(draft_config.resolve_block_size(default=16))
+        else:
+            self.block_size = int(server_args.speculative_num_draft_tokens)
+            model_block_size = draft_config.block_size
+            if model_block_size is None:
+                model_block_size = getattr(self.draft_model, "block_size", None)
+            if model_block_size is not None and int(model_block_size) != int(
+                self.block_size
+            ):
+                logger.warning(
+                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
+                    self.block_size,
+                    model_block_size,
+                )
+        self.speculative_num_draft_tokens = int(self.block_size)
+
+        self._mask_token = draft_config.mask_token
+        self._mask_token_id_override = draft_config.mask_token_id
+        self._mask_token_id = self._resolve_mask_token_id(
+            mask_token=self._mask_token,
+            mask_token_id=self._mask_token_id_override,
+        )
+        self.draft_num_tokens = self.block_size
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -390,6 +435,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            lm_head=lm_head,
+            placement=self._native_block_draft_placement,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -895,7 +942,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
-                logits = torch.matmul(hs, weight.T)
+                logits = _native_block_head_matmul(
+                    hs,
+                    weight,
+                    lm_head,
+                    getattr(self, "_native_block_draft_placement", None),
+                )
                 out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
             return out_tokens
 
@@ -950,7 +1002,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    base_logits = _native_block_head_matmul(
+                        hs,
+                        weight[:num_org],
+                        lm_head,
+                        getattr(self, "_native_block_draft_placement", None),
+                    )
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
