@@ -491,6 +491,13 @@ def draft_graph(graph):
 
 def own_block(tokens, positions, locations, own_outputs, originals):
     s, t = _session, _session.current
+    if (
+        t is None
+        or t.published
+        or s.ledger.current[t.slot] is not t
+        or hasattr(t, "native_locations")
+    ):
+        raise AssertionError("native block location owner is stale or already bound")
     if tokens.shape != (len(t.rows), 8):
         raise ValueError("native seed-plus-seven output shape changed")
     if own_outputs and any(
@@ -509,6 +516,9 @@ def own_block(tokens, positions, locations, own_outputs, originals):
     t.snapshots.update(
         tokens=tokens.clone(), positions=positions.clone(), locations=locations.clone()
     )
+    # The other slot can flush after this block is owned but before begin_verify.
+    # Bind the exact post-clone native object here, never a value-equal snapshot.
+    t.native_locations = locations
     for name, w in (("inputs", s.inputs), ("head", s.head)):
         n = len(t.rows)
         _flag(t, f"own_block.{name}.graph_flags", w.flags[t.slot, :n].any().clone())
@@ -779,11 +789,15 @@ def observed_append(worker, native_call, **materialize):
     ]
     # The owned location object is the original cloned native block, not a
     # host readback or a guessed slot from equal batch sizes.
-    t = next(
-        (t for t in slots if t.native_locations is materialize["cache_loc_2d"]), None
-    )
-    if t is None:
-        raise AssertionError("feature append lost exact native slot owner")
+    for t in slots:
+        if not hasattr(t, "native_locations"):
+            raise AssertionError(
+                f"feature append encountered unbound live draft slot={t.slot} epoch={t.epoch}"
+            )
+    owners = [t for t in slots if t.native_locations is materialize["cache_loc_2d"]]
+    if len(owners) != 1:
+        raise AssertionError("feature append lost unique exact native slot owner")
+    t = owners[0]
     for key, value in materialize.items():
         name = {
             "target_hidden": "hidden",
@@ -838,7 +852,11 @@ def observed_append(worker, native_call, **materialize):
 
 
 def bind_locations(slot, block):
-    ticket(slot).native_locations = block.cache_locs
+    t = ticket(slot)
+    if not hasattr(t, "native_locations") or t.native_locations is not block.cache_locs:
+        raise AssertionError(
+            "verify native location identity was not owned at draft completion"
+        )
 
 
 def finish_append(slot):

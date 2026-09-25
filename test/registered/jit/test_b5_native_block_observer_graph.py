@@ -429,10 +429,14 @@ def test_verified_bonus_continuity_native_two_stream_relay(corrupt, monkeypatch)
         p
         for p in specs
         if p.target.endswith(
-            ("._defer_draft_materialization", ".flush_spec_pdmux_pending")
+            (
+                "._make_draft_block",
+                "._defer_draft_materialization",
+                ".flush_spec_pdmux_pending",
+            )
         )
     ]
-    assert len(selected) == 2
+    assert len(selected) == 3
     small.wait_stream(torch.cuda.current_stream())
     large.wait_stream(torch.cuda.current_stream())
     native_wait = torch.cuda.Stream.wait_event
@@ -477,9 +481,16 @@ def test_verified_bonus_continuity_native_two_stream_relay(corrupt, monkeypatch)
                         guard.setattr(torch.cuda.Stream, "wait_event", forbidden_sync)
                         obs.begin_draft(worker, batch, draft, True)
                     t = s.current
+                    s.checked_tokens[slot].fill_(7)
+                    for watch in (s.inputs, s.head):
+                        watch.record(
+                            torch.zeros(32, 5, device="cuda", dtype=torch.int64)
+                        )
                     block = worker._make_draft_block(
-                        torch.arange(256, device="cuda").reshape(32, 8),
-                        torch.arange(256, device="cuda"),
+                        torch.cat([s.seed[:32, None], s.checked_tokens[slot]], 1),
+                        (
+                            s.prefix[:32, None] + torch.arange(8, device="cuda")
+                        ).flatten(),
                         s.locations[:32],
                         own_outputs=True,
                     )

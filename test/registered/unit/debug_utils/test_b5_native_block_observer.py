@@ -774,6 +774,7 @@ def test_packed_block_links_checked_graph_head_seed_and_allocator_locations(
     session.seed[:32].copy_(torch.arange(32) + 100)
     session.prefix[:32].fill_(19)
     session.locations[:32].copy_(t.native_locations)
+    del t.native_locations  # own_block is the first native location binding.
     session.checked_tokens[1].copy_(torch.arange(32 * 7).reshape(32, 7))
     for watch in (session.inputs, session.head):
         watch.activate(t)
@@ -814,6 +815,274 @@ def test_begin_draft_binds_actual_target_req_to_token_mapping(session):
     assert torch.equal(session.locations[:32], expected.long())
     table.zero_()
     assert torch.equal(session.locations[:32], expected.long())
+
+
+@pytest.fixture
+def native_append_lifecycle(monkeypatch):
+    """Actual worker ordering/ownership; synthetic draft and KV arithmetic only."""
+    monkeypatch.syspath_prepend(str(ROOT / "test/registered/unit"))
+    from test_dflash_slot_lifecycle import DFlashSlotLifecycleTests
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    case = DFlashSlotLifecycleTests()
+    case.setUp()
+    monkeypatch.setattr(obs, "FEATURES", 4)
+    s = obs.Session("cpu", 2, [32, 64])
+    monkeypatch.setattr(obs, "_session", s)
+    s.runners = {"target": NS(), "draft": NS()}
+    worker = case.worker
+    worker.model_runner = NS(
+        req_to_token_pool=NS(req_to_token=torch.arange(65 * 128).reshape(65, 128))
+    )
+    worker._use_fused_kv_materialize = False
+    worker._fused_kv_helper = None
+    buffers = [
+        [torch.zeros(65 * 128, 1, 1).bfloat16() for _ in range(6)] for _ in range(2)
+    ]
+    worker.draft_model_runner = NS(
+        token_to_kv_pool=NS(
+            _get_key_buffer=lambda i: buffers[0][i],
+            _get_value_buffer=lambda i: buffers[1][i],
+        )
+    )
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (2**40, 2**40))
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda: NS(record=lambda _: None, query=lambda: True)
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        obs,
+        "materializer_reference",
+        lambda worker, hidden, positions: (
+            "sequential",
+            [
+                (
+                    torch.ones(hidden.shape[0], 1, 1).bfloat16(),
+                    torch.ones(hidden.shape[0], 1, 1).bfloat16(),
+                )
+                for _ in range(6)
+            ],
+        ),
+    )
+
+    def append(**materialize):
+        case.device.log.append(("small", "append"))
+        loc, count = materialize["cache_loc_2d"], materialize["commit_lens"]
+        ids = loc[torch.arange(8)[None, :] < count[:, None]]
+        for family in buffers:
+            for value in family:
+                value[ids] = 1
+
+    worker._append_target_hidden_to_draft_kv_by_loc = append
+
+    def draft(batch, draft_input, *, own_outputs):
+        obs.begin_draft(worker, batch, draft_input, own_outputs)
+        t, n = s.current, len(batch.reqs)
+        case.device.log.append(("small", "draft", t.slot))
+        s.checked_tokens[t.slot, :n].fill_(7)
+        for watch in (s.inputs, s.head):
+            watch.record(torch.zeros(n, 5, dtype=torch.int64))
+        return worker._make_draft_block(
+            torch.cat([s.seed[:n, None], s.checked_tokens[t.slot, :n]], 1),
+            (s.prefix[:n, None] + torch.arange(8)).flatten(),
+            s.locations[:n],
+            own_outputs=own_outputs,
+        )
+
+    def verify(batch, draft_input, block, *, on_publish, on_relay, slot):
+        index = 0 if slot is None else slot
+        case.device.log.append(("large", "verify", index))
+        obs.begin_verify(batch, block, slot)
+        obs.bind_locations(slot, block)
+        t, n = s.current, len(batch.reqs)
+        hidden = torch.ones(n * 8, 4).bfloat16()
+        result = case.result(bs=n, offset=100 * index)
+        t.snapshots.update(
+            hidden=hidden.clone(),
+            committed=result.accept_lens.clone(),
+            bonus=result.next_draft_input.bonus_tokens.clone(),
+        )
+        if slot is None:
+            obs.observed_append(
+                worker,
+                append,
+                target_hidden=hidden,
+                cache_loc=block.cache_locs.flatten(),
+                cache_loc_2d=block.cache_locs,
+                positions=block.positions,
+                commit_lens=result.accept_lens,
+            )
+        else:
+            worker._defer_draft_materialization(
+                slot=slot, result=result, hidden=hidden, block=block, on_relay=on_relay
+            )
+        return block
+
+    monkeypatch.setattr(worker, "_draft_block", draft)
+    monkeypatch.setattr(worker, "_verify_block", verify)
+
+    def run(slot, n=32):
+        batch = NS(
+            reqs=reqs(slot, n),
+            spec_pdmux_slot=slot,
+            forward_mode=ForwardMode.DECODE,
+            is_extend_in_batch=False,
+            spec_info=case.result(bs=n).next_draft_input,
+            sampling_info=None,
+            seq_lens=torch.full((n,), 16),
+            req_pool_indices=torch.arange(slot * 32 + 1, slot * 32 + n + 1),
+            enable_overlap=True,
+        )
+        batch._spec_pdmux_draft_pool = [batch]
+        return worker.forward_batch_generation(batch, on_relay=lambda _: None)
+
+    specs = PatchConfig(
+        **yaml.safe_load((ROOT / "test/manual/gdn_compact_shadow_b5.yaml").read_text())
+    ).patches
+    selected = [
+        p
+        for p in specs
+        if p.target.endswith(
+            (
+                "._make_draft_block",
+                "._defer_draft_materialization",
+                ".flush_spec_pdmux_pending",
+            )
+        )
+    ]
+    assert len(selected) == 3
+    try:
+        with CodePatcher(patches=selected):
+            yield NS(session=s, worker=worker, case=case, run=run)
+    finally:
+        case.doCleanups()
+
+
+@pytest.mark.parametrize("first", [0, 1])
+@pytest.mark.parametrize("n", [1, 32])
+def test_native_opposite_draft_is_owned_before_pending_append(
+    native_append_lifecycle, first, n
+):
+    fixture = native_append_lifecycle
+    s, worker = fixture.session, fixture.worker
+    original = fixture.run(first, n)
+    prior = s.ledger.current[first]
+    next_block = fixture.run(1 - first, n)
+    current = s.ledger.current[1 - first]
+    assert prior.published and current.native_locations is next_block.cache_locs
+    assert not current.published
+    log = fixture.case.device.log
+    assert log.index(("small", "draft", 1 - first)) < log.index(("small", "append"))
+    assert log.index(("small", "append")) < log.index(("large", "verify", 1 - first))
+    s.poll()  # Actual cleanup deletes prior.native_locations while ledger retains it.
+    assert not hasattr(prior, "native_locations") and not prior.snapshots
+    worker.flush_spec_pdmux_pending(1 - first)
+    s.poll()
+    assert s.stats["completed"] == 2 and s.retained() == 0
+    replacement = fixture.run(first, n)  # Same physical rows, new request generations.
+    assert s.ledger.current[first].generations != prior.generations
+    assert replacement.cache_locs is not original.cache_locs
+    worker.flush_spec_pdmux_pending(first)
+    s.poll()
+    assert s.stats["completed"] == 3
+
+
+@pytest.mark.parametrize("n", [1, 32])
+def test_native_stock_immediate_append_and_retired_row_reuse(
+    native_append_lifecycle, n
+):
+    fixture = native_append_lifecycle
+    s, worker = fixture.session, fixture.worker
+    s.slots = 1
+    worker.server_args.enable_spec_pdmux = False
+    worker._spec_pdmux_concurrent = False
+    block = fixture.run(0, n)
+    old = s.ledger.current[0]
+    assert old.published and old.native_locations is block.cache_locs
+    s.poll()
+    assert not hasattr(old, "native_locations") and not old.snapshots
+    replacement = fixture.run(0, n)
+    assert s.ledger.current[0].generations != old.generations
+    assert s.ledger.current[0].native_locations is replacement.cache_locs
+    s.poll()
+    assert s.stats["completed"] == 2 and s.retained() == 0
+
+
+@pytest.mark.parametrize("corrupt", ["clone", "opposite", "missing"])
+def test_verify_cannot_rebind_exact_native_location_owner(
+    native_append_lifecycle, corrupt
+):
+    fixture = native_append_lifecycle
+    block = fixture.run(0, 1)
+    t = fixture.session.ledger.current[0]
+    original = t.native_locations
+    if corrupt == "clone":
+        block.cache_locs = original.clone()
+    elif corrupt == "opposite":
+        block.cache_locs = owner(fixture.session, 1, 1).native_locations
+    else:
+        del t.native_locations
+    with pytest.raises(
+        AssertionError, match="identity was not owned at draft completion"
+    ):
+        obs.bind_locations(0, block)
+    if corrupt != "missing":
+        assert t.native_locations is original
+    else:
+        assert not hasattr(t, "native_locations")
+
+
+@pytest.mark.parametrize(
+    "corrupt", ["missing_active", "ambiguous", "stale_clone", "retired"]
+)
+def test_append_owner_selection_fails_closed(native_append_lifecycle, corrupt):
+    fixture = native_append_lifecycle
+    s, worker = fixture.session, fixture.worker
+    block = fixture.run(0, 1)
+    payload = dict(worker._spec_pdmux_state["pending"][0].materialize)
+    expected = "unique exact native slot owner"
+    if corrupt == "missing_active":
+        other = owner(s, 1, 1)
+        del other.native_locations
+        expected = "unbound live draft slot=1"
+    elif corrupt == "ambiguous":
+        other = owner(s, 1, 1)
+        other.native_locations = block.cache_locs
+    elif corrupt == "stale_clone":
+        payload["cache_loc_2d"] = block.cache_locs.clone()
+    else:
+        worker.flush_spec_pdmux_pending(0)
+        s.poll()
+        assert not hasattr(s.ledger.current[0], "native_locations")
+    calls = []
+    with pytest.raises(AssertionError, match=expected):
+        obs.observed_append(worker, lambda **kwargs: calls.append(kwargs), **payload)
+    assert not calls
+
+
+@pytest.mark.parametrize("corrupt", ["already_bound", "retired", "noncurrent"])
+def test_draft_completion_cannot_replace_location_owner(
+    native_append_lifecycle, corrupt
+):
+    fixture = native_append_lifecycle
+    s, worker = fixture.session, fixture.worker
+    block = fixture.run(0, 1)
+    old = s.current
+    if corrupt != "already_bound":
+        worker.flush_spec_pdmux_pending(0)
+        s.poll()
+        if corrupt == "noncurrent":
+            fixture.run(0, 1)
+            s.current = old
+    with pytest.raises(AssertionError, match="owner is stale or already bound"):
+        obs.own_block(
+            block.tokens,
+            block.positions,
+            block.cache_locs,
+            True,
+            (block.tokens, block.positions, block.cache_locs),
+        )
 
 
 @pytest.fixture
