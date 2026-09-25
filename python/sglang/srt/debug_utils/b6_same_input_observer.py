@@ -120,7 +120,9 @@ def native_kv_reference(attn, context, positions):
     return k * cos + torch.cat([-right, left], -1) * sin, v.view_as(k)
 
 
-def acceptance_reference(candidates, target, prefix):
+def acceptance_reference(candidates, target, prefix, *, use_triton=False):
+    if type(use_triton) is not bool:
+        raise ValueError("native acceptance path must be explicit")
     if (
         candidates.ndim != 2
         or candidates.shape[1] != 8
@@ -132,7 +134,13 @@ def acceptance_reference(candidates, target, prefix):
     bonus = target.gather(1, accepted[:, None]).squeeze(1)
     output = torch.cat([candidates[:, 1:], torch.zeros_like(candidates[:, :1])], 1)
     output.scatter_(1, accepted[:, None], bonus[:, None])
-    return committed, bonus, output, prefix + committed.to(prefix.dtype)
+    new_lens = prefix + committed.to(prefix.dtype)
+    if use_triton:
+        # Match DFlashWorkerV2's actual buffered store ABI, not the observed
+        # tensor dtype. Eager fallback returns int64 bonus and prefix-typed lens.
+        bonus = bonus.to(torch.int32)
+        new_lens = new_lens.to(torch.int64)
+    return committed, bonus, output, new_lens
 
 
 def prefix_expected(before, projected, committed):
@@ -371,6 +379,7 @@ class Session:
         self.arm = None
         self.small_stream = None
         self.worker_bound = False
+        self.worker = None
         self.failure = None
         # Graph64 padded storage; live comparisons always use actual <=32 rows.
         self.taps = torch.empty((64 * 8, 5 * 5120), dtype=torch.bfloat16, device=device)
@@ -423,6 +432,7 @@ class Session:
         if (self.arm == "stock") != (stream is None):
             raise AssertionError("native stock/co-location stream contract changed")
         self.small_stream, self.worker_bound = stream, True
+        self.worker = worker
 
     def reference_stream(self):
         if self.device.type == "cpu":
@@ -935,7 +945,12 @@ def verification(
     if not graph:
         raise AssertionError("native target graph replay required")
     _session.stats["target_graph_replays"][slot] += 1
-    expected = acceptance_reference(candidates, target, prefix)
+    expected = acceptance_reference(
+        candidates,
+        target,
+        prefix,
+        use_triton=_session.worker._use_triton_accept_bonus,
+    )
     t.checks += [
         different(a, b).long()
         for a, b in zip((committed, bonus, output, new_lens), expected)

@@ -12,6 +12,7 @@ import torch
 import yaml
 
 from sglang.srt.debug_utils import b6_same_input_observer as obs
+from sglang.srt.debug_utils import b5_native_block_observer as b5_obs
 from sglang.srt.debug_utils.source_patcher.source_editor import apply_edits
 from sglang.srt.debug_utils.source_patcher.types import PatchConfig
 
@@ -370,6 +371,144 @@ def test_all_commit_lengths_acceptance_and_poison_on_independent_two32_shadow():
             assert not torch.equal(expected[:, :commit], source[:, :commit])
 
 
+@pytest.mark.parametrize("observer", [obs, b5_obs], ids=["B6", "B5"])
+@pytest.mark.parametrize("batch_size", [1, 32])
+@pytest.mark.parametrize("prefix_dtype", [torch.int32, torch.int64])
+def test_real_native_acceptance_buffer_abi_and_eager_fallback(
+    observer, batch_size, prefix_dtype, monkeypatch
+):
+    """Actual allocator ABI on CPU; no claim to execute the Triton kernel."""
+    path = "sglang/srt/speculative/dflash_worker_v2.py"
+    scope = dict(torch=torch)
+    exec(
+        compile(
+            source_method(path, "DFlashWorkerV2", "_ensure_accept_bonus_buffers"),
+            str(PYTHON / path),
+            "exec",
+        ),
+        scope,
+    )
+    worker = NS(device="cpu", block_size=8, _accept_bonus_buffer_cap=0)
+    scope["_ensure_accept_bonus_buffers"](worker, batch_size)
+    eager_path = "sglang/srt/speculative/dflash_utils.py"
+    exec(
+        compile(
+            "from __future__ import annotations\n"
+            + source_method(eager_path, "compute_dflash_correct_drafts_and_bonus"),
+            str(PYTHON / eager_path),
+            "exec",
+        ),
+        scope,
+    )
+    ledger, watch = obs.Ledger(), obs.GraphWatch("cpu")
+    features = len(observer.TAPS) * 5120
+    session = NS(
+        worker=worker,
+        arm="prior",
+        slots=2,
+        ledger=ledger,
+        target=watch,
+        taps=torch.zeros(batch_size * 8, features, dtype=torch.bfloat16),
+        tap_epochs=torch.ones(len(observer.TAPS), dtype=torch.int64),
+        tap_slots=torch.zeros(len(observer.TAPS), dtype=torch.int64),
+        stats={"target_graph_replays": [0, 0]},
+    )
+    monkeypatch.setattr(observer, "_session", session)
+    candidates = torch.arange(batch_size * 8).reshape(batch_size, 8)
+    prefix = torch.arange(batch_size, dtype=prefix_dtype) + 17
+    for slot in (0, 1):
+        ticket = ledger.begin(slot, reqs(1 + slot * 32, batch_size))
+        watch.activate(ticket)
+        watch.record(torch.zeros(batch_size, 5, dtype=torch.int64))
+        session.tap_slots.fill_(slot)
+        for commit in range(1, 9):
+            target = candidates + 1
+            target[:, commit - 1 :] += 10000
+            accepted, bonus = scope["compute_dflash_correct_drafts_and_bonus"](
+                candidates=candidates, target_predict=target
+            )
+            assert (accepted + 1 == commit).all()
+            output = torch.cat(
+                [candidates[:, 1:], torch.zeros_like(candidates[:, :1])], 1
+            )
+            output[:, commit - 1] = bonus
+            eager = (
+                accepted.to(torch.int32) + 1,
+                bonus,
+                output,
+                prefix + commit,
+            )
+            # Match native buffer stores, not an invented uniform integer ABI.
+            fast = (
+                worker._commit_lens_bufs[slot],
+                worker._bonus_id_bufs[slot],
+                worker._out_tokens_bufs[slot],
+                worker._new_seq_lens_bufs[slot],
+            )
+            for actual, expected in zip(fast, eager):
+                actual.copy_(expected)
+            assert tuple(x.dtype for x in fast) == (
+                torch.int32,
+                torch.int32,
+                torch.int64,
+                torch.int64,
+            )
+            # The flag can flip on a native fallback between draft and verify.
+            for use_triton, actual in ((True, fast), (False, eager)):
+                worker._use_triton_accept_bonus = use_triton
+                ticket.checks.clear()
+                print(
+                    observer.__name__,
+                    slot,
+                    commit,
+                    use_triton,
+                    [(tuple(x.shape), str(x.dtype), str(x.device)) for x in actual],
+                )
+                observer.verification(
+                    slot,
+                    candidates,
+                    target,
+                    prefix,
+                    *actual,
+                    session.taps.reshape(batch_size, 8, features),
+                    True
+                )
+                assert not torch.stack(ticket.checks).any()
+                if commit == 1:
+                    # Value corruption and wrong ABI still fail; never cast
+                    # the expected result to an arbitrary observed dtype.
+                    for field in range(4):
+                        corrupted = [x.clone() for x in actual]
+                        corrupted[field].reshape(-1)[0] += 1
+                        ticket.checks.clear()
+                        observer.verification(
+                            slot,
+                            candidates,
+                            target,
+                            prefix,
+                            *corrupted,
+                            session.taps.reshape(batch_size, 8, features),
+                            True
+                        )
+                        assert torch.stack(ticket.checks).any()
+                        wrong_abi = list(actual)
+                        wrong_abi[field] = actual[field].to(
+                            torch.int64
+                            if actual[field].dtype == torch.int32
+                            else torch.int32
+                        )
+                        with pytest.raises(ValueError, match="shape/dtype/device"):
+                            observer.verification(
+                                slot,
+                                candidates,
+                                target,
+                                prefix,
+                                *wrong_abi,
+                                session.taps.reshape(batch_size, 8, features),
+                                True
+                            )
+
+
 def test_byte_comparison_rejects_alias_and_detects_signed_zero():
     x = torch.zeros(32, dtype=torch.bfloat16)
     assert not obs.disjoint(x, x[:8])
@@ -386,6 +525,25 @@ def test_byte_comparison_rejects_alias_and_detects_signed_zero():
         obs.independent_storage([x], [x])
     with pytest.raises(ValueError):
         obs.independent_storage([x.float()], [])
+
+
+def test_acceptance_path_requires_a_bound_worker_boolean():
+    s = obs.Session("cpu")
+    s.arm = "prior"
+    worker = NS(_spec_pdmux_small_stream=object(), _use_triton_accept_bonus=True)
+    s.bind_worker(worker)
+    assert s.worker is worker
+    worker._use_triton_accept_bonus = False
+    assert s.worker._use_triton_accept_bonus is False
+    candidates = torch.arange(8).reshape(1, 8)
+    for invalid in (None, 1, "triton"):
+        with pytest.raises(ValueError, match="path must be explicit"):
+            obs.acceptance_reference(
+                candidates,
+                candidates + 1,
+                torch.zeros(1, dtype=torch.int64),
+                use_triton=invalid,
+            )
 
 
 def test_native_proposal_clone_pointer_guard_and_replay_survival():
@@ -411,6 +569,7 @@ def test_native_proposal_clone_pointer_guard_and_replay_survival():
 
 def test_feature_order_and_epoch_are_checked_on_actual_verify_rows():
     s = obs.Session("cpu")
+    s.worker = NS(_use_triton_accept_bonus=False)
     obs._session = s
     ticket = s.ledger.begin(0, reqs())
     s.target.activate(ticket)

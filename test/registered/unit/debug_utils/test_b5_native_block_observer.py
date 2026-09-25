@@ -337,6 +337,7 @@ def test_graph_input_checks_native_mask_positions_embedding_and_rows(session, co
 
 @pytest.mark.parametrize("corrupt", [None, "tap_order", "epoch", "publication"])
 def test_actual_tap_order_epoch_and_native_publication_are_checked(session, corrupt):
+    session.worker = NS(_use_triton_accept_bonus=False)
     t = owner(session, 0, 1)
     session.target.activate(t)
     fb = NS(
@@ -434,6 +435,7 @@ def test_begin_draft_binds_actual_target_req_to_token_mapping(session):
         req_pool_indices=torch.arange(1, 33),
     )
     obs.begin_draft(worker, batch, NS(bonus_tokens=torch.arange(32)), True)
+    assert session.worker is worker
     expected = table[
         batch.req_pool_indices[:, None], batch.seq_lens[:, None] + torch.arange(8)
     ]

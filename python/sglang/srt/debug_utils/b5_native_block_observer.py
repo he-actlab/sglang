@@ -68,6 +68,7 @@ class Session:
         self.free = list(range(4))
         self.inflight, self.runners = [], {}
         self.current = None
+        self.worker = None
         self.stats = dict(
             failure_count=0,
             completed=0,
@@ -230,6 +231,7 @@ def initialize(runner):
 
 def begin_draft(worker, batch, draft_input, own_outputs):
     s = _session
+    s.worker = worker
     s.poll()
     if set(s.runners) != {"target", "draft"} or not s.free:
         raise AssertionError("B5 observer roles/mailbox bound incomplete")
@@ -394,7 +396,12 @@ def verification(
     t, s = ticket(slot), _session
     if not graph:
         raise AssertionError("native target graph replay required")
-    expected = acceptance_reference(candidates, target, prefix)
+    expected = acceptance_reference(
+        candidates,
+        target,
+        prefix,
+        use_triton=s.worker._use_triton_accept_bonus,
+    )
     t.checks += [
         different(a, b).long()
         for a, b in zip((committed, bonus, output, new_lens), expected)
