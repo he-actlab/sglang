@@ -39,12 +39,12 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.native_block_phase import spec_stage_span
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     record_stream_each,
     spec_pdmux_concurrent_enabled,
-    spec_stage_span,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
