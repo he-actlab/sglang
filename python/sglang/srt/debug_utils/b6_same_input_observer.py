@@ -9,9 +9,11 @@ this cannot establish uninstrumented timing/overlap, loader mapping, literal
 author-environment numerics, or independent target-attention correctness.
 """
 
+import hashlib
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -309,6 +311,306 @@ class DraftTrace:
         )
 
 
+class FirstLayerTrace:
+    """Graph-owned, full-padded-M evidence; never input to serving.
+
+    The two banks are selected by device controls, not a captured Python ticket.
+    Every field records the actual graph row count. Only those rows are read;
+    the capacity tail may contain poison or a previous graph's data.
+    """
+
+    def __init__(self, watch, hidden_size, kv_size, plan_capacity):
+        if min(hidden_size, kv_size, plan_capacity) <= 0:
+            raise ValueError("positive first-layer diagnostic geometry required")
+        self.watch = watch
+        self.plan_capacity = plan_capacity
+        self.widths = dict(
+            entry=hidden_size,
+            input_norm=hidden_size,
+            qkv=hidden_size + 2 * kv_size,
+            qk_norm=hidden_size + kv_size,
+            qk_rope=hidden_size + kv_size,
+            attention=hidden_size,
+            output_projection=hidden_size,
+        )
+        device = watch.control.device
+        self.tensors = {
+            name: torch.empty((2, 64, 7, width), dtype=torch.bfloat16, device=device)
+            for name, width in self.widths.items()
+        }
+        for name in ("input_ids", "positions", "out_cache_loc"):
+            self.tensors[name] = torch.empty(
+                (2, 64, 7), dtype=torch.int64, device=device
+            )
+        for name in ("rows", "prefix"):
+            self.tensors[name] = torch.empty((2, 64), dtype=torch.int64, device=device)
+        for name, width in (
+            ("qo_indptr", 65),
+            ("kv_indptr", 65),
+            ("last_page_len", 64),
+            ("kv_indices", plan_capacity),
+        ):
+            self.tensors[name] = torch.empty(
+                (2, width), dtype=torch.int32, device=device
+            )
+        self.names = tuple(self.tensors)
+        self.stamps = torch.zeros(
+            (2, len(self.names)), dtype=torch.int64, device=device
+        )
+        self.graph_rows = torch.zeros_like(self.stamps)
+
+    def persistent_tensors(self):
+        return [*self.tensors.values(), self.stamps, self.graph_rows]
+
+    def capture(self, name, value, graph_rows):
+        destination = self.tensors[name]
+        if (
+            not 1 <= graph_rows <= 64
+            or value.dtype != destination.dtype
+            or value.device != destination.device
+            or value.shape[1:] != destination.shape[2:]
+            or value.shape[0] > destination.shape[1]
+        ):
+            raise ValueError("first-layer capture metadata changed: " + name)
+        index = self.names.index(name)
+        for slot in (0, 1):
+            selected = (self.watch.control[0] == slot) & (self.watch.control[1] > 0)
+            target = destination[slot, : value.shape[0]]
+            torch.where(selected, value, target, out=target)
+            self.stamps[slot, index].copy_(
+                torch.where(selected, self.watch.control[1], self.stamps[slot, index])
+            )
+            self.graph_rows[slot, index].copy_(
+                torch.where(
+                    selected,
+                    torch.full_like(self.graph_rows[slot, index], graph_rows),
+                    self.graph_rows[slot, index],
+                )
+            )
+
+    def stage(self, name, value):
+        width = self.widths[name]
+        if value.ndim != 2 or value.shape[1] != width or value.shape[0] % 7:
+            raise ValueError("first-layer seven-position stage changed: " + name)
+        self.capture(name, value.reshape(-1, 7, width), value.shape[0] // 7)
+
+    def entry(self, ids, positions, hidden, batch):
+        self.stage("entry", hidden)
+        rows = hidden.shape[0] // 7
+        for name, value in (
+            ("input_ids", ids),
+            ("positions", positions),
+            ("out_cache_loc", batch.out_cache_loc),
+        ):
+            if value is None or value.numel() != rows * 7:
+                raise ValueError("missing actual graph-entry metadata: " + name)
+            if value.dtype not in (torch.int32, torch.int64):
+                raise ValueError("nonintegral graph-entry metadata: " + name)
+            self.capture(name, value.reshape(rows, 7).long(), rows)
+        for name, value in (
+            ("rows", batch.req_pool_indices),
+            ("prefix", batch.seq_lens),
+        ):
+            if value is None or value.shape != (rows,):
+                raise ValueError("missing actual graph-entry metadata: " + name)
+            if value.dtype not in (torch.int32, torch.int64):
+                raise ValueError("nonintegral graph-entry metadata: " + name)
+            self.capture(name, value.long(), rows)
+
+    def plan(self, wrapper, graph_rows):
+        # These are the buffers of the wrapper actually selected at the native
+        # callsite, not an eager/default backend or a later mutable lookup.
+        for name, attribute, count in (
+            ("qo_indptr", "_qo_indptr_buf", graph_rows + 1),
+            ("kv_indptr", "_paged_kv_indptr_buf", graph_rows + 1),
+            ("last_page_len", "_paged_kv_last_page_len_buf", graph_rows),
+            ("kv_indices", "_paged_kv_indices_buf", self.plan_capacity),
+        ):
+            value = getattr(wrapper, attribute, None)
+            if value is None or value.ndim != 1 or value.numel() < count:
+                raise ValueError("missing or undersized actual planner buffer: " + name)
+            self.capture(name, value[:count], graph_rows)
+
+    def own(self, ticket):
+        if not hasattr(ticket, "layer0_prefix_lengths"):
+            raise AssertionError("first-layer trace lacks owned entry prefix")
+        slot, n = ticket.slot, len(ticket.rows)
+        sizes = self.graph_rows[slot]
+        ticket.checks += [
+            (self.stamps[slot] != ticket.epoch).any().long(),
+            ((sizes < n) | (sizes > 64) | (sizes != sizes[0])).any().long(),
+        ]
+        ticket.snapshots.update(
+            {
+                "layer0_" + name: value[slot].clone()
+                for name, value in self.tensors.items()
+            }
+        )
+        ticket.snapshots["layer0_graph_rows"] = sizes.clone()
+        ticket.snapshots["layer0_stamps"] = self.stamps[slot].clone()
+
+
+def first_layer_evidence(session, ticket):
+    """Report exact primitive comparisons without replacing the failing oracle.
+
+    Norm/GEMM/RoPE replay uses the entire actual padded M, then compares only
+    live rows. The attention output is retained with bound active-row inputs;
+    no synthetic padded-prefix SDPA replay is mislabeled as the native call.
+    """
+    trace, ref, s = session.first_layer, session.reference, ticket.snapshots
+    n = len(ticket.rows)
+    sizes = s["layer0_graph_rows"].tolist()
+    if not sizes or len(set(sizes)) != 1 or not n <= sizes[0] <= 64:
+        raise AssertionError("actual selected graph shape was not captured")
+    if not torch.all(s["layer0_stamps"] == ticket.epoch):
+        raise AssertionError("first-layer graph stamp changed")
+    g = sizes[0]
+    layer, attn = ref.model.layers[0], ref.model.layers[0].self_attn
+    device, h, kv = session.device, ref.hidden_size, ref.num_kv_heads * ref.head_dim
+    exact, expected = {}, {}
+
+    def check(name, actual, other, *, live=False):
+        expected[name] = other
+        exact[name] = not bool(
+            different(actual[:n] if live else actual, other[:n] if live else other)
+        )
+
+    prefix = ticket.layer0_prefix_lengths
+    positions = s["layer0_positions"][:g]
+    ids = s["layer0_input_ids"][:g]
+    entry = s["layer0_entry"][:g]
+    wanted_ids = torch.full_like(ids[:n], ref.mask_token_id)
+    wanted_ids[:, 0].copy_(s["tokens"][:, 0])
+    check("entry_ids", ids[:n], wanted_ids)
+    check(
+        "entry_embedding",
+        entry[:n],
+        F.embedding(wanted_ids, ref.model.embed_tokens.weight),
+    )
+    check("entry_rows", s["layer0_rows"][:n], torch.tensor(ticket.rows, device=device))
+    check(
+        "entry_prefix_lengths",
+        s["layer0_prefix"][:n],
+        torch.tensor(prefix, device=device),
+    )
+    check(
+        "entry_positions",
+        positions[:n],
+        torch.tensor(prefix, device=device)[:, None]
+        + torch.arange(7, device=device)[None],
+    )
+    check("entry_locations", s["layer0_out_cache_loc"][:n], s["locations"][:, :7])
+    qo, indptr = s["layer0_qo_indptr"][: g + 1], s["layer0_kv_indptr"][: g + 1]
+    check(
+        "planner_query_stride",
+        qo,
+        torch.arange(g + 1, dtype=torch.int32, device=device) * 7,
+    )
+    check(
+        "planner_live_indptr",
+        indptr[: n + 1],
+        torch.tensor(
+            [0, *torch.tensor(prefix).add(7).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+    check(
+        "planner_page1_last",
+        s["layer0_last_page_len"][:g],
+        torch.ones(g, dtype=torch.int32, device=device),
+    )
+    used = int(indptr[n])
+    if not 0 <= used <= trace.plan_capacity:
+        raise AssertionError(
+            "actual used planner span exceeds owned diagnostic storage"
+        )
+    check(
+        "planner_live_locations",
+        s["layer0_kv_indices"][:used],
+        s["layer0_expected_plan"].int(),
+    )
+    prefix_equal = []
+    cursor = 0
+    for key, length in zip(zip(ticket.rows, ticket.generations), prefix):
+        independent = ref._prefixes[key]
+        prefix_equal.append(
+            {
+                "key": list(key),
+                "key_bytes_equal": not bool(
+                    different(
+                        s["layer0_prefix_k"][cursor : cursor + length],
+                        independent.keys[0],
+                    )
+                ),
+                "value_bytes_equal": not bool(
+                    different(
+                        s["layer0_prefix_v"][cursor : cursor + length],
+                        independent.values[0],
+                    )
+                ),
+            }
+        )
+        cursor += length
+    x = s["layer0_input_norm"][:g]
+    check(
+        "input_norm_author_same_input",
+        x,
+        native_norm(entry, layer.input_layernorm),
+        live=True,
+    )
+    packed = F.linear(x.flatten(0, 1), attn.qkv_proj.weight).reshape(g, 7, -1)
+    check("qkv_packed_same_input", s["layer0_qkv"][:g], packed, live=True)
+    separate = torch.cat(
+        [
+            F.linear(x.flatten(0, 1), weight)
+            for weight in attn.qkv_proj.weight.split([h, kv, kv])
+        ],
+        -1,
+    ).reshape(g, 7, -1)
+    check("qkv_separate_same_input", s["layer0_qkv"][:g], separate, live=True)
+    check("qkv_packed_vs_separate", packed, separate, live=True)
+    q, k, _ = s["layer0_qkv"][:g].split([h, kv, kv], -1)
+    q = native_norm(q.reshape(g, 7, ref.num_heads, ref.head_dim), attn.q_norm)
+    k = native_norm(k.reshape(g, 7, ref.num_kv_heads, ref.head_dim), attn.k_norm)
+    check(
+        "qk_norm_author_same_input",
+        s["layer0_qk_norm"][:g],
+        torch.cat([q.flatten(2), k.flatten(2)], -1),
+        live=True,
+    )
+    q, k = s["layer0_qk_norm"][:g].split([h, kv], -1)
+    q = ref._rotary(q.reshape(g, 7, ref.num_heads, ref.head_dim), positions)
+    k = ref._rotary(k.reshape(g, 7, ref.num_kv_heads, ref.head_dim), positions)
+    check(
+        "rope_author_same_input",
+        s["layer0_qk_rope"][:g],
+        torch.cat([q.flatten(2), k.flatten(2)], -1),
+        live=True,
+    )
+    check(
+        "output_projection_same_input",
+        s["layer0_output_projection"][:g],
+        F.linear(s["layer0_attention"][:g].flatten(0, 1), attn.o_proj.weight).reshape(
+            g, 7, h
+        ),
+        live=True,
+    )
+    return (
+        dict(
+            scope="FIRST_LAYER_SAME_INPUT_DIAGNOSTIC_ONLY",
+            live_rows=n,
+            selected_graph_rows=g,
+            primitive_gemm_m=g * 7,
+            exact=exact,
+            independent_prefix=prefix_equal,
+            attention_scope="Actual attention output plus actual active-row prefix/plan/Q/K/V are retained. No additional SDPA replay or native FlashInfer equality claim.",
+            limitations="Separate/packed GEMM and author norm/RoPE comparisons are diagnostics, not substitutions, tolerances or causal conclusions. Residual/MLP are outside this localization.",
+        ),
+        expected,
+    )
+
+
 def validate_args(a):
     colo = a.enable_spec_pdmux
     capacity = 64 if colo else 32
@@ -375,6 +677,7 @@ class Session:
         self.draft = GraphWatch(device)
         self.target = GraphWatch(device)
         self.trace = DraftTrace(self.draft, hidden_size)
+        self.first_layer = None
         self.reference = None
         self.arm = None
         self.small_stream = None
@@ -473,7 +776,112 @@ class Session:
             slot=None if ticket is None else ticket.slot,
             epoch=None if ticket is None else ticket.epoch,
         )
+        if self.first_layer is not None and ticket is not None:
+            try:
+                self.save_first_layer_failure(stage, ticket)
+            except Exception as exc:
+                # Preserve the original strict mismatch even when diagnostics
+                # cannot be completed or the exclusive artifact write fails.
+                self.failure["first_layer_artifact_error"] = repr(exc)
         raise AssertionError("B6 exact diagnostic mismatch: " + repr(self.failure))
+
+    def save_first_layer_failure(self, stage, ticket):
+        if hasattr(ticket, "first_layer_artifact"):
+            return
+        # Existing poll has established ticket.event readiness. No live serving
+        # pool or planner is read here: accepted append may already have run.
+        with self.reference_stream():
+            for tensor in ticket.snapshots.values():
+                if tensor.device.type == "cuda":
+                    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            self.budget(
+                3
+                * sum(
+                    t.numel() * t.element_size()
+                    for t in self.first_layer.tensors.values()
+                )
+            )
+            try:
+                evidence, expected = first_layer_evidence(self, ticket)
+            except Exception as exc:
+                evidence, expected = {"localization_error": repr(exc)}, {}
+            sizes = ticket.snapshots.get("layer0_graph_rows")
+            graph_rows = None if sizes is None else int(sizes[0])
+            if graph_rows is None or not len(ticket.rows) <= graph_rows <= 64:
+                raise AssertionError("cannot persist an unbound selected graph shape")
+            indptr = ticket.snapshots.get("layer0_kv_indptr")
+            used = None if indptr is None else int(indptr[graph_rows])
+            if used is None or not 0 <= used <= self.first_layer.plan_capacity:
+                raise AssertionError("cannot persist an unbound used planner span")
+            tensors = {}
+            for name, tensor in ticket.snapshots.items():
+                if name.startswith("layer0_"):
+                    field = name.removeprefix("layer0_")
+                    if field in self.first_layer.widths or field in (
+                        "input_ids",
+                        "positions",
+                        "out_cache_loc",
+                        "rows",
+                        "prefix",
+                        "last_page_len",
+                    ):
+                        tensor = tensor[:graph_rows]
+                    elif field in ("qo_indptr", "kv_indptr"):
+                        tensor = tensor[: graph_rows + 1]
+                    elif field == "kv_indices":
+                        tensor = tensor[:used]
+                    tensors[name] = tensor.detach().cpu().clone()
+            tensors.update(
+                {
+                    "expected_" + name: tensor.detach().cpu().clone()
+                    for name, tensor in expected.items()
+                }
+            )
+            # Keep both the unchanged full-layer failure and its independent
+            # expected value. These are outputs, not recomputed substitutes.
+            tensors["native_layer0_output"] = (
+                ticket.snapshots["draft_hidden"][0].detach().cpu().clone()
+            )
+            if hasattr(ticket, "reference_block"):
+                tensors["reference_layer0_output"] = (
+                    ticket.reference_block.layer_hidden[0].detach().cpu().clone()
+                )
+            for row, key in enumerate(zip(ticket.rows, ticket.generations)):
+                prefix = self.reference._prefixes[key]
+                tensors[f"reference_prefix_k_{row}"] = (
+                    prefix.keys[0].detach().cpu().clone()
+                )
+                tensors[f"reference_prefix_v_{row}"] = (
+                    prefix.values[0].detach().cpu().clone()
+                )
+            self.reference_done()
+        digest = {
+            name: hashlib.sha256(
+                tensor.contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+            for name, tensor in tensors.items()
+        }
+        path = (
+            Path(self.failure_artifact_dir)
+            / f"b6-layer0-slot{ticket.slot}-epoch{ticket.epoch}.pt"
+        )
+        payload = dict(
+            schema_version=1,
+            original_failure=dict(self.failure),
+            rows=ticket.rows,
+            generations=ticket.generations,
+            prefix_lengths=ticket.layer0_prefix_lengths,
+            evidence=evidence,
+            tensor_sha256=digest,
+            tensors=tensors,
+            timing_valid=False,
+            full_checkpoint_native_semantics=False,
+        )
+        with path.open("xb") as output:
+            torch.save(payload, output)
+        ticket.first_layer_artifact = str(path)
+        self.failure["first_layer_artifact"] = str(path)
+        self.failure["first_layer_localization"] = evidence.get("exact", evidence)
 
     def compare(self, stage, actual, expected, ticket):
         self.stats["reference_byte_comparisons"] += 1
@@ -603,6 +1011,8 @@ class Session:
             self.trace.lengths,
             self.trace.head_stamps,
         ]
+        if self.first_layer is not None:
+            persistent += self.first_layer.persistent_tensors()
         if self.reference is not None:
             persistent.append(self.reference.inv_freq)
         for watch in (self.draft, self.target):
@@ -711,6 +1121,24 @@ def initialize(runner):
         )
 
         _session.reference = NativeDSparkReference(model)
+        # Explicit failure-only output path; generic dumper remains disabled.
+        artifact_dir = os.environ.get("DUMPER_DIR")
+        if not artifact_dir or not Path(artifact_dir).is_absolute():
+            raise ValueError(
+                "first-layer diagnostic requires an explicit absolute DUMPER_DIR"
+            )
+        Path(artifact_dir).mkdir(parents=True, exist_ok=False)
+        _session.failure_artifact_dir = artifact_dir
+        kv_size = model.layers[0].self_attn.kv_size
+        plan_capacity = runner.token_to_kv_pool.k_buffer[0].shape[0] + 64 * 8
+        _session.budget(
+            2 * 64 * 7 * (7 * model.config.hidden_size + 4 * kv_size) * 2
+            + 2 * plan_capacity * 4
+            + 65536
+        )
+        _session.first_layer = FirstLayerTrace(
+            _session.draft, model.config.hidden_size, kv_size, plan_capacity
+        )
     _session.initialized.add(role)
     _session.runners[role] = runner
     if _session.initialized == {"target", "draft"}:
@@ -775,6 +1203,102 @@ def prefill_context(worker, batch, hidden, positions):
 
 def capture_draft_hidden(index, hidden, forward_batch):
     _session.trace.capture(index, hidden)
+
+
+def capture_first_layer_entry(ids, positions, hidden, forward_batch):
+    if _session.first_layer is None:
+        raise AssertionError("first-layer evidence was not initialized before capture")
+    _session.first_layer.entry(ids, positions, hidden, forward_batch)
+
+
+def capture_first_layer_stage(attn, name, value):
+    if attn.attn.layer_id == 0:
+        _session.first_layer.stage(name, value)
+
+
+def capture_first_layer_qk(attn, name, q, k):
+    if attn.attn.layer_id == 0:
+        _session.first_layer.stage(name, torch.cat([q, k], dim=-1))
+
+
+def capture_first_layer_plan(backend, wrapper, layer, forward_batch):
+    s = _session
+    runner = s.runners.get("draft")
+    if runner is None or backend is not runner.attn_backend or layer.layer_id != 0:
+        return
+    if (
+        s.first_layer is None
+        or backend.forward_metadata.use_ragged
+        or runner.token_to_kv_pool.page_size != 1
+        or layer.attn_type.value != "encoder_only"
+        or layer.is_cross_attention
+        or layer.logit_cap != 0
+        or layer.sliding_window_size not in (None, -1)
+        or forward_batch.spec_info.custom_mask is not None
+        or getattr(wrapper, "_custom_mask_buf", None) is not None
+    ):
+        raise ValueError(
+            "first-layer planner left native page1 noncausal no-mask scope"
+        )
+    s.first_layer.plan(wrapper, forward_batch.batch_size)
+
+
+def before_first_layer_forward(worker, batch):
+    s, t = _session, _session.current_draft
+    if s.first_layer is None or t is None:
+        raise AssertionError("first-layer prefix has no owned draft ticket")
+    # Called inside _draft_block, after schedule/prefill relay, pending accepted
+    # KV flush and FutureMap resolution on the SAME native stream. It adds no
+    # readiness edge and cannot be moved to an independent/default stream.
+    if s.device.type == "cuda" and s.small_stream is not None:
+        if torch.cuda.current_stream(s.device) != s.small_stream:
+            raise AssertionError("first-layer prefix capture left native SMALL")
+    host = batch.seq_lens_cpu
+    n = len(t.rows)
+    if (
+        host is None
+        or host.device.type != "cpu"
+        or host.shape != (n,)
+        or not batch.spec_info.seq_lens_cpu_is_exact
+    ):
+        raise ValueError("first-layer prefix requires exact native host lengths")
+    lengths = tuple(host.tolist())
+    if any(type(length) is not int or length <= 0 for length in lengths):
+        raise ValueError("positive exact committed prefixes required")
+    pool = worker.draft_model_runner.token_to_kv_pool
+    if sum(lengths) + 7 * n > s.first_layer.plan_capacity:
+        raise ValueError("native prefix exceeds declared diagnostic plan storage")
+    # Two native BF16 K/V arrays, prefix and prefix+noise locations, plus one
+    # full-padded graph snapshot. This is explicit allocation prediction only.
+    fixed_copy = sum(
+        tensor.numel() * tensor.element_size() // 2
+        for tensor in s.first_layer.persistent_tensors()
+    )
+    s.budget(
+        sum(lengths) * (2 * pool.k_buffer[0][0].numel() * 2 + 24)
+        + n * 7 * 8
+        + fixed_copy
+    )
+    mapping = worker.model_runner.req_to_token_pool.req_to_token
+    prefix_ids = torch.cat(
+        [
+            mapping[batch.req_pool_indices[row], :length].long()
+            for row, length in enumerate(lengths)
+        ]
+    )
+    plan_ids = torch.cat(
+        [
+            mapping[batch.req_pool_indices[row], : length + 7].long()
+            for row, length in enumerate(lengths)
+        ]
+    )
+    t.snapshots.update(
+        layer0_prefix_indices=prefix_ids,
+        layer0_expected_plan=plan_ids,
+        layer0_prefix_k=pool._get_key_buffer(0).index_select(0, prefix_ids),
+        layer0_prefix_v=pool._get_value_buffer(0).index_select(0, prefix_ids),
+    )
+    t.layer0_prefix_lengths = lengths
 
 
 def observer_slot(slot):
@@ -898,6 +1422,8 @@ def own_block(tokens, positions, cache_locs, own_outputs, originals):
     t.checks += [(w.stamps[t.slot, :n, 1] != w.generations[:n]).any().long()]
     if hasattr(_session, "trace"):
         _session.trace.own(t)
+    if _session.first_layer is not None:
+        _session.first_layer.own(t)
 
 
 def begin_verify(batch, block, slot):
