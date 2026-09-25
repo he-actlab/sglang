@@ -1,0 +1,119 @@
+# Correctness-only B6 two-slot same-input diagnostic, NOT full native semantics.
+# No attention oracle, serving waiver, performance measurement or tensor offload.
+patches:
+  - target: sglang.srt.debug_utils.dumper._Dumper.register_non_intrusive_dumper
+    edits:
+      - match: "self._http_manager  # noqa: B018"
+        prepend: |
+          if (self._config.enable is not False
+                  or self._config.non_intrusive_mode != "off"
+                  or self._config.server_port_parsed != "reuse"):
+              raise ValueError("B6 source-patcher-only dumper settings required")
+          if self.__dict__.get("_http_manager") is not None:
+              raise RuntimeError("B6 fixture cannot retire an active dumper manager")
+          self.__dict__["_http_manager"] = None
+          return None
+  - target: sglang.srt.debug_utils.dumper._Dumper.apply_source_patches
+    edits:
+      - match: config_path = self._config.source_patcher_config
+        replacement: return
+  - target: sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import initialize
+    edits:
+      - match: self.eager_runner = EagerRunner(self)
+        prepend: initialize(self)
+  - target: sglang.srt.speculative.dspark_worker_v2.DSparkWorkerV2._draft_block
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import begin_draft, draft_graph
+    edits:
+      - match: bs = len(batch.seq_lens)
+        prepend: begin_draft(self, batch, own_outputs)
+      - match: draft_out = self.draft_model_runner.forward(forward_batch)
+        append: draft_graph(draft_out.can_run_graph)
+  - target: sglang.srt.models.dspark.Qwen3DSparkModel.propose
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import observed_proposal
+    edits:
+      - match: |
+          return DSparkProposal(
+              tokens=tokens,
+              logits=logits,
+              confidence_logits=confidence_logits,
+              lengths=dspark_confident_prefix_lengths(
+                  confidence_logits, confidence_threshold
+              ),
+          )
+        replacement: |
+          proposal = DSparkProposal(
+              tokens=tokens,
+              logits=logits,
+              confidence_logits=confidence_logits,
+              lengths=dspark_confident_prefix_lengths(
+                  confidence_logits, confidence_threshold
+              ),
+          )
+          return observed_proposal(self, hidden_states, first_prev_token_ids, proposal, confidence_threshold)
+  - target: sglang.srt.speculative.dspark_worker_v2._DSparkDraftSampler.__call__
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import sampler_rows
+    edits:
+      - match: self.lengths[:bs].copy_(proposal.lengths)
+        append: sampler_rows(forward_batch)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._make_draft_block
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import own_block
+    edits:
+      - match: "if own_outputs:"
+        prepend: _b6_originals = (tokens, positions, cache_locs)
+      - match: return SimpleNamespace(
+        prepend: own_block(tokens, positions, cache_locs, own_outputs, _b6_originals)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._verify_block
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import begin_verify, verification
+    edits:
+      - match: "# Include metadata, acceptance, target recovery, publication and owned"
+        prepend: begin_verify(batch, block, slot)
+      - match: hidden = hidden.view(bs, int(self.block_size), -1)
+        append: verification(slot, candidates, target_predict, prefix_lens, commit_lens, bonus, out_tokens, new_seq_lens, hidden, can_run_cuda_graph)
+  - target: sglang.srt.models.qwen2.Qwen2Model.forward
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import capture_tap
+    edits:
+      - match: aux_hidden_states.append(
+        prepend: capture_tap(i, hidden_states, residual, forward_batch)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._defer_draft_materialization
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import deferred
+    edits:
+      - match: verify_done = dev.Event()
+        prepend: deferred(slot, hidden, materialize)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2.flush_spec_pdmux_pending
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import begin_append, finish_append
+    edits:
+      - match: self._append_target_hidden_to_draft_kv_by_loc(**pending.materialize)
+        prepend: begin_append(self, index, pending)
+      - match: pending.on_relay(pending.relay_result)
+        append: finish_append(index)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import before_write, after_write
+    edits:
+      - match: |
+          self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
+              attn.attn,
+              cache_loc_2d,
+              commit_lens,
+              k,
+              v,
+              attn.attn.k_scale,
+              attn.attn.v_scale,
+          )
+        replacement: |
+          _b6_check = before_write(self, attn, cache_loc_2d, commit_lens, k, v, positions)
+          self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
+              attn.attn,
+              cache_loc_2d,
+              commit_lens,
+              k,
+              v,
+              attn.attn.k_scale,
+              attn.attn.v_scale,
+          )
+          after_write(_b6_check)
+  - target: sglang.srt.managers.scheduler.Scheduler.get_internal_state
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import snapshot
+    edits:
+      - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        append: ret["b6_same_input_observer"] = snapshot()
