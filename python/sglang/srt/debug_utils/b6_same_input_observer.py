@@ -1,12 +1,16 @@
-"""Opt-in B6 same-input checks; never a full-backbone or serving parity gate.
+"""Opt-in B6 exact diagnostic; never a serving/parity/performance admission gate.
 
 Installed only by test/manual/b6_same_input_observer.yaml. Immutable checkpoint
 weights are referenced, not copied. All mutable reference tensors are diagnostic
 copies and never feed serving. Exact comparisons have no numerical tolerance.
-The five-layer attention and complete prefix cache are NOT independently replayed.
+The eager author-algorithm reference owns full accepted prefixes independently.
+Pinned per-row readback and scoped event/value-guard waits perturb scheduling;
+this cannot establish uninstrumented timing/overlap, loader mapping, literal
+author-environment numerics, or independent target-attention correctness.
 """
 
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -159,30 +163,37 @@ class Ledger:
         self.current = [None, None]
         self.epochs = [0, 0]
 
+    def keys(self, reqs):
+        rows = tuple(r.req_pool_idx for r in reqs)
+        if (
+            not 1 <= len(rows) <= 64
+            or len(set(rows)) != len(rows)
+            or any(type(row) is not int or not 1 <= row <= 64 for row in rows)
+        ):
+            raise ValueError("invalid request row ownership")
+        keys = []
+        for req in reqs:
+            if getattr(req, "retraction_count", 0):
+                raise AssertionError("retraction is outside this diagnostic")
+            identity = id(req)
+            if identity not in self.identities:
+                self.identities[identity] = (req, len(self.identities) + 1)
+            keys.append((req.req_pool_idx, self.identities[identity][1]))
+        return tuple(keys)
+
     def begin(self, slot, reqs):
         if slot not in (0, 1) or not 1 <= len(reqs) <= 32:
             raise ValueError("expected two real slots of at most batch32")
         old = self.current[slot]
         if old is not None and not old.published:
             raise AssertionError("slot reused before accepted-feature publication")
-        rows = tuple(r.req_pool_idx for r in reqs)
-        if len(set(rows)) != len(rows) or any(
-            type(x) is not int or not 1 <= x <= 64 for x in rows
-        ):
-            raise ValueError("invalid request row ownership")
+        keys = self.keys(reqs)
+        rows = tuple(k[0] for k in keys)
         other = self.current[1 - slot]
         if other is not None and not other.published and set(rows) & set(other.rows):
             raise AssertionError("live slots share request rows")
-        generations = []
-        for req in reqs:
-            if getattr(req, "retraction_count", 0):
-                raise AssertionError("retraction is outside this diagnostic")
-            key = id(req)
-            if key not in self.identities:
-                self.identities[key] = (req, len(self.identities) + 1)
-            generations.append(self.identities[key][1])
         self.epochs[slot] += 1
-        ticket = Ticket(slot, self.epochs[slot], rows, tuple(generations))
+        ticket = Ticket(slot, self.epochs[slot], rows, tuple(k[1] for k in keys))
         self.current[slot] = ticket
         return ticket
 
@@ -227,7 +238,72 @@ class GraphWatch:
             )
 
 
+class DraftTrace:
+    """Six graph-stamped hidden boundaries; immutable per-ticket copies follow."""
+
+    def __init__(self, watch, hidden_size=5120):
+        self.watch = watch
+        device = watch.control.device
+        self.hidden = torch.empty(
+            (2, 6, 32, 7, hidden_size), dtype=torch.bfloat16, device=device
+        )
+        self.stamps = torch.zeros((2, 6, 32, 2), dtype=torch.int64, device=device)
+        self.confidence = torch.empty((2, 32, 7), dtype=torch.float32, device=device)
+        self.lengths = torch.empty((2, 32), dtype=torch.int64, device=device)
+        self.head_stamps = torch.zeros((2, 32, 2), dtype=torch.int64, device=device)
+
+    def _write(self, destination, stamps, value):
+        w, n = self.watch, min(value.shape[0], 32)
+        active = torch.arange(n, device=value.device) < w.control[2]
+        stamp = torch.stack([w.control[1].expand(n), w.generations[:n]], 1)
+        for slot in (0, 1):
+            selected = active & (w.control[0] == slot) & (w.control[1] > 0)
+            mask = selected.reshape((n,) + (1,) * (value.ndim - 1))
+            torch.where(
+                mask, value[:n], destination[slot, :n], out=destination[slot, :n]
+            )
+            torch.where(
+                selected[:, None], stamp, stamps[slot, :n], out=stamps[slot, :n]
+            )
+
+    def capture(self, index, hidden):
+        if (
+            index not in range(6)
+            or hidden.ndim != 2
+            or hidden.shape[1] != self.hidden.shape[-1]
+            or hidden.shape[0] % 7
+            or hidden.shape[0] > 64 * 7
+            or hidden.dtype != torch.bfloat16
+        ):
+            raise ValueError("native seven-position draft trace changed")
+        self._write(
+            self.hidden[:, index],
+            self.stamps[:, index],
+            hidden.reshape(-1, 7, hidden.shape[-1]),
+        )
+
+    def proposal(self, proposal):
+        self._write(self.confidence, self.head_stamps, proposal.confidence_logits)
+        self._write(self.lengths, self.head_stamps, proposal.lengths)
+
+    def own(self, ticket):
+        n, slot = len(ticket.rows), ticket.slot
+        generation = torch.tensor(ticket.generations, device=self.stamps.device)
+        for stamps in (self.stamps[slot, :, :n], self.head_stamps[slot, :n]):
+            ticket.checks += [
+                (stamps[..., 0] != ticket.epoch).any().long(),
+                (stamps[..., 1] != generation).any().long(),
+            ]
+        ticket.snapshots.update(
+            draft_hidden=self.hidden[slot, :, :n].clone(),
+            confidence=self.confidence[slot, :n].clone(),
+            draft_lengths=self.lengths[slot, :n].clone(),
+        )
+
+
 def validate_args(a):
+    colo = a.enable_spec_pdmux
+    capacity = 64 if colo else 32
     if (
         (a.model_path, a.revision) != TARGET
         or (a.speculative_draft_model_path, a.speculative_draft_model_revision) != DRAFT
@@ -238,11 +314,9 @@ def validate_args(a):
             a.speculative_num_draft_tokens,
         )
         != (1, 1, 8)
-        or not a.enable_spec_pdmux
-        or a.spec_pdmux_slots != 2
-        or a.max_running_requests != 64
-        or a.cuda_graph_config.decode.max_bs != 64
-        or a.spec_pdmux_sm_split != "132,56"
+        or (colo and (a.spec_pdmux_slots != 2 or a.spec_pdmux_sm_split != "132,56"))
+        or a.max_running_requests != capacity
+        or a.cuda_graph_config.decode.max_bs != capacity
         or a.page_size != 1
         or a.dtype != "bfloat16"
         or a.tp_size != 1
@@ -256,30 +330,48 @@ def validate_args(a):
         or getattr(a, "quantization", None) is not None
     ):
         raise ValueError(
-            "B6 observer requires frozen native BF16 DSPARK 7/8 two32/graph64 cache-off TP1"
+            "B6 observer requires frozen BF16 DSPARK7/8 stock32 or two32 cache-off TP1"
         )
-    if (
-        any(
-            os.environ.get(k, "0") != "0"
-            for k in (
-                "SGLANG_PHASE_EVENTS",
-                "SGLANG_NVTX_PROFILE",
-                "SGLANG_SPEC_PDMUX_SERIALIZE",
-            )
+    if any(
+        os.environ.get(k, "0") != "0"
+        for k in (
+            "SGLANG_PHASE_EVENTS",
+            "SGLANG_NVTX_PROFILE",
+            "SGLANG_SPEC_PDMUX_SERIALIZE",
         )
-        or os.environ.get("SGLANG_SPEC_PDMUX_SM_HINT") != "2"
+    ) or os.environ.get("SGLANG_SPEC_PDMUX_SM_HINT") != ("2" if colo else "0"):
+        raise ValueError(
+            "correctness-only diagnostic requires its native stream controls"
+        )
+    placement = tuple(
+        os.environ.get("SGLANG_SPEC_PDMUX_" + key, default)
+        for key, default in (
+            ("DRAFT_EXTEND_QKV_PLACEMENT", "auto"),
+            ("FULL_DEVICE_DRAFT_EXTEND_GATE_UP", "0"),
+            ("FULL_DEVICE_DRAFT_EXTEND_LM_HEAD", "0"),
+        )
+    )
+    if placement not in (("auto", "0", "0"), ("full", "1", "1")) or (
+        not colo and placement != ("auto", "0", "0")
     ):
         raise ValueError(
-            "correctness-only overlapping diagnostic with native hint2 required"
+            "only exact stock/prior/candidate placement controls are supported"
         )
+    return "stock" if not colo else ("candidate" if placement[0] == "full" else "prior")
 
 
 class Session:
-    def __init__(self, device):
-        self.device = device
+    def __init__(self, device, *, hidden_size=5120):
+        self.device = torch.device(device)
         self.ledger = Ledger()
         self.draft = GraphWatch(device)
         self.target = GraphWatch(device)
+        self.trace = DraftTrace(self.draft, hidden_size)
+        self.reference = None
+        self.arm = None
+        self.small_stream = None
+        self.worker_bound = False
+        self.failure = None
         # Graph64 padded storage; live comparisons always use actual <=32 rows.
         self.taps = torch.empty((64 * 8, 5 * 5120), dtype=torch.bfloat16, device=device)
         self.tap_epochs = torch.zeros(5, dtype=torch.int64, device=device)
@@ -291,6 +383,16 @@ class Session:
             "slot_max_batch_enqueued": [0, 0],
             "slot_max_batch_checked": [0, 0],
             "prefix_histogram": [0] * 8,
+            "reference_completed": 0,
+            "reference_prefill_batches": 0,
+            "reference_prefill_tokens": 0,
+            "reference_layer_comparisons": [0] * 6,
+            "draft_graph_replays": [0, 0],
+            "target_graph_replays": [0, 0],
+            "diagnostic_event_waits": 0,
+            "reference_byte_comparisons": 0,
+            "rejected_verify_positions": 0,
+            "max_explicit_tensor_budget_bytes": 0,
         }
         self.current_draft = None
         self.current_write = None
@@ -304,17 +406,163 @@ class Session:
             for _ in range(4)
         ]
         self.free_mailboxes = list(range(4))
+        self.row_mailboxes = [
+            torch.empty(
+                (32, 2),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=(str(device) != "cpu"),
+            )
+            for _ in range(4)
+        ]
 
-    def poll(self):
+    def bind_worker(self, worker):
+        stream = worker._spec_pdmux_small_stream
+        if self.worker_bound and stream is not self.small_stream:
+            raise AssertionError("diagnostic cannot replace the native draft stream")
+        if (self.arm == "stock") != (stream is None):
+            raise AssertionError("native stock/co-location stream contract changed")
+        self.small_stream, self.worker_bound = stream, True
+
+    def reference_stream(self):
+        if self.device.type == "cpu":
+            return nullcontext()
+        return torch.cuda.stream(
+            self.small_stream or torch.cuda.current_stream(self.device)
+        )
+
+    def budget(self, additional_bytes):
+        # Explicit tensors only; SDPA/allocator workspaces and sampled headroom
+        # still require external admission. This prediction never grants fit.
+        self.stats["max_explicit_tensor_budget_bytes"] = max(
+            self.stats["max_explicit_tensor_budget_bytes"], additional_bytes
+        )
+        if self.device.type == "cuda":
+            from sglang.srt.debug_utils.gdn_compact_shadow import _require_budget
+
+            _require_budget(torch.cuda.mem_get_info(self.device)[0], additional_bytes)
+
+    def wait_event(self, event):
+        if not event.query():
+            self.stats["diagnostic_event_waits"] += 1
+            event.synchronize()
+
+    def reference_done(self):
+        # A diagnostic-only event, never native verify_done/flush_done. Eager
+        # tensor truth/value guards also wait; scheduling is intentionally not
+        # equivalent to an uninstrumented run.
+        if self.device.type == "cuda":
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream(self.device))
+            self.wait_event(done)
+        self.budget(0)
+
+    def fail(self, stage, ticket=None):
+        self.failure = dict(
+            stage=stage,
+            slot=None if ticket is None else ticket.slot,
+            epoch=None if ticket is None else ticket.epoch,
+        )
+        raise AssertionError("B6 exact diagnostic mismatch: " + repr(self.failure))
+
+    def compare(self, stage, actual, expected, ticket):
+        self.stats["reference_byte_comparisons"] += 1
+        if different(actual, expected):
+            self.fail(stage, ticket)
+
+    def replay_reference(self, ticket):
+        ref, n = self.reference, len(ticket.rows)
+        keys = tuple(zip(ticket.rows, ticket.generations))
+        metadata = ticket.row_mailbox.tolist()  # Only after its event readiness.
+        prefix = tuple(row[0] for row in metadata)
+        counts = tuple(row[1] for row in metadata)
+        if ref.prefix_lengths(keys) != prefix or any(not 1 <= c <= 8 for c in counts):
+            self.fail("accepted-prefix metadata", ticket)
+        # Retain diagnostic inputs on their reader stream through the eager
+        # reference; no tensor is returned to serving.
+        if self.device.type == "cuda":
+            for tensor in ticket.snapshots.values():
+                tensor.record_stream(torch.cuda.current_stream(self.device))
+        width = max(prefix) + 7
+        h, kv, q = (
+            ref.hidden_size,
+            ref.num_kv_heads * ref.head_dim,
+            ref.num_heads * ref.head_dim,
+        )
+        vocab = ref.model.lm_head.weight.shape[0]
+        # Simultaneously live explicit attention/head/cache-copy tensors. The
+        # unknown backend workspace is deliberately NOT called a fit bound.
+        self.budget(
+            3 * n * 7 * vocab * 2
+            + 6 * n * 7 * h * 2
+            + 2 * n * width * (kv + q) * 2
+            + (sum(prefix) + 2 * sum(counts)) * 5 * 2 * kv * 2
+        )
+        owned = ref.begin_batch(ticket.slot, ticket.epoch, keys)
+        result = ref.forward_block(owned, ticket.snapshots["tokens"][:, 0])
+        ticket.reference_block = result  # Retained on failure for diagnosis.
+        for index, expected in enumerate((*result.layer_hidden, result.hidden)):
+            self.compare(
+                f"draft hidden boundary {index}",
+                ticket.snapshots["draft_hidden"][index],
+                expected,
+                ticket,
+            )
+        for stage, actual, expected in (
+            (
+                "seven native proposals",
+                ticket.snapshots["tokens"][:, 1:],
+                result.tokens,
+            ),
+            (
+                "native confidence",
+                ticket.snapshots["confidence"],
+                result.confidence_logits,
+            ),
+            ("native lengths", ticket.snapshots["draft_lengths"], result.lengths),
+        ):
+            self.compare(stage, actual, expected, ticket)
+        ref.append_context(
+            keys,
+            ticket.snapshots["hidden"],
+            ticket.snapshots["positions"].reshape(n, 8),
+            counts,
+            ticket=owned,
+        )
+        ref.finish_batch(owned)
+        self.reference_done()
+        self.stats["reference_completed"] += 1
+        self.stats["reference_layer_comparisons"] = [
+            count + 1 for count in self.stats["reference_layer_comparisons"]
+        ]
+        self.stats["rejected_verify_positions"] += sum(8 - count for count in counts)
+        del ticket.reference_block
+
+    def poll(self, *, wait=False):
+        if self.failure is not None:
+            raise AssertionError("B6 diagnostic already failed: " + repr(self.failure))
         for ticket in list(self.inflight):
             if not ticket.event.query():
-                continue
+                if not wait:
+                    break  # Never overtake an earlier prefix on the same row.
+                self.wait_event(ticket.event)
             values = ticket.mailbox.tolist()
             if any(values[: ticket.error_count]):
-                raise AssertionError(
-                    "B6 exact same-input mismatch: "
-                    + repr(values[: ticket.error_count])
+                self.fail(
+                    "same-input checks " + repr(values[: ticket.error_count]), ticket
                 )
+            if self.reference is not None:
+                try:
+                    with self.reference_stream():
+                        self.replay_reference(ticket)
+                except Exception:
+                    if self.failure is None:
+                        self.failure = dict(
+                            stage="reference replay exception",
+                            slot=ticket.slot,
+                            epoch=ticket.epoch,
+                        )
+                    raise
             counts = values[ticket.error_count :]
             for i, count in enumerate(counts):
                 self.stats["prefix_histogram"][i] += count
@@ -330,10 +578,23 @@ class Session:
             ticket.snapshots.clear()
             ticket.checks.clear()
             del ticket.reference_context, ticket.values, ticket.mailbox
+            for name in ("row_mailbox", "row_values"):
+                if hasattr(ticket, name):
+                    delattr(ticket, name)
 
     def snapshot(self):
-        self.poll()
+        if self.failure is None:
+            self.poll(wait=True)
         persistent = [self.taps, self.tap_epochs, self.tap_slots]
+        persistent += [
+            self.trace.hidden,
+            self.trace.stamps,
+            self.trace.confidence,
+            self.trace.lengths,
+            self.trace.head_stamps,
+        ]
+        if self.reference is not None:
+            persistent.append(self.reference.inv_freq)
         for watch in (self.draft, self.target):
             persistent += [
                 watch.control,
@@ -347,38 +608,76 @@ class Session:
         for t in tickets:
             values = list(t.snapshots.values()) + t.checks
             values += [
-                getattr(t, name, None) for name in ("reference_context", "values")
+                getattr(t, name, None)
+                for name in ("reference_context", "values", "row_values")
             ]
+            if hasattr(t, "reference_block"):
+                block = t.reference_block
+                values += list(block.layer_hidden) + [
+                    block.hidden,
+                    block.tokens,
+                    block.logits,
+                    block.confidence_logits,
+                    block.lengths,
+                ]
             for tensor in values:
                 if isinstance(tensor, torch.Tensor):
                     storage = tensor.untyped_storage()
                     retained[(tensor.device, storage.data_ptr())] = storage.nbytes()
         return dict(
-            status="EXACT_SAME_INPUT_DIAGNOSTIC_ONLY",
+            status="INDEPENDENT_DRAFT_REFERENCE_DIAGNOSTIC_ONLY",
+            active=self.initialized == {"target", "draft"}
+            and self.reference is not None,
+            control_arm=self.arm,
+            diagnostic_failure=self.failure,
             full_checkpoint_native_semantics=False,
-            attention_reference="NOT_ESTABLISHED",
+            attention_reference=(
+                "FIVE_LAYER_ACCEPTED_PREFIX_AUTHOR_ALGORITHM"
+                if self.reference is not None
+                else "NOT_ESTABLISHED"
+            ),
             serving_parity="NOT_ESTABLISHED",
-            prefix_scope="touched verify windows; not full-context attention carry",
+            prefix_scope="independent accepted prefix, five draft layers; target attention and loader mapping not independently proved",
             persistent_tensor_bytes=sum(
                 t.numel() * t.element_size() for t in persistent
             ),
-            pinned_mailbox_bytes=4 * 128 * 8,
+            pinned_mailbox_bytes=4 * (128 + 32 * 2) * 8,
             retained_ticket_tensor_bytes=sum(retained.values()),
-            transient_accounting="native head reference, one layer KV reference, <=4 owned ticket copies; actual allocator/headroom admission required",
+            reference_prefix_tensor_bytes=(
+                0
+                if self.reference is None
+                else sum(
+                    t.numel() * t.element_size()
+                    for p in self.reference._prefixes.values()
+                    for t in p.keys + p.values
+                )
+            ),
+            transient_accounting="explicit tensor prediction is not admission; native/reference heads, ragged SDPA/GQA, cache replacement and backend workspace require actual allocator/headroom evidence",
+            scheduling_perturbed=True,
+            value_guard_waits="eager tensor truth guards can synchronize their work; no uninstrumented timing/overlap claim",
             inflight=len(self.inflight),
+            pending_native_tickets=sum(
+                t is not None and not t.published for t in self.ledger.current
+            ),
             **self.stats,
         )
 
 
 def initialize(runner):
     global _session
-    validate_args(runner.server_args)
+    arm = validate_args(runner.server_args)
     if _session is None:
         from sglang.srt.debug_utils.gdn_compact_shadow import _require_budget
 
-        _require_budget(torch.cuda.mem_get_info()[0], 64 * 8 * 25600 * 2 + 65536)
+        _require_budget(
+            torch.cuda.mem_get_info()[0],
+            64 * 8 * 25600 * 2 + 2 * 6 * 32 * 7 * 5120 * 2 + 65536,
+        )
         _session = Session(runner.device)
+        _session.arm = arm
         _require_budget(torch.cuda.mem_get_info()[0], 65536)
+    if _session.arm != arm:
+        raise AssertionError("target/draft diagnostic controls differ")
     role = "draft" if runner.is_draft_worker else "target"
     if role in _session.initialized:
         raise AssertionError("duplicate B6 graph observer initialization")
@@ -397,6 +696,11 @@ def initialize(runner):
             raise ValueError("full native B6 checkpoint required")
         if any(p.dtype != torch.bfloat16 for p in model.parameters()):
             raise ValueError("native checkpoint precision changed")
+        from sglang.srt.debug_utils.b6_native_attention_reference import (
+            NativeDSparkReference,
+        )
+
+        _session.reference = NativeDSparkReference(model)
     _session.initialized.add(role)
     _session.runners[role] = runner
     if _session.initialized == {"target", "draft"}:
@@ -411,17 +715,89 @@ def initialize(runner):
                     raise ValueError("native KV head geometry changed")
             native += pool.k_buffer + pool.v_buffer
             native += [r.model.get_input_embeddings().weight, r.model.lm_head.weight]
-        independent_storage(native, [_session.taps])
+        independent_storage(native, [_session.taps, _session.trace.hidden])
+
+
+def prefill_context(worker, batch, hidden, positions):
+    """Actual packed prompt/chunk input, already ordered on the native stream."""
+    s = _session
+    s.bind_worker(worker)
+    if s.reference is None or s.initialized != {"target", "draft"}:
+        raise AssertionError("native reference must be initialized before prefill")
+    # Native prefill already flushes pending serving publication. Drain only
+    # observer events before reusing rows or extending independent prefixes.
+    s.poll(wait=True)
+    keys = s.ledger.keys(batch.reqs)
+    if s.arm == "stock" and any(key[0] > 32 for key in keys):
+        raise ValueError("stock prefill request rows exceed native capacity32")
+    lengths, starts = tuple(batch.extend_lens), tuple(batch.prefix_lens)
+    if len(lengths) != len(keys) or len(starts) != len(keys):
+        raise ValueError("packed prefill host metadata changed")
+    ref = s.reference
+    try:
+        for key, start in zip(keys, starts):
+            previous = ref._rows.get(key[0])
+            if previous != key and start != 0:
+                raise AssertionError("new request cannot inherit a cached prefix")
+            if previous == key and ref._prefixes[key].length != start:
+                raise AssertionError("chunked prefill lost actual prefix positions")
+        kv = ref.num_kv_heads * ref.head_dim
+        old_tokens = sum(ref._prefixes[k].length for k in keys if k in ref._prefixes)
+        s.budget(
+            (old_tokens + 2 * sum(lengths)) * 5 * 2 * kv * 2
+            + sum(lengths) * ref.hidden_size * 16
+        )
+        with s.reference_stream():
+            for key in keys:
+                previous = ref._rows.get(key[0])
+                if previous != key:
+                    if previous is not None:
+                        ref.retire_request(previous)
+                    ref.register_request(key)
+            ref.append_packed_context(keys, hidden, positions, lengths)
+            s.reference_done()
+        s.stats["reference_prefill_batches"] += 1
+        s.stats["reference_prefill_tokens"] += sum(lengths)
+    except Exception:
+        s.failure = dict(stage="packed prefill exception", slot=None, epoch=None)
+        raise
+
+
+def capture_draft_hidden(index, hidden, forward_batch):
+    _session.trace.capture(index, hidden)
+
+
+def observer_slot(slot):
+    if _session.arm == "stock":
+        if slot not in (None, 0):
+            raise AssertionError("stock has only logical diagnostic slot0")
+        return 0
+    if slot not in (0, 1):
+        raise AssertionError("missing real co-location slot")
+    return slot
 
 
 def begin_draft(worker, batch, own_outputs):
     s = _session
+    s.bind_worker(worker)
     s.poll()
-    if not own_outputs or not s.free_mailboxes or s.initialized != {"target", "draft"}:
+    if not s.free_mailboxes:
+        s.poll(wait=True)
+    if (
+        own_outputs != (s.arm != "stock")
+        or not s.free_mailboxes
+        or s.initialized != {"target", "draft"}
+        or s.reference is None
+    ):
         raise AssertionError(
-            "owned concurrent B6 diagnostic required; mailbox bound four"
+            "native ownership/reference contract required; mailbox bound four"
         )
-    ticket = s.ledger.begin(getattr(batch, "spec_pdmux_slot", None), batch.reqs)
+    keys = s.ledger.keys(batch.reqs)
+    if any(key not in s.reference._prefixes for key in keys):
+        raise AssertionError("draft lacks actual prefill reference context")
+    ticket = s.ledger.begin(
+        observer_slot(getattr(batch, "spec_pdmux_slot", None)), batch.reqs
+    )
     ticket.mailbox_index = s.free_mailboxes.pop(0)
     s.current_draft = ticket
     s.draft.activate(ticket)
@@ -468,6 +844,8 @@ def observed_proposal(model, hidden, seed, proposal, threshold):
         1,
     )
     _session.draft.record(errors)
+    if hasattr(_session, "trace"):
+        _session.trace.proposal(proposal)
     return proposal
 
 
@@ -485,16 +863,17 @@ def sampler_rows(forward_batch):
 def draft_graph(graph):
     if not graph:
         raise AssertionError("native seven-position draft graph replay required")
+    _session.stats["draft_graph_replays"][_session.current_draft.slot] += 1
 
 
 def own_block(tokens, positions, cache_locs, own_outputs, originals):
-    if not own_outputs:
-        raise AssertionError("diagnostic requires owned native proposal metadata")
+    if not own_outputs and _session.arm != "stock":
+        raise AssertionError("co-location requires owned native proposal metadata")
     t = _session.current_draft
     n = len(t.rows)
     if tokens.shape != (n, 8):
         raise ValueError("native seed-plus-seven block changed")
-    if any(
+    if own_outputs and any(
         not disjoint(a, b) for a, b in zip((tokens, positions, cache_locs), originals)
     ):
         raise AssertionError("native proposal metadata aliases reusable draft scratch")
@@ -507,9 +886,12 @@ def own_block(tokens, positions, cache_locs, own_outputs, originals):
         (w.stamps[t.slot, :n, 0] != t.epoch).any().long(),
     ]
     t.checks += [(w.stamps[t.slot, :n, 1] != w.generations[:n]).any().long()]
+    if hasattr(_session, "trace"):
+        _session.trace.own(t)
 
 
 def begin_verify(batch, block, slot):
+    slot = observer_slot(slot)
     t = _session.ledger.current[slot] if slot in (0, 1) else None
     if t is None or tuple(r.req_pool_idx for r in batch.reqs) != t.rows:
         raise AssertionError("target verification lost native slot ownership")
@@ -548,9 +930,11 @@ def capture_tap(index, hidden, residual, forward_batch):
 def verification(
     slot, candidates, target, prefix, committed, bonus, output, new_lens, hidden, graph
 ):
+    slot = observer_slot(slot)
     t = _session.ledger.current[slot]
     if not graph:
         raise AssertionError("native target graph replay required")
+    _session.stats["target_graph_replays"][slot] += 1
     expected = acceptance_reference(candidates, target, prefix)
     t.checks += [
         different(a, b).long()
@@ -582,10 +966,32 @@ def deferred(slot, original_hidden, materialize):
 
 
 def begin_append(worker, slot, pending):
+    begin_materialization(worker, slot, pending.materialize)
+
+
+def begin_immediate_append(
+    worker, hidden, locations, locations_2d, positions, committed
+):
+    if _session.arm != "stock":
+        raise AssertionError("only stock uses immediate accepted-prefix publication")
+    begin_materialization(
+        worker,
+        0,
+        dict(
+            target_hidden=hidden,
+            cache_loc=locations,
+            cache_loc_2d=locations_2d,
+            positions=positions,
+            commit_lens=committed,
+        ),
+    )
+
+
+def begin_materialization(worker, slot, materialize):
     t = _session.ledger.current[slot]
     if t is None or t.published:
         raise AssertionError("unowned or duplicate feature append")
-    for key, value in pending.materialize.items():
+    for key, value in materialize.items():
         expected = {
             "target_hidden": "hidden",
             "cache_loc": "locations",
@@ -598,14 +1004,14 @@ def begin_append(worker, slot, pending):
         )
     _session.current_write = t
     t.reference_context = native_context_reference(
-        worker.draft_model, pending.materialize["target_hidden"]
+        worker.draft_model, materialize["target_hidden"]
     )
 
 
 def before_write(worker, attn, locations, committed, k, v, positions):
     t = _session.current_write
     if t is None:
-        raise AssertionError("prefix writer outside owned deferred append")
+        raise AssertionError("prefix writer outside owned accepted append")
     pool = worker.draft_model_runner.token_to_kv_pool
     layer = attn.attn.layer_id
     if layer in t.layers or not 0 <= layer < 5:
@@ -664,6 +1070,17 @@ def finish_append(slot):
         raise AssertionError("bounded diagnostic mailbox exceeded")
     t.mailbox = s.mailboxes[t.mailbox_index][: values.numel()]
     t.mailbox.copy_(values, non_blocking=True)
+    if s.reference is not None:
+        n = len(t.rows)
+        t.row_values = torch.stack(
+            [
+                t.snapshots["positions"].reshape(n, 8)[:, 0],
+                t.snapshots["committed"].long(),
+            ],
+            1,
+        )
+        t.row_mailbox = s.row_mailboxes[t.mailbox_index][:n]
+        t.row_mailbox.copy_(t.row_values, non_blocking=True)
     t.event = torch.cuda.Event()
     t.event.record(torch.cuda.current_stream())
     # Keep values and all owned diagnostic inputs alive through readback.

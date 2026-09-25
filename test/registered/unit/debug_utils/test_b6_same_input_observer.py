@@ -127,7 +127,7 @@ def test_fixture_exact_source_matches_and_compiles_without_runtime_import():
     config = PatchConfig(
         **yaml.safe_load((ROOT / "test/manual/b6_same_input_observer.yaml").read_text())
     )
-    assert len(config.patches) == 13
+    assert len(config.patches) == 15
     for spec in config.patches:
         pieces = spec.target.split(".")
         for split in range(len(pieces), 0, -1):
@@ -140,6 +140,20 @@ def test_fixture_exact_source_matches_and_compiles_without_runtime_import():
         if spec.target.endswith("._defer_draft_materialization"):
             assert edited.index("deferred(slot, hidden, materialize)") < edited.index(
                 "verify_done.record(dev.current_stream())"
+            )
+        if spec.target.endswith(".forward_batch_generation"):
+            assert edited.index("prefill_context(") < edited.index(
+                "logits_output.hidden_states = None"
+            )
+            assert edited.index(
+                "self._append_target_hidden_to_draft_kv_by_loc("
+            ) < edited.index("prefill_context(")
+        if spec.target.endswith("._verify_block"):
+            immediate = edited[edited.index("if slot is None:") :]
+            assert (
+                immediate.index("begin_immediate_append(")
+                < immediate.index("self._append_target_hidden_to_draft_kv_by_loc(")
+                < immediate.index("finish_append(0)")
             )
     assert (
         not (ROOT / "test/manual/b6_same_input_observer.yaml")
@@ -181,6 +195,41 @@ def test_timing_profile_and_serialization_rejected():
         ):
             with pytest.raises(ValueError):
                 obs.validate_args(args())
+
+
+@pytest.mark.parametrize("arm", ["stock", "prior", "candidate"])
+def test_exact_three_control_shapes_without_changing_native_stock_ownership(arm):
+    a = args()
+    if arm == "stock":
+        a.enable_spec_pdmux = False
+        a.max_running_requests = a.cuda_graph_config.decode.max_bs = 32
+    env = {
+        "SGLANG_SPEC_PDMUX_SM_HINT": "0" if arm == "stock" else "2",
+        "SGLANG_SPEC_PDMUX_DRAFT_EXTEND_QKV_PLACEMENT": (
+            "full" if arm == "candidate" else "auto"
+        ),
+        "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_GATE_UP": str(
+            int(arm == "candidate")
+        ),
+        "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD": str(
+            int(arm == "candidate")
+        ),
+    }
+    with patch.dict("os.environ", env, clear=True):
+        assert obs.validate_args(a) == arm
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_SPEC_PDMUX_FULL_DEVICE_DRAFT_EXTEND_LM_HEAD": (
+                    "1" if arm != "candidate" else "0"
+                )
+            },
+        ):
+            with pytest.raises(ValueError, match="placement"):
+                obs.validate_args(a)
+        a.cuda_graph_config.decode.max_bs = 64 if arm == "stock" else 32
+        with pytest.raises(ValueError):
+            obs.validate_args(a)
 
 
 def test_two_real32_ledgers_and_recycled_generation():
@@ -226,6 +275,43 @@ def test_graph_device_controls_update_slot_epoch_and_generations_without_crosswr
     w.record(torch.zeros(32, 5, dtype=torch.int64))
     assert (w.stamps[0, :, 0] == 2).all()
     assert not torch.equal(w.stamps[0, :, 1], first[:, 1])
+
+
+def test_six_hidden_boundaries_use_device_epoch_generation_and_owned_snapshots():
+    watch, ledger = obs.GraphWatch("cpu"), obs.Ledger()
+    trace = obs.DraftTrace(watch, hidden_size=12)
+    tickets = [ledger.begin(0, reqs()), ledger.begin(1, reqs(33))]
+    for slot, ticket in enumerate(tickets):
+        watch.activate(ticket)
+        for layer in range(6):
+            # Graph64 includes padding; only actual B32 belongs to the owner.
+            trace.capture(layer, torch.full((64 * 7, 12), 10 * slot + layer).bfloat16())
+        trace.proposal(
+            NS(
+                confidence_logits=torch.full((64, 7), float(slot)),
+                lengths=torch.full((64,), 7),
+            )
+        )
+        trace.own(ticket)
+        assert not torch.stack(ticket.checks).any()
+    first = tickets[0].snapshots["draft_hidden"].clone()
+    trace.hidden.fill_(99)
+    assert torch.equal(tickets[0].snapshots["draft_hidden"], first)
+    tickets[0].published = True
+    recycled = ledger.begin(0, reqs())
+    watch.activate(recycled)
+    for layer in (0, 1, 2, 3, 5):  # Missing fifth backbone layer must fail.
+        trace.capture(layer, torch.zeros(32 * 7, 12).bfloat16())
+    trace.proposal(
+        NS(confidence_logits=torch.zeros(32, 7), lengths=torch.full((32,), 7))
+    )
+    trace.own(recycled)
+    assert torch.stack(recycled.checks).any()
+    recycled.checks.clear()
+    trace.capture(4, torch.zeros(32 * 7, 12).bfloat16())
+    trace.stamps[0, 4, 31, 1] = tickets[0].generations[31]
+    trace.own(recycled)
+    assert torch.stack(recycled.checks).any()
 
 
 def test_real_native_head_methods_match_reference_two32_and_detect_corruption():
