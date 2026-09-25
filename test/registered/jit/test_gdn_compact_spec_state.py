@@ -320,6 +320,203 @@ def test_static_graph_replay_refreshes_inputs_and_prefix_lengths(steps):
         assert addresses == [t.data_ptr() for t in (state, *compact, accepted)]
 
 
+def _capture_component(call):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        call()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = call()
+    torch.cuda.current_stream().wait_stream(stream)
+    return graph, output
+
+
+@CUDA
+def test_b5_two_batch32_slots_d8_native_recovery_poison_and_replay():
+    # Two independent batch32 state sets, not one combined batch64 invocation.
+    # One real-shape GDN layer: no model weights, scheduler or green contexts.
+    slots = []
+    for slot in range(2):
+        state, inputs, dense, compact = _case(
+            [8] * 32, layers=1, seed=925 + slot, hv=48, h=16
+        )
+        reference = state.clone()
+        accepted = torch.arange(32, dtype=torch.int32, device="cuda") % 8
+        verify_graph, output = _capture_component(
+            lambda: _forward(state, inputs, compact=compact)
+        )
+        commit_graph, _ = _capture_component(
+            lambda: fused_gdn_compact_state_commit(
+                state,
+                *compact,
+                inputs["initial_state_indices"],
+                accepted,
+                intermediate_state_indices=inputs["intermediate_state_indices"],
+            )
+        )
+        state.copy_(reference)  # Discard capture/warmup commits only.
+        slots.append(
+            dict(
+                state=state,
+                inputs=inputs,
+                dense=dense,
+                compact=compact,
+                reference=reference,
+                accepted=accepted,
+                verify=verify_graph,
+                commit=commit_graph,
+                output=output,
+                addresses=[t.data_ptr() for t in (state, *compact, accepted)],
+            )
+        )
+
+    spans = sorted(
+        (tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size())
+        for bank in slots
+        for tensor in (
+            bank["state"],
+            bank["reference"],
+            bank["dense"],
+            *bank["compact"],
+        )
+    )
+    assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+    for iteration in range(3):
+        # Carry both independent references forward; never reseed from candidate
+        # state. Reverse order so either slot can overwrite its own graph first.
+        for slot in ((0, 1) if iteration % 2 == 0 else (1, 0)):
+            bank, other = slots[slot], slots[1 - slot]
+            state, inputs, compact = bank["state"], bank["inputs"], bank["compact"]
+            reference, accepted = bank["reference"], bank["accepted"]
+            other_factors = [factor.clone() for factor in other["compact"]]
+            for name in ("q", "k", "v", "a", "b", "A_log", "dt_bias"):
+                inputs[name].normal_()
+            accepted.copy_((torch.arange(32, device="cuda") + iteration + slot) % 8)
+            # Reuse physical rows with changed mappings, retaining all 32 live rows.
+            for name in ("initial_state_indices", "intermediate_state_indices"):
+                inputs[name].copy_(inputs[name].roll(1))
+            control = _forward(reference, inputs, dense=bank["dense"])
+            expected = _expected(
+                reference,
+                bank["dense"],
+                inputs["initial_state_indices"],
+                inputs["intermediate_state_indices"],
+                accepted,
+            )
+            bank["verify"].replay()
+            assert _bitwise_equal(bank["output"], control)
+            assert _bitwise_equal(state, reference), "verify advanced committed state"
+            for row, step in enumerate(accepted.tolist()):
+                factor_row = inputs["intermediate_state_indices"][row].item()
+                for factor in compact:
+                    factor[:, factor_row, step + 1 :] = float("nan")
+            bank["commit"].replay()
+            assert _bitwise_equal(state, expected), (iteration, slot)
+            assert _bitwise_equal(other["state"], other["reference"])
+            for factor, saved in zip(other["compact"], other_factors):
+                assert _bitwise_equal(factor, saved), "other slot factors changed"
+            assert bank["addresses"] == [
+                t.data_ptr() for t in (state, *compact, accepted)
+            ]
+            bank["reference"] = expected
+
+
+@CUDA
+def test_b5_two_batch32_conv_windows_recover_all_d8_prefixes():
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_update,
+    )
+    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+        fused_conv_window_scatter_with_mask,
+    )
+
+    # Actual B5 Q/K/V channel counts and kernel width4; check native window
+    # production + recovery, not convolution-output arithmetic or full model.
+    bs, steps, dim, win = 32, 8, (2 * 16 + 48) * 128, 3
+    slots = []
+    for slot in range(2):
+        torch.manual_seed(927 + slot)
+        state = torch.randn(1, bs + 2, dim, win, device="cuda", dtype=torch.bfloat16)
+        physical = torch.full(
+            (1, bs + 1, dim, steps + win - 1),
+            float("nan"),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        windows = physical.as_strided(
+            (1, bs + 1, steps, dim, win),
+            (
+                physical.stride(0),
+                physical.stride(1),
+                physical.stride(3),
+                physical.stride(2),
+                physical.stride(3),
+            ),
+        )
+        slots.append(
+            dict(
+                state=state,
+                reference=state.clone(),
+                physical=physical,
+                windows=windows,
+                weight=torch.randn(dim, win + 1, device="cuda", dtype=torch.bfloat16),
+                x=torch.empty(
+                    bs, steps, dim, device="cuda", dtype=torch.bfloat16
+                ).transpose(1, 2),
+                indices=torch.arange(1, bs + 1, dtype=torch.int32, device="cuda").flip(
+                    0
+                ),
+            )
+        )
+    assert slots[0]["physical"].data_ptr() != slots[1]["physical"].data_ptr()
+    assert slots[0]["state"].data_ptr() != slots[1]["state"].data_ptr()
+    for iteration in range(3):
+        for slot in ((0, 1) if iteration % 2 == 0 else (1, 0)):
+            bank, other = slots[slot], slots[1 - slot]
+            reference, indices = bank["reference"], bank["indices"]
+            bank["x"].normal_()
+            indices.copy_(indices.roll(1))
+            accepted = (
+                torch.arange(bs, dtype=torch.int32, device="cuda") + iteration + slot
+            ) % steps
+            expected = reference.clone()
+            for row, step in enumerate(accepted.tolist()):
+                dest = indices[row].item()
+                expected[0, dest] = torch.cat(
+                    [reference[0, dest], bank["x"][row, :, : step + 1]], dim=-1
+                )[:, -win:]
+            # Match target verify: update all eight, then recover accepted prefix.
+            causal_conv1d_update(
+                bank["x"],
+                bank["state"][0],
+                bank["weight"],
+                activation="silu",
+                conv_state_indices=indices,
+                intermediate_conv_window=bank["windows"][0],
+                intermediate_state_indices=torch.arange(
+                    bs, dtype=torch.int32, device="cuda"
+                ),
+            )
+            for row, step in enumerate(accepted.tolist()):
+                assert _bitwise_equal(
+                    bank["windows"][0, row, step], expected[0, indices[row]]
+                )
+                # Windows overlap: poison only physical values AFTER the accepted
+                # window, not later views that alias its valid trailing values.
+                bank["physical"][0, row, :, step + win :] = float("nan")
+            fused_conv_window_scatter_with_mask(
+                bank["state"],
+                bank["windows"],
+                indices,
+                accepted,
+            )
+            assert _bitwise_equal(bank["state"], expected), (iteration, slot)
+            assert _bitwise_equal(other["state"], other["reference"])
+            bank["reference"] = expected
+
+
 def test_compact_capture_rejects_partial_or_unsupported_modes_before_launch():
     state = torch.zeros(2, 6, 128, 128)
     keys = torch.zeros(2, 7, 6, 128)
