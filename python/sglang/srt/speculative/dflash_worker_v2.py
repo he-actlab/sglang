@@ -1857,145 +1857,87 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _verify_block(
         self, batch, draft_input, block, *, on_publish=None, on_relay=None, slot=None
     ):
-        bs = len(batch.seq_lens)
-        device = self.device
-        block_size = int(self.block_size)
-        prefix_lens = batch.seq_lens
-        draft_tokens = block.tokens
-        positions = block.positions
-        verify_out_cache_loc_2d = block.cache_locs
-        verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
-
-        # --- 2) Target verify.
-        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
-        custom_mask = None
-
-        verify_input_ids = draft_tokens.reshape(-1)
-        verify_input = DFlashVerifyInput(
-            draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
-            custom_mask=custom_mask,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-        )
-
-        batch.out_cache_loc = verify_out_cache_loc
-        sampling_info = batch.sampling_info
-
-        need_mamba_verify_commit = hasattr(
-            self.target_worker.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
-        )
-        seq_lens_pre_verify = (
-            batch.seq_lens.clone() if need_mamba_verify_commit else None
-        )
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
-
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
-        )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
-
+        # Include metadata, acceptance, target recovery, publication and owned
+        # deferred features. Draft KV materialization is timed separately.
         with spec_stage_span("verify"):
+            bs = len(batch.seq_lens)
+            device = self.device
+            block_size = int(self.block_size)
+            prefix_lens = batch.seq_lens
+            draft_tokens = block.tokens
+            positions = block.positions
+            verify_out_cache_loc_2d = block.cache_locs
+            verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+
+            # --- 2) Target verify.
+            # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+            custom_mask = None
+
+            verify_input_ids = draft_tokens.reshape(-1)
+            verify_input = DFlashVerifyInput(
+                draft_token=verify_input_ids,
+                positions=positions,
+                draft_token_num=int(self.block_size),
+                custom_mask=custom_mask,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+
+            batch.out_cache_loc = verify_out_cache_loc
+            sampling_info = batch.sampling_info
+
+            need_mamba_verify_commit = hasattr(
+                self.target_worker.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
+            seq_lens_pre_verify = (
+                batch.seq_lens.clone() if need_mamba_verify_commit else None
+            )
+            seq_lens_cpu_backup = batch.seq_lens_cpu
+            seq_lens_sum_backup = batch.seq_lens_sum
+            if seq_lens_cpu_backup is not None:
+                # Verify host bound = committed prefix + one verify block (matches draft).
+                verify_host_seq_lens = seq_lens_cpu_backup + block_size
+                batch.seq_lens_cpu = verify_host_seq_lens
+                batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+            elif draft_input.reserved_seq_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
+                batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch, self.target_worker
+            )
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+
             target_out = self.target_worker.forward_batch_generation(
                 batch=None,
                 forward_batch=verify_forward_batch,
                 is_verify=True,
                 skip_attn_backend_init=True,
             )
-        logits_output = target_out.logits_output
-        can_run_cuda_graph = target_out.can_run_cuda_graph
+            logits_output = target_out.logits_output
+            can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
-            )
+            if sampling_info is not None:
+                apply_dflash_verify_logits_adjustments(
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=sampling_info,
+                    draft_token_num=int(self.block_size),
+                )
 
-        candidates = draft_tokens
-        new_seq_lens = None
-        if (
-            sampling_info is not None
-            and not sampling_info.is_all_greedy
-            and is_dflash_sampling_verify_available()
-        ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                max_top_k=draft_input.max_top_k,
-                uniform_top_k_value=draft_input.uniform_top_k_value,
-            )
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
-            )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
-        else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
-            if self._use_triton_accept_bonus:
-                try:
-                    (
-                        accept_len,
-                        commit_lens,
-                        bonus,
-                        out_tokens,
-                        new_seq_lens,
-                    ) = self._next_accept_bonus_buffers(bs)
-                    _compute_dflash_accept_bonus_triton_unchecked(
-                        candidates=candidates,
-                        target_top1=target_predict,
-                        accept_lens_out=accept_len,
-                        commit_lens_out=commit_lens,
-                        bonus_ids_out=bonus,
-                        out_tokens_out=out_tokens,
-                        prefix_lens=prefix_lens,
-                        new_seq_lens_out=new_seq_lens,
-                    )
-                except Exception as e:
-                    self._use_triton_accept_bonus = False
-                    logger.warning(
-                        "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
-                        e,
-                    )
-                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                        candidates=candidates,
-                        target_predict=target_predict,
-                    )
-                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                    out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=torch.int64,
-                        device=device,
-                    )
-                    if int(self.block_size) > 1:
-                        out_tokens[:, : int(self.block_size) - 1].copy_(
-                            candidates[:, 1:]
-                        )
-                    out_tokens[:, int(self.block_size) - 1].fill_(0)
-                    out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
-                    )
-            else:
-                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+            candidates = draft_tokens
+            new_seq_lens = None
+            if (
+                sampling_info is not None
+                and not sampling_info.is_all_greedy
+                and is_dflash_sampling_verify_available()
+            ):
+                accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                     candidates=candidates,
-                    target_predict=target_predict,
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=sampling_info,
+                    max_top_k=draft_input.max_top_k,
+                    uniform_top_k_value=draft_input.uniform_top_k_value,
                 )
                 commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                 out_tokens = torch.empty(
@@ -2007,60 +1949,124 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+            else:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
+                if self._use_triton_accept_bonus:
+                    try:
+                        (
+                            accept_len,
+                            commit_lens,
+                            bonus,
+                            out_tokens,
+                            new_seq_lens,
+                        ) = self._next_accept_bonus_buffers(bs)
+                        _compute_dflash_accept_bonus_triton_unchecked(
+                            candidates=candidates,
+                            target_top1=target_predict,
+                            accept_lens_out=accept_len,
+                            commit_lens_out=commit_lens,
+                            bonus_ids_out=bonus,
+                            out_tokens_out=out_tokens,
+                            prefix_lens=prefix_lens,
+                            new_seq_lens_out=new_seq_lens,
+                        )
+                    except Exception as e:
+                        self._use_triton_accept_bonus = False
+                        logger.warning(
+                            "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
+                            e,
+                        )
+                        accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                            candidates=candidates,
+                            target_predict=target_predict,
+                        )
+                        commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                        out_tokens = torch.empty(
+                            (bs, int(self.block_size)),
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                        if int(self.block_size) > 1:
+                            out_tokens[:, : int(self.block_size) - 1].copy_(
+                                candidates[:, 1:]
+                            )
+                        out_tokens[:, int(self.block_size) - 1].fill_(0)
+                        out_tokens.scatter_(
+                            1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                        )
+                else:
+                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
+                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                    out_tokens = torch.empty(
+                        (bs, int(self.block_size)), dtype=torch.int64, device=device
+                    )
+                    if int(self.block_size) > 1:
+                        out_tokens[:, : int(self.block_size) - 1].copy_(
+                            candidates[:, 1:]
+                        )
+                    out_tokens[:, int(self.block_size) - 1].fill_(0)
+                    out_tokens.scatter_(
+                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                    )
 
-        if need_mamba_verify_commit:
-            assert seq_lens_pre_verify is not None
-            self._update_target_mamba_state_after_verify(
-                batch=batch,
-                seq_lens_pre_verify=seq_lens_pre_verify,
-                commit_lens=commit_lens,
+            if need_mamba_verify_commit:
+                assert seq_lens_pre_verify is not None
+                self._update_target_mamba_state_after_verify(
+                    batch=batch,
+                    seq_lens_pre_verify=seq_lens_pre_verify,
+                    commit_lens=commit_lens,
+                )
+
+            if new_seq_lens is None:
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            if slot is not None:
+                # Native greedy verification rotates two global scratch buffers.
+                # Co-location must own each result across deferred relay and D2H.
+                commit_lens = commit_lens.clone()
+                bonus = bonus.clone()
+                out_tokens = out_tokens.clone()
+                new_seq_lens = new_seq_lens.clone()
+            if on_publish is not None:
+                on_publish(new_seq_lens)
+
+            # --- 3) Materialize committed verify-input tokens into draft KV cache.
+            hidden = logits_output.hidden_states
+            if hidden is None:
+                raise RuntimeError(
+                    "DFLASH verify requires target hidden states, but got None."
+                )
+            hidden = hidden.view(bs, int(self.block_size), -1)
+
+            next_draft_input = self._make_next_draft_input_decode(
+                bonus_tokens=bonus,
+                new_seq_lens=new_seq_lens,
             )
 
-        if new_seq_lens is None:
-            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
-        if slot is not None:
-            # Native greedy verification rotates two global scratch buffers.
-            # Co-location must own each result across deferred relay and D2H.
-            commit_lens = commit_lens.clone()
-            bonus = bonus.clone()
-            out_tokens = out_tokens.clone()
-            new_seq_lens = new_seq_lens.clone()
-        if on_publish is not None:
-            on_publish(new_seq_lens)
-
-        # --- 3) Materialize committed verify-input tokens into draft KV cache.
-        hidden = logits_output.hidden_states
-        if hidden is None:
-            raise RuntimeError(
-                "DFLASH verify requires target hidden states, but got None."
+            result = GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=out_tokens.reshape(-1),
+                accept_lens=commit_lens,
+                can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=next_draft_input,
+                speculative_num_draft_tokens=int(self.block_size),
+                # The non-overlap (sync) scheduler path advances batch.seq_lens
+                # from the result; overlap carries it via next_draft_input instead.
+                new_seq_lens=new_seq_lens,
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
-
-        next_draft_input = self._make_next_draft_input_decode(
-            bonus_tokens=bonus,
-            new_seq_lens=new_seq_lens,
-        )
-
-        result = GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=out_tokens.reshape(-1),
-            accept_lens=commit_lens,
-            can_run_cuda_graph=can_run_cuda_graph,
-            next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=int(self.block_size),
-            # The non-overlap (sync) scheduler path advances batch.seq_lens
-            # from the result; overlap carries it via next_draft_input instead.
-            new_seq_lens=new_seq_lens,
-        )
-        if slot is not None:
-            self._defer_draft_materialization(
-                slot=slot,
-                result=result,
-                hidden=hidden.reshape(-1, hidden.shape[-1]),
-                block=block,
-                on_relay=on_relay,
-            )
-        else:
+            if slot is not None:
+                self._defer_draft_materialization(
+                    slot=slot,
+                    result=result,
+                    hidden=hidden.reshape(-1, hidden.shape[-1]),
+                    block=block,
+                    on_relay=on_relay,
+                )
+        if slot is None:
             with self._draft_stream_region(), spec_stage_span("draft_extend"):
                 if self._spec_pdmux_small_stream is not None:
                     record_stream_each(

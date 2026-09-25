@@ -439,6 +439,55 @@ class DFlashSlotLifecycleTests(unittest.TestCase):
                 self.assertFalse(sequential.spec_pdmux_relay_deferred)
                 self.worker.flush_spec_pdmux_pending(0)
 
+    def test_verify_phase_includes_accept_recovery_publish_but_not_draft_append(self):
+        # Native verify owns accepted-prefix recovery and the publication/slot
+        # snapshot. Both immediate and deferred KV appends have their own phase.
+        @contextmanager
+        def phase(name):
+            self.device.log.append(("phase_begin", name))
+            try:
+                yield
+            finally:
+                self.device.log.append(("phase_end", name))
+
+        original_accept = native.compute_dflash_correct_drafts_and_bonus
+
+        def accept(**kwargs):
+            self.device.log.append(("large", "accept"))
+            return original_accept(**kwargs)
+
+        for slot in (None, 0):
+            with self.subTest(slot=slot):
+                self.device.log.clear()
+                with (
+                    patch.object(native, "spec_stage_span", phase),
+                    patch.object(
+                        native, "compute_dflash_correct_drafts_and_bonus", accept
+                    ),
+                ):
+                    self.verify(3, slot=slot)
+                    if slot is not None:
+                        self.worker.flush_spec_pdmux_pending(slot)
+
+                begin = self.device.log.index(("phase_begin", "verify"))
+                end = self.device.log.index(("phase_end", "verify"))
+                verified = self.device.log[begin + 1 : end]
+                self.assertEqual(
+                    [entry[1] for entry in verified if entry[0] == "large"][:3],
+                    ["accept", "commit", "publish"],
+                )
+                if slot is not None:
+                    # The pending target-feature clone's completion event is
+                    # recorded before verify closes, not after its end marker.
+                    self.assertEqual(verified[-1][0:2], ("large", "record"))
+                draft_begin = self.device.log.index(("phase_begin", "draft_extend"))
+                draft_end = self.device.log.index(("phase_end", "draft_extend"))
+                append = self.device.log.index(("small", "append"))
+                self.assertLess(end, draft_begin)
+                self.assertLess(draft_begin, append)
+                self.assertLess(append, draft_end)
+                self.assertNotIn(("small", "append"), verified)
+
     def test_same_tick_draft_precedes_other_append_and_own_verify(self):
         self.defer(1)
         batch = SimpleNamespace(

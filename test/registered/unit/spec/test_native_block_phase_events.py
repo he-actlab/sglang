@@ -182,7 +182,7 @@ class NativeBlockPhaseEventTests(unittest.TestCase):
             )
         self.sync.assert_not_called()
 
-    def test_worker_preserves_exact_existing_native_phase_boundaries(self):
+    def test_worker_preserves_native_phase_names_and_append_sites(self):
         self.assertIs(
             dflash_worker_v2.spec_stage_span, native_block_phase.spec_stage_span
         )
@@ -205,6 +205,37 @@ class NativeBlockPhaseEventTests(unittest.TestCase):
                 "draft_extend",
             ],
         )
+
+    def test_verify_scope_includes_metadata_and_owned_results_before_materialization(
+        self,
+    ):
+        tree = ast.parse(Path(dflash_worker_v2.__file__).read_text())
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_verify_block"
+        )
+        span = method.body[0]
+        self.assertIsInstance(span, ast.With)
+        self.assertEqual(span.items[0].context_expr.args[0].value, "verify")
+        calls = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            for node in ast.walk(span)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, (ast.Attribute, ast.Name))
+        }
+        self.assertTrue(
+            {
+                "prepare_for_verify",
+                "forward_batch_generation",
+                "argmax",
+                "_update_target_mamba_state_after_verify",
+                "on_publish",
+                "_defer_draft_materialization",
+            }
+            <= calls
+        )
+        self.assertNotIn("_append_target_hidden_to_draft_kv_by_loc", calls)
 
 
 if __name__ == "__main__":
