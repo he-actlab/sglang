@@ -638,6 +638,7 @@ def test_strided_native_pool_reference_is_rejected_before_any_copy():
 @pytest.mark.parametrize("batch", [1, 32])
 @torch.inference_mode()
 def test_actual_native_sequential_materializer_strided_v_is_independent(batch):
+    from sglang.srt.layers.utils import MultiPlatformOp
     from sglang.srt.models.dflash import DFlashDraftModel
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -667,9 +668,17 @@ def test_actual_native_sequential_materializer_strided_v_is_independent(batch):
         patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True),
         patch("sglang.srt.layers.rotary_embedding.factory._ROPE_DICT", {}),
         patch("sglang.srt.layers.linear.get_tp_group", return_value=NS(world_size=1)),
+        # CPU synthetic tensors need the real portable native method even when
+        # this fixture is collected in a GPU-visible suite; no arithmetic mock.
+        patch.object(
+            MultiPlatformOp, "dispatch_forward", lambda self: self.forward_native
+        ),
         get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
     ):
         model = DFlashDraftModel(config).to(torch.bfloat16)
+        for op in model.modules():
+            if isinstance(op, MultiPlatformOp):
+                assert op._forward_method.__func__ is op.forward_native.__func__
         for value in model.parameters():
             value.fill_(0.125)
         m = batch * 8

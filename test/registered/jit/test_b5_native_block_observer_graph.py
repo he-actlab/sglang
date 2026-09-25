@@ -299,9 +299,10 @@ def test_b5_two32_payloads_preserve_native_fence_and_delayed_readback(monkeypatc
             committed=(torch.arange(32, device="cuda") % 8 + 1).int(),
             bonus=torch.arange(32, device="cuda", dtype=torch.int32),
         )
-        warm.checks = [
-            obs.different(source, warm.snapshots["hidden"]).long() for _ in range(2)
-        ]
+        for i in range(2):
+            obs._compare(
+                warm, f"component.warm_hidden{i}", source, warm.snapshots["hidden"]
+            )
         warm.layers = set(range(6))  # Synthetic markers, not KV computation.
         obs.finish_append(0)
     warm.event.synchronize()
@@ -336,7 +337,7 @@ def test_b5_two32_payloads_preserve_native_fence_and_delayed_readback(monkeypatc
             verify_done.record(large)
         small.wait_event(verify_done)
         with torch.cuda.stream(small):
-            t.checks.append(obs.different(held, t.snapshots["hidden"]).long())
+            obs._compare(t, "component.held_hidden", held, t.snapshots["hidden"])
             t.layers = set(range(6))  # Synthetic layer markers, NOT KV proof.
             torch.cuda._sleep(1_000_000_000)
             obs.finish_append(slot)
