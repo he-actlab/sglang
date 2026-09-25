@@ -194,7 +194,7 @@ def test_b5_two32_payloads_preserve_native_fence_and_delayed_readback(monkeypatc
         with torch.cuda.stream(small):
             t.checks.append(obs.different(held, t.snapshots["hidden"]).long())
             t.layers = set(range(6))  # Synthetic layer markers, NOT KV proof.
-            torch.cuda._sleep(80_000_000)
+            torch.cuda._sleep(1_000_000_000)
             obs.finish_append(slot)
         payloads.append((held, expected))
         assert not t.event.query()
