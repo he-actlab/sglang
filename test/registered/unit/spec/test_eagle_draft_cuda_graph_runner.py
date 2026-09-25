@@ -83,7 +83,9 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         runner.require_gathered_buffer = False
         runner.model_runner = SimpleNamespace(
             model_config=SimpleNamespace(vocab_size=8),
-            server_args=SimpleNamespace(speculative_use_rejection_sampling=False),
+            server_args=SimpleNamespace(
+                speculative_use_rejection_sampling=False, enable_spec_pdmux=False
+            ),
             device_timer=None,
             draft_attn_backend=backend,
         )
