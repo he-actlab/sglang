@@ -43,6 +43,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -199,24 +200,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.enable_pdmux = model_runner.server_args.enable_pdmux
-        # spec-pdmux (M1): capture graphs on the LARGE green-ctx stream so the
-        # captured SM affinity matches the forward/replay stream. None => stock
-        # behavior (graph_capture allocates its own stream).
+        # Target graphs use LARGE; native DFlash draft graphs also use this
+        # runner and must capture on SMALL to match their replay affinity.
+        # None retains stock behavior (graph_capture allocates its own stream).
+        is_dflash_draft = (
+            model_runner.is_draft_worker and model_runner.spec_algorithm.is_dflash()
+        )
         self.capture_stream_override = None
         from sglang.srt.multiplex.pdmux_context import spec_sm_partition_enabled
 
         if spec_sm_partition_enabled(model_runner.server_args):
             from sglang.srt.multiplex.pdmux_context import get_spec_streams
 
-            self.capture_stream_override = get_spec_streams()[0]
+            self.capture_stream_override = get_spec_streams()[1 if is_dflash_draft else 0]
             logger.info(
-                "[%s] %s: graph capture on LARGE green-ctx stream",
+                "[%s] %s: graph capture on %s green-ctx stream",
                 (
                     "spec-pdmux"
                     if model_runner.server_args.enable_spec_pdmux
                     else "spec-sm-partition"
                 ),
                 type(self).__name__,
+                "SMALL" if is_dflash_draft else "LARGE",
             )
 
         self.attn_tp_size = get_attention_tp_size()
@@ -344,7 +349,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
-        self.buffers.share_buffers()
+        # DFlash's draft and target can have identical static-buffer shapes,
+        # but concurrent replay must not alias their inputs or logits. Reuse
+        # the namespace already used by draft eager/Eagle graph runners.
+        buffer_namespace = ""
+        if (
+            is_dflash_draft
+            and model_runner.server_args.enable_spec_pdmux
+            and not envs.SGLANG_SPEC_PDMUX_SERIALIZE.get()
+        ):
+            buffer_namespace = "spec-pdmux-draft"
+        self.buffers.share_buffers(namespace=buffer_namespace)
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
@@ -363,6 +378,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             enable_prefill_cp=self.enable_prefill_cp,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             dp_size=self.dp_size,
+            pool_namespace=buffer_namespace,
             source=self.buffers,
         )
 
