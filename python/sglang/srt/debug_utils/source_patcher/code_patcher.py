@@ -1,5 +1,6 @@
 import __future__
 
+import ast
 import importlib
 import inspect
 import textwrap
@@ -70,14 +71,17 @@ def patch_function(
 ) -> PatchState:
     """Patch a function by modifying its source and replacing __code__.
 
-    1. inspect.getsource -> get original source
+    1. unwrap decorators and inspect.getsource -> get original body source
     2. apply_edits -> modify source text
     3. optionally prepend preamble (e.g. import lines) inside the function body
-    4. compile + exec -> get new code object
-    5. replace target.__code__
+    4. compile + exec without reapplying decorators -> get new body code
+    5. replace the unwrapped target.__code__, retaining its outer wrappers
 
     Returns PatchState that can restore the original code.
     """
+    # inspect.getsource already follows __wrapped__. Globals and code mutation
+    # must address that same function, not e.g. torch's contextlib wrapper.
+    target = inspect.unwrap(target)
     original_code: types.CodeType = target.__code__
 
     source: str = inspect.getsource(target)
@@ -87,8 +91,18 @@ def patch_function(
     if preamble.strip():
         modified_source = _insert_preamble(source=modified_source, preamble=preamble)
 
+    parsed = ast.parse(modified_source)
+    # Keep the original decorator objects/closures active. Re-executing their
+    # expressions can cause side effects and would produce another wrapper code
+    # object rather than the body we are replacing. Nested decorators stay intact.
+    for node in parsed.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == target.__name__
+        ):
+            node.decorator_list = []
     code: types.CodeType = compile(
-        modified_source,
+        parsed,
         inspect.getfile(target),
         "exec",
         flags=__future__.annotations.compiler_flag,
