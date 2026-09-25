@@ -356,7 +356,7 @@ def test_decoder_rounds_native_residual_before_normalization():
             return attention_output
 
     class IdentityMLP(nn.Module):
-        def forward(self, normalized):
+        def forward(self, normalized, forward_batch=None):
             return normalized
 
     layer.self_attn = FixedAttention()

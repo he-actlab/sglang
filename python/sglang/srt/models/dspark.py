@@ -35,6 +35,10 @@ from sglang.srt.configs.dspark import parse_dspark_draft_config
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.models.dflash import DFlashAttention, DFlashDraftModel, DFlashMLP
+from sglang.srt.multiplex.native_block_draft_placement import (
+    use_native_block_full_device_projection,
+)
+from sglang.srt.multiplex.pdmux_context import spec_pdmux_full_device_operator_region
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -45,7 +49,7 @@ class DSparkAttention(DFlashAttention):
         self.k_norm.cast_x_before_out_mul = True
 
     def forward(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self._forward_qkv(hidden_states, forward_batch)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # The generic fused Q/K norm does not preserve the native HF cast.
         q = self.q_norm(q.reshape(-1, self.head_dim)).view_as(q)
@@ -72,8 +76,8 @@ class DSparkAttention(DFlashAttention):
 
 
 class DSparkMLP(DFlashMLP):
-    def forward(self, hidden_states):
-        gate_up, _ = self.gate_up_proj(hidden_states)
+    def forward(self, hidden_states, forward_batch=None):
+        gate_up = self._forward_gate_up(hidden_states, forward_batch)
         gate, up = gate_up.chunk(2, dim=-1)
         # HF Qwen3 rounds SiLU to BF16 before multiplication; the generic CUDA
         # SiluAndMul keeps both operations in FP32 until its final store.
@@ -102,7 +106,9 @@ class DSparkDecoderLayer(nn.Module):
         # Native BF16 residual addition precedes the next normalization.
         hidden_states = residual + hidden_states
         residual = hidden_states
-        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = self.mlp(
+            self.post_attention_layernorm(hidden_states), forward_batch=forward_batch
+        )
         return residual + hidden_states
 
 
@@ -235,8 +241,26 @@ class Qwen3DSparkModel(DFlashDraftModel):
             next_token_logits=None, hidden_states=hidden_states
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden_states)
+    def compute_logits(
+        self, hidden_states: torch.Tensor, *, draft_head: bool = False
+    ) -> torch.Tensor:
+        use_full_device = use_native_block_full_device_projection(
+            "lm_head",
+            hidden_states,
+            self.lm_head,
+            None,
+            getattr(self, "_native_block_draft_placement", None),
+            draft_head=draft_head,
+        )
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_device_stream:
+            if full_device_stream is not None:
+                hidden_states.record_stream(full_device_stream)
+            logits = self.lm_head(hidden_states)
+        if full_device_stream is not None:
+            logits.record_stream(torch.cuda.current_stream())
+        return logits
 
     def sample_draft_tokens(
         self,
@@ -291,7 +315,7 @@ class Qwen3DSparkModel(DFlashDraftModel):
                 "DSpark proposal requires [batch, block_size, hidden_size]."
             )
         tokens, logits = self.sample_draft_tokens(
-            self.compute_logits(hidden_states),
+            self.compute_logits(hidden_states, draft_head=True),
             first_prev_token_ids=first_prev_token_ids,
         )
         prev_token_ids = torch.cat(

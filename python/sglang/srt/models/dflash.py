@@ -25,6 +25,10 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.multiplex.native_block_draft_placement import (
+    use_native_block_full_device_projection,
+)
+from sglang.srt.multiplex.pdmux_context import spec_pdmux_full_device_operator_region
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -152,6 +156,24 @@ class DFlashAttention(nn.Module):
             attn_type=self.attn_type,
         )
 
+    def _forward_qkv(self, hidden_states, forward_batch):
+        use_full_device = use_native_block_full_device_projection(
+            "qkv",
+            hidden_states,
+            self.qkv_proj,
+            forward_batch,
+            getattr(self, "_native_block_draft_placement", None),
+        )
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_device_stream:
+            if full_device_stream is not None:
+                hidden_states.record_stream(full_device_stream)
+            qkv, _ = self.qkv_proj(hidden_states)
+        if full_device_stream is not None:
+            qkv.record_stream(torch.cuda.current_stream())
+        return qkv
+
     def forward_prepare_npu(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -178,7 +200,7 @@ class DFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self._forward_qkv(hidden_states, forward_batch)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         else:
@@ -257,8 +279,26 @@ class DFlashMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
+    def _forward_gate_up(self, x, forward_batch):
+        use_full_device = use_native_block_full_device_projection(
+            "gate_up",
+            x,
+            self.gate_up_proj,
+            forward_batch,
+            getattr(self, "_native_block_draft_placement", None),
+        )
+        with spec_pdmux_full_device_operator_region(
+            use_full_device, source_partition="small"
+        ) as full_device_stream:
+            if full_device_stream is not None:
+                x.record_stream(full_device_stream)
+            gate_up, _ = self.gate_up_proj(x)
+        if full_device_stream is not None:
+            gate_up.record_stream(torch.cuda.current_stream())
+        return gate_up
+
+    def forward(self, x: torch.Tensor, forward_batch=None) -> torch.Tensor:
+        gate_up = self._forward_gate_up(x, forward_batch)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -301,7 +341,7 @@ class DFlashDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual
 
 
