@@ -22,6 +22,8 @@ from sglang.srt.debug_utils.b6_same_input_observer import (
 TAPS = (2, 11, 19, 28, 36, 45, 53, 62)
 FEATURES = 8 * 5120
 APPEND_BUDGET = 128 * 1024**2
+BONUS_BANK_BYTES = 65 * 8
+BONUS_CONTINUITY_SCOPE = "verified_bonus_to_next_draft_input_by_request_row_generation"
 _session = None
 
 
@@ -77,7 +79,13 @@ def planning_bytes(buckets):
     tickets = 4 * (32 * 8 * FEATURES * 2 + 65536)
     return dict(
         graph_reference_estimate_bytes=head,
-        planning_increment_bytes=taps + tickets + APPEND_BUDGET + head + 65536,
+        planning_increment_bytes=taps
+        + tickets
+        + APPEND_BUDGET
+        + head
+        + 65536
+        + BONUS_BANK_BYTES
+        + 4 * 32 * 2 * 8,
     )
 
 
@@ -88,6 +96,11 @@ class Session:
         self.ledger = Ledger()
         self.inputs, self.head, self.target = (GraphWatch(device) for _ in range(3))
         self.seed = torch.zeros(64, dtype=torch.int64, device=device)
+        self.expected_bonus = torch.zeros(65, dtype=torch.int64, device=device)
+        # History is keyed by request generation, not logical slot. Retain known
+        # publications so a missing/replaced row owner cannot become a baseline.
+        self.bonus_publications, self.bonus_owners = {}, {}
+        self.bonus_generation_rows = {}
         self.prefix = torch.zeros_like(self.seed)
         self.locations = torch.zeros((64, 8), dtype=torch.int64, device=device)
         self.checked_tokens = torch.zeros((2, 32, 7), dtype=torch.int64, device=device)
@@ -114,11 +127,17 @@ class Session:
             layers_checked=[0] * 6,
             materializer_paths=[],
             retained_peak_bytes=0,
+            bonus_continuation_rows_checked=0,
+            bonus_first_entry_rows_baselined=0,
+            slot_bonus_continuation_rows_checked=[0, 0],
+            slot_bonus_first_entry_rows_baselined=[0, 0],
+            slot_bonus_full32_continuation_checks=[0, 0],
         )
 
     def persistent(self):
         tensors = [
             self.seed,
+            self.expected_bonus,
             self.prefix,
             self.locations,
             self.checked_tokens,
@@ -159,10 +178,41 @@ class Session:
                     for i, value in enumerate(values[: t.error_count])
                     if value
                 ]
+                continuity = None
+                if any(
+                    d["label"] == "begin_draft.verified_bonus_continuity"
+                    for d in failed
+                ):
+                    # Failure-only value readback, after the existing event.
+                    continuity = dict(
+                        **t.bonus_continuity,
+                        current_slot=t.slot,
+                        actual_seeds=t.snapshots["continuity_actual_bonus"].tolist(),
+                        expected_seeds=t.snapshots[
+                            "continuity_expected_bonus"
+                        ].tolist(),
+                    )
                 raise AssertionError(
                     "B5 exact block diagnostic mismatch: "
-                    + repr(dict(failed_checks=failed, values=values))
+                    + repr(
+                        dict(
+                            failed_checks=failed,
+                            values=values,
+                            bonus_continuity=continuity,
+                        )
+                    )
                 )
+            carried, baseline = t.bonus_continuation_rows, t.bonus_first_entry_rows
+            if carried + baseline != len(t.rows):
+                raise AssertionError("B5 completed bonus row accounting changed")
+            for field, count in (
+                ("bonus_continuation_rows_checked", carried),
+                ("bonus_first_entry_rows_baselined", baseline),
+            ):
+                self.stats[field] += count
+                self.stats["slot_" + field][t.slot] += count
+            if carried == len(t.rows) == 32:
+                self.stats["slot_bonus_full32_continuation_checks"][t.slot] += 1
             self.stats["completed"] += 1
             self.stats["slot_completed"][t.slot] += 1
             self.stats["slot_graph_replays"][t.slot] += 1
@@ -196,6 +246,8 @@ class Session:
             serving_storage_offloaded=False,
             immutable_weights_copied=False,
             kv_reference="same_selected_native_materializer_replay",
+            bonus_continuity_scope=BONUS_CONTINUITY_SCOPE,
+            first_entry_seed_scope="first observed generation baseline, not prefill oracle",
             prefix_scope="touched eight-position windows, not full-context attention",
             pending=sum(not t.published for t in self.ledger.current if t is not None)
             + len(self.inflight),
@@ -279,6 +331,73 @@ def initialize(runner):
                 )
 
 
+def _check_bonus_continuity(s, t, bonus):
+    if (
+        bonus.shape != (len(t.rows),)
+        or bonus.dtype != torch.int64
+        or bonus.device != s.expected_bonus.device
+    ):
+        raise ValueError(
+            "B5 begin_draft.bonus publication ABI changed; "
+            f"actual={_metadata(bonus)}, expected={_metadata(s.expected_bonus[:len(t.rows)])}"
+        )
+    indices, producers = [], []
+    keys = tuple(zip(t.rows, t.generations))
+    for i, key in enumerate(keys):
+        previous_row = s.bonus_generation_rows.setdefault(key[1], key[0])
+        if previous_row != key[0]:
+            raise AssertionError(
+                f"B5 known request generation changed row: generation={key[1]}, "
+                f"previous_row={previous_row}, current_row={key[0]}, current_slot={t.slot}"
+            )
+        if key not in s.bonus_publications:
+            continue  # Explicit first-observed seed baseline, not prefill proof.
+        published = s.bonus_publications[key]
+        if s.bonus_owners.get(key[0]) != (key[1], *published):
+            raise AssertionError(
+                f"B5 verified bonus owner missing/replaced: key={key}, "
+                f"producer={published}, current_slot={t.slot}, "
+                f"row_owner={s.bonus_owners.get(key[0])}"
+            )
+        indices.append(i)
+        producers.append(published)
+    t.bonus_continuation_rows = len(indices)
+    t.bonus_first_entry_rows = len(keys) - len(indices)
+    if indices:
+        # Fixed-size device reads, with no H2D index transfer or value readback.
+        actual = torch.stack([bonus[i] for i in indices])
+        expected = torch.stack([s.expected_bonus[t.rows[i]] for i in indices])
+        t.snapshots.update(
+            continuity_actual_bonus=actual, continuity_expected_bonus=expected
+        )
+        t.bonus_continuity = dict(
+            rows=[t.rows[i] for i in indices],
+            generations=[t.generations[i] for i in indices],
+            producer_slots=[p[0] for p in producers],
+            producer_epochs=[p[1] for p in producers],
+        )
+        _compare(t, "begin_draft.verified_bonus_continuity", actual, expected)
+
+
+def _publish_verified_bonus(s, t):
+    if t.bonus_continuation_rows + t.bonus_first_entry_rows != len(t.rows):
+        raise AssertionError("B5 bonus continuity was not armed for every live row")
+    bonus = t.snapshots["bonus"]
+    if (
+        bonus.shape != (len(t.rows),)
+        or bonus.device != s.expected_bonus.device
+        or bonus.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("B5 verified bonus snapshot publication geometry changed")
+    bonus = bonus.to(torch.int64)
+    # Caller is the existing SMALL append/relay region, after verify_done. This
+    # enqueue and the next begin_draft read use its FIFO; add no wait or stream.
+    for i, (row, generation) in enumerate(zip(t.rows, t.generations)):
+        s.expected_bonus[row].copy_(bonus[i])
+        s.bonus_publications[(row, generation)] = (t.slot, t.epoch)
+        s.bonus_owners[row] = (generation, t.slot, t.epoch)
+
+
 def begin_draft(worker, batch, draft_input, own_outputs):
     s = _session
     s.worker = worker
@@ -291,6 +410,7 @@ def begin_draft(worker, batch, draft_input, own_outputs):
     t = s.ledger.begin(slot, batch.reqs)
     t.mailbox_index = s.free.pop(0)
     s.current = t
+    _check_bonus_continuity(s, t, draft_input.bonus_tokens)
     s.inputs.activate(t)
     s.head.activate(t)
     s.seed.zero_()
@@ -725,6 +845,7 @@ def finish_append(slot):
     s, t = _session, ticket(slot)
     if t.layers != set(range(6)):
         raise AssertionError("incomplete B5 six-layer feature publication")
+    _publish_verified_bonus(s, t)
     t.published = True
     counts = [(t.snapshots["committed"] == i).sum() for i in range(1, 9)]
     t.values = torch.stack(t.checks + counts)

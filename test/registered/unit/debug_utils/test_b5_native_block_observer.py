@@ -36,6 +36,8 @@ def session(monkeypatch):
 def owner(s, slot, n=32):
     t = s.ledger.begin(slot, reqs(slot, n))
     t.mailbox_index = s.free.pop(0)
+    obs._check_bonus_continuity(s, t, torch.zeros(n, dtype=torch.int64))
+    t.snapshots["bonus"] = torch.zeros(n, dtype=torch.int32)
     t.native_locations = torch.arange(slot * 256 + 1, slot * 256 + 1 + n * 8).reshape(
         n, 8
     )
@@ -803,3 +805,218 @@ def test_begin_draft_binds_actual_target_req_to_token_mapping(session):
     assert torch.equal(session.locations[:32], expected.long())
     table.zero_()
     assert torch.equal(session.locations[:32], expected.long())
+
+
+@pytest.fixture
+def continuity(session, monkeypatch):
+    ready = [True]
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda: NS(record=lambda _: None, query=lambda: ready[0])
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    session.runners = {"target": NS(), "draft": NS()}
+    return session, ready
+
+
+def continuity_begin(s, requests, slot, bonus=None, draft=None):
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+    worker.model_runner = NS(
+        req_to_token_pool=NS(req_to_token=torch.arange(65 * 128).reshape(65, 128))
+    )
+    if draft is None:
+        draft = worker._make_next_draft_input_decode(
+            bonus_tokens=bonus, new_seq_lens=torch.full((len(requests),), 16)
+        )
+    batch = NS(
+        reqs=requests,
+        spec_pdmux_slot=slot,
+        seq_lens=draft.new_seq_lens,
+        req_pool_indices=torch.tensor([r.req_pool_idx for r in requests]),
+    )
+    obs.begin_draft(worker, batch, draft, s.slots == 2)
+    return s.current, draft
+
+
+def continuity_finish(s, t, verified_bonus):
+    # Staged verification/append boundary; not target arithmetic or KV proof.
+    t.native_locations = s.locations[: len(t.rows)].clone()
+    t.snapshots.update(
+        bonus=verified_bonus.clone(),
+        committed=torch.ones(len(t.rows), dtype=torch.int32),
+    )
+    obs._flag(t, "component.append", torch.zeros((), dtype=torch.int64))
+    t.layers = set(range(6))
+    obs.finish_append(t.slot)
+
+
+@pytest.mark.parametrize("n,slot", [(32, 0), (32, 1), (31, 1)])
+def test_verified_bonus_continuity_uses_actual_native_filter_and_migration(
+    continuity, n, slot
+):
+    s, _ = continuity
+    requests = reqs(0)
+    t, _ = continuity_begin(s, requests, 0, torch.arange(32))
+    verified = torch.arange(32, dtype=torch.int32) + 100
+    continuity_finish(s, t, verified)
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    draft = DFlashWorkerV2._make_next_draft_input_decode(
+        None, bonus_tokens=verified, new_seq_lens=torch.full((32,), 17)
+    )
+    selected = torch.arange(31, 31 - n, -1)
+    draft.filter_batch(selected)  # Real native filtering, not a reference gather.
+    verified.zero_()  # Published bank must own the verified snapshot, not scratch.
+    t, _ = continuity_begin(s, [requests[i] for i in selected], slot, draft=draft)
+    assert t.bonus_continuation_rows == n and t.bonus_first_entry_rows == 0
+    assert t.bonus_continuity["producer_slots"] == [0] * n
+    assert not torch.stack(t.checks).any()
+    continuity_finish(s, t, draft.bonus_tokens + 1)
+    s.poll()
+    assert s.stats["bonus_first_entry_rows_baselined"] == 32
+    assert s.stats["bonus_continuation_rows_checked"] == n
+    assert s.stats["slot_bonus_full32_continuation_checks"][slot] == (n == 32)
+    assert sum(s.stats["prefix_histogram"]) == 32 + n
+    assert any(value is s.expected_bonus for value in s.persistent())
+    assert s.expected_bonus.untyped_storage().nbytes() == obs.BONUS_BANK_BYTES == 520
+
+
+@pytest.mark.parametrize("corrupt", ["wrong", "stale", "permuted", "cross_slot"])
+def test_verified_bonus_failure_has_owned_identity_and_values_after_event(
+    continuity, corrupt
+):
+    s, ready = continuity
+    groups = [reqs(0), reqs(1)]
+    bonuses = [torch.arange(32) + 100, torch.arange(32) + 1000]
+    for slot in (0, 1):
+        t, _ = continuity_begin(s, groups[slot], slot, torch.arange(32))
+        continuity_finish(s, t, bonuses[slot])
+    s.poll()
+    actual = bonuses[0].clone()
+    if corrupt == "wrong":
+        actual[3] += 1
+    elif corrupt == "stale":
+        actual = torch.arange(32)
+    elif corrupt == "permuted":
+        actual = actual.roll(1)
+    else:
+        actual = bonuses[1].clone()
+    # Even if the current seed scratch matches the bad input, continuity fails.
+    s.seed[:32].copy_(actual)
+    t, draft = continuity_begin(s, groups[0], 0, actual)
+    captured = actual.clone()
+    draft.bonus_tokens.fill_(-99)
+    assert torch.equal(t.snapshots["continuity_actual_bonus"], captured)
+    ready[0] = False
+    continuity_finish(s, t, torch.arange(32) + 200)
+    s.poll()
+    assert s.stats["completed"] == 2
+    assert s.stats["bonus_continuation_rows_checked"] == 0
+    ready[0] = True
+    with pytest.raises(AssertionError, match="verified_bonus_continuity") as error:
+        s.poll()
+    message = str(error.value)
+    for name in (
+        "rows",
+        "generations",
+        "producer_slots",
+        "producer_epochs",
+        "current_slot",
+        "actual_seeds",
+        "expected_seeds",
+    ):
+        assert name in message
+    assert "-99" not in message
+    assert s.stats["completed"] == 2
+    assert s.stats["slot_bonus_full32_continuation_checks"] == [0, 0]
+    assert t.snapshots and t in s.inflight  # Retain the exact failed evidence.
+
+
+@pytest.mark.parametrize("change", ["missing", "stale_epoch"])
+def test_known_bonus_owner_cannot_silently_become_first_entry(continuity, change):
+    s, _ = continuity
+    requests = reqs(0, 1)
+    t, _ = continuity_begin(s, requests, 0, torch.tensor([1]))
+    continuity_finish(s, t, torch.tensor([7]))
+    if change == "missing":
+        del s.bonus_owners[1]
+    else:
+        generation, slot, epoch = s.bonus_owners[1]
+        s.bonus_owners[1] = (generation, slot, epoch + 1)
+    with pytest.raises(AssertionError, match="owner missing/replaced"):
+        continuity_begin(s, requests, 1, torch.tensor([7]))
+
+
+def test_new_generation_baselines_but_known_old_generation_cannot_resurrect(continuity):
+    s, _ = continuity
+    old = reqs(0, 1)
+    t, _ = continuity_begin(s, old, 0, torch.tensor([1]))
+    continuity_finish(s, t, torch.tensor([7]))
+    new = reqs(0, 1)
+    t, _ = continuity_begin(s, new, 1, torch.tensor([90]))
+    assert t.bonus_continuation_rows == 0 and t.bonus_first_entry_rows == 1
+    continuity_finish(s, t, torch.tensor([91]))
+    s.poll()
+    assert s.stats["bonus_first_entry_rows_baselined"] == 2
+    with pytest.raises(AssertionError, match="owner missing/replaced"):
+        continuity_begin(s, old, 0, torch.tensor([7]))
+
+
+def test_full32_continuation_count_excludes_one_new_generation(continuity):
+    s, _ = continuity
+    requests = reqs(0)
+    t, _ = continuity_begin(s, requests, 0, torch.arange(32))
+    continuity_finish(s, t, torch.arange(32) + 100)
+    requests[-1] = NS(req_pool_idx=32, retraction_count=0)
+    t, _ = continuity_begin(s, requests, 0, torch.arange(32) + 100)
+    assert t.bonus_continuation_rows == 31 and t.bonus_first_entry_rows == 1
+    continuity_finish(s, t, torch.arange(32) + 200)
+    s.poll()
+    assert s.stats["bonus_continuation_rows_checked"] == 31
+    assert s.stats["bonus_first_entry_rows_baselined"] == 33
+    assert s.stats["slot_bonus_full32_continuation_checks"] == [0, 0]
+    assert sum(s.stats["prefix_histogram"]) == 64
+
+
+def test_known_generation_row_change_is_not_a_new_seed_baseline(continuity):
+    s, _ = continuity
+    requests = reqs(0, 1)
+    t, _ = continuity_begin(s, requests, 0, torch.tensor([1]))
+    continuity_finish(s, t, torch.tensor([7]))
+    requests[0].req_pool_idx = 33
+    with pytest.raises(AssertionError, match="known request generation changed row"):
+        continuity_begin(s, requests, 1, torch.tensor([7]))
+
+
+@pytest.mark.parametrize("wrong", ["dtype", "shape"])
+def test_verified_bonus_snapshot_publication_rejects_unknown_abi(continuity, wrong):
+    s, _ = continuity
+    t, _ = continuity_begin(s, reqs(0, 1), 0, torch.tensor([1]))
+    value = torch.tensor([7.0]) if wrong == "dtype" else torch.tensor([[7]])
+    with pytest.raises(ValueError, match="snapshot publication geometry"):
+        continuity_finish(s, t, value)
+    assert not s.bonus_publications and not s.bonus_owners
+    assert not t.published
+
+
+def test_continuity_adds_no_wait_or_value_readback_to_native_enqueue_path():
+    for fn in (
+        obs._check_bonus_continuity,
+        obs._publish_verified_bonus,
+        obs.begin_draft,
+        obs.finish_append,
+    ):
+        names = {
+            n.func.attr
+            for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(fn))))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+        assert not names & {
+            "wait_event",
+            "wait_stream",
+            "synchronize",
+            "item",
+            "cpu",
+            "tolist",
+        }

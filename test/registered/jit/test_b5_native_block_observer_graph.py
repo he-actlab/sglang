@@ -290,10 +290,14 @@ def test_b5_two32_payloads_preserve_native_fence_and_delayed_readback(monkeypatc
     warm = s.ledger.begin(0, requests(0))
     warm.mailbox_index = s.free.pop(0)
     with torch.cuda.stream(small):
+        obs._check_bonus_continuity(
+            s, warm, torch.zeros(32, device="cuda", dtype=torch.int64)
+        )
         warm.native_locations = torch.arange(1, 257, device="cuda").reshape(32, 8)
         warm.snapshots.update(
             hidden=source.clone(),
             committed=(torch.arange(32, device="cuda") % 8 + 1).int(),
+            bonus=torch.arange(32, device="cuda", dtype=torch.int32),
         )
         warm.checks = [
             obs.different(source, warm.snapshots["hidden"]).long() for _ in range(2)
@@ -310,6 +314,10 @@ def test_b5_two32_payloads_preserve_native_fence_and_delayed_readback(monkeypatc
     for slot in (0, 1):
         t = s.ledger.begin(slot, requests(slot))
         t.mailbox_index = s.free.pop(0)
+        with torch.cuda.stream(small):
+            obs._check_bonus_continuity(
+                s, t, torch.zeros(32, device="cuda", dtype=torch.int64)
+            )
         t.native_locations = torch.arange(
             slot * 256 + 1, slot * 256 + 257, device="cuda"
         ).reshape(32, 8)
@@ -321,6 +329,7 @@ def test_b5_two32_payloads_preserve_native_fence_and_delayed_readback(monkeypatc
             t.snapshots.update(
                 hidden=held.clone(),
                 committed=(torch.arange(32, device="cuda") % 8 + 1).int(),
+                bonus=torch.arange(32, device="cuda", dtype=torch.int32),
             )
             obs.deferred(slot, scratch, {"target_hidden": held})
             verify_done = torch.cuda.Event()  # Existing native event ordering.
@@ -349,3 +358,220 @@ def test_b5_two32_payloads_preserve_native_fence_and_delayed_readback(monkeypatc
     assert result["prefix_histogram"] == [8] * 8
     assert len(s.free) == 4 and s.retained() == 0
     assert result["full_checkpoint_native_semantics"] is False
+
+
+@CUDA
+@pytest.mark.parametrize("corrupt", [False, True])
+@torch.inference_mode()
+def test_verified_bonus_continuity_native_two_stream_relay(corrupt, monkeypatch):
+    """Native acceptance/relay, staged hidden/KV boundaries; not model proof."""
+    from sglang.srt.managers import overlap_utils
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.triton_ops.dflash import (
+        _compute_dflash_accept_bonus_triton_unchecked,
+    )
+
+    s = obs.Session("cuda", 2, [32, 64])
+    monkeypatch.setattr(obs, "_session", s)
+    small, large = torch.cuda.Stream(), torch.cuda.Stream()
+    s.runners = {"target": NS(), "draft": NS()}
+    worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+    worker.device, worker.block_size = "cuda", 8
+    worker.server_args = NS(enable_spec_pdmux=True, spec_pdmux_slots=2)
+    worker._spec_pdmux_small_stream = small
+    worker._spec_pdmux_concurrent = True
+    worker._use_triton_accept_bonus = True
+    worker._accept_bonus_buffer_cap = 0
+    table = torch.arange(65 * 128, device="cuda").reshape(65, 128)
+    worker.model_runner = NS(req_to_token_pool=NS(req_to_token=table))
+    worker._append_target_hidden_to_draft_kv_by_loc = lambda **_: None
+
+    # Reuse actual stash/gather methods with fixed buffers. The constructor's
+    # unrelated host-length D2H stream is not part of this two-stream component.
+    relay = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+    relay.device = torch.device("cuda")
+    relay.spec_algo = SpeculativeAlgorithm.DFLASH
+    relay.output_tokens_buf = torch.full((65,), -1, device="cuda", dtype=torch.int64)
+    relay._forward_buf_initialized = True
+    relay.need_topk = relay.need_hidden_states = False
+    relay.draft_probs_buf = None
+    scheduler = NS(spec_algorithm=SpeculativeAlgorithm.DFLASH, future_map=relay)
+    monkeypatch.setattr(overlap_utils, "_DEBUG_ASSERT", False)
+    groups = [requests(0), requests(1)]
+    rows = [torch.arange(1, 33, device="cuda"), torch.arange(33, 65, device="cuda")]
+
+    def staged_append(worker, native_call, **materialize):
+        t = next(
+            t
+            for t in s.ledger.current
+            if t is not None
+            and not t.published
+            and t.native_locations is materialize["cache_loc_2d"]
+        )
+        assert torch.cuda.current_stream() == small
+        assert materialize["cache_loc_2d"] is t.native_locations
+        native_call(**materialize)
+        t.layers = set(range(6))  # No KV arithmetic is claimed here.
+
+    monkeypatch.setattr(obs, "observed_append", staged_append)
+    specs = PatchConfig(
+        **yaml.safe_load(
+            (
+                Path(__file__).resolve().parents[2]
+                / "manual/gdn_compact_shadow_b5.yaml"
+            ).read_text()
+        )
+    ).patches
+    selected = [
+        p
+        for p in specs
+        if p.target.endswith(
+            ("._defer_draft_materialization", ".flush_spec_pdmux_pending")
+        )
+    ]
+    assert len(selected) == 2
+    small.wait_stream(torch.cuda.current_stream())
+    large.wait_stream(torch.cuda.current_stream())
+    native_wait = torch.cuda.Stream.wait_event
+    waits = []
+
+    def audited_wait(stream, event):
+        waits.append((stream.cuda_stream, event))
+        return native_wait(stream, event)
+
+    def forbidden_sync(*args, **kwargs):
+        raise AssertionError("observer added a stream/device synchronization")
+
+    with CodePatcher(patches=selected):
+        for iteration in range(2):
+            for slot in (0, 1):
+                worker._accept_bonus_buffer_slot = slot
+                with torch.cuda.stream(small):
+                    draft = worker._make_next_draft_input_decode(
+                        bonus_tokens=torch.arange(32, device="cuda") + 100 * slot,
+                        new_seq_lens=torch.full((32,), 16, device="cuda"),
+                    )
+                    batch = NS(
+                        reqs=groups[slot],
+                        spec_pdmux_slot=slot,
+                        seq_lens=draft.new_seq_lens,
+                        req_pool_indices=rows[slot],
+                        spec_info=draft,
+                        prefill_input_ids_cpu=None,
+                        input_ids=None,
+                        enable_overlap=True,
+                        spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                    )
+                    if iteration:
+                        draft.future_indices = rows[slot]
+                        overlap_utils.resolve_forward_inputs(batch, relay)
+                        if corrupt and slot == 1:
+                            draft.bonus_tokens[3].add_(1)
+                    with monkeypatch.context() as guard:
+                        guard.setattr(torch.cuda, "synchronize", forbidden_sync)
+                        guard.setattr(torch.cuda.Stream, "synchronize", forbidden_sync)
+                        guard.setattr(torch.cuda.Stream, "wait_stream", forbidden_sync)
+                        guard.setattr(torch.cuda.Stream, "wait_event", forbidden_sync)
+                        obs.begin_draft(worker, batch, draft, True)
+                    t = s.current
+                    block = worker._make_draft_block(
+                        torch.arange(256, device="cuda").reshape(32, 8),
+                        torch.arange(256, device="cuda"),
+                        s.locations[:32],
+                        own_outputs=True,
+                    )
+                    obs.bind_locations(slot, block)
+                    draft_ready = torch.cuda.Event()
+                    draft_ready.record(small)
+                large.wait_event(draft_ready)  # Existing draft-to-verify edge.
+                with torch.cuda.stream(large):
+                    s.target.activate(t)
+                    s.target.record(
+                        torch.zeros(32, 5, device="cuda", dtype=torch.int64)
+                    )
+                    s.tap_epochs.fill_(t.epoch)
+                    s.tap_slots.fill_(slot)
+                    s.taps[:256].zero_()
+                    target = block.tokens.roll(-1, 1)
+                    accepted = torch.arange(32, device="cuda") % 8
+                    target[torch.arange(32, device="cuda"), accepted] += 1000 + slot
+                    accept, committed, bonus, output, lengths = (
+                        worker._next_accept_bonus_buffers(32)
+                    )
+                    _compute_dflash_accept_bonus_triton_unchecked(
+                        candidates=block.tokens,
+                        target_top1=target,
+                        accept_lens_out=accept,
+                        commit_lens_out=committed,
+                        bonus_ids_out=bonus,
+                        out_tokens_out=output,
+                        prefix_lens=batch.seq_lens,
+                        new_seq_lens_out=lengths,
+                    )
+                    committed, bonus, output, lengths = (
+                        x.clone() for x in (committed, bonus, output, lengths)
+                    )
+                    hidden = s.taps[:256].clone()  # Staged target-feature boundary.
+                    obs.verification(
+                        slot,
+                        block.tokens,
+                        target,
+                        batch.seq_lens,
+                        committed,
+                        bonus,
+                        output,
+                        lengths,
+                        hidden,
+                        True,
+                    )
+                    result = GenerationBatchResult(
+                        accept_lens=committed,
+                        next_token_ids=output.flatten(),
+                        new_seq_lens=lengths,
+                        next_draft_input=worker._make_next_draft_input_decode(
+                            bonus_tokens=bonus,
+                            new_seq_lens=lengths,
+                        ),
+                    )
+                    obs.result_owned(result, slot)
+                    worker._defer_draft_materialization(
+                        slot=slot,
+                        result=result,
+                        hidden=hidden,
+                        block=block,
+                        on_relay=lambda payload, slot=slot: Scheduler._relay_forward_payload(
+                            scheduler, rows[slot], payload
+                        ),
+                    )
+                native_event = worker._spec_pdmux_state["pending"][slot].verify_done
+                before = len(waits)
+                with monkeypatch.context() as guard:
+                    guard.setattr(torch.cuda, "synchronize", forbidden_sync)
+                    guard.setattr(torch.cuda.Stream, "synchronize", forbidden_sync)
+                    guard.setattr(torch.cuda.Stream, "wait_stream", forbidden_sync)
+                    guard.setattr(torch.cuda.Stream, "wait_event", audited_wait)
+                    worker.flush_spec_pdmux_pending(slot)
+                assert waits[before:] == [(small.cuda_stream, native_event)]
+                # Test-only drain. Observer never adds this synchronization.
+                t.event.synchronize()
+                if corrupt and iteration == 1 and slot == 1:
+                    with pytest.raises(
+                        AssertionError, match="verified_bonus_continuity"
+                    ) as error:
+                        s.poll()
+                    assert "actual_seeds" in str(error.value)
+                    assert s.stats["bonus_continuation_rows_checked"] == 32
+                    assert s.stats["slot_bonus_full32_continuation_checks"] == [1, 0]
+                    assert t.snapshots and t in s.inflight
+                else:
+                    s.poll()
+    if not corrupt:
+        result = s.snapshot()
+        assert result["bonus_continuation_rows_checked"] == 64
+        assert result["bonus_first_entry_rows_baselined"] == 64
+        assert result["slot_bonus_continuation_rows_checked"] == [32, 32]
+        assert result["slot_bonus_full32_continuation_checks"] == [1, 1]
+        assert sum(result["prefix_histogram"]) == 128
+        assert result["completed"] == 4 and result["pending"] == 0
