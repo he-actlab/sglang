@@ -1,7 +1,9 @@
 """Synthetic CUDA component checks for the B6 diagnostic's graph/lifetime seams.
 
-Two genuine B32 ownership banks use graph64 padding. This is not checkpoint,
-attention, green-context placement, serving parity, KV correctness or model fit.
+Two genuine B32 ownership banks use graph64 padding. The integrated-reference
+case stages synthetic reference boundaries, NOT independent native FlashInfer
+attention. This is not checkpoint, green-context placement, serving parity,
+native KV correctness or model fit.
 Only this test creates streams; the opt-in serving observer creates none.
 """
 
@@ -13,6 +15,7 @@ import torch
 import yaml
 
 from sglang.srt.debug_utils import b6_same_input_observer as obs
+from sglang.srt.debug_utils.b6_native_attention_reference import NativeDSparkReference
 from sglang.srt.debug_utils.source_patcher.code_patcher import CodePatcher
 from sglang.srt.debug_utils.source_patcher.types import PatchConfig
 from sglang.srt.speculative.dspark_worker_v2 import DSparkWorkerV2
@@ -250,3 +253,284 @@ def test_two32_payloads_wait_for_native_style_event_then_release_mailboxes(monke
     assert (
         result["attention_reference"] == result["serving_parity"] == "NOT_ESTABLISHED"
     )
+
+
+def _tiny_five_layer_reference_model():
+    """Actual native head methods plus small synthetic reference-only layers."""
+    model = _native_heads()
+    model.mask_token_id = model.config.mask_token_id
+    model.config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000}
+
+    def linear(out, inp):
+        layer = torch.nn.Linear(
+            inp, out, bias=False, dtype=torch.bfloat16, device="cuda"
+        )
+        layer.weight.uniform_(-0.05, 0.05)
+        return layer
+
+    def norm(width):
+        return NS(
+            weight=torch.ones(width, dtype=torch.bfloat16, device="cuda"),
+            variance_epsilon=1e-6,
+        )
+
+    model.fc, model.hidden_norm, model.norm = linear(32, 160), norm(32), norm(32)
+    model.layers = [
+        NS(
+            input_layernorm=norm(32),
+            post_attention_layernorm=norm(32),
+            self_attn=NS(
+                head_dim=8,
+                num_heads=4,
+                num_kv_heads=2,
+                q_size=32,
+                kv_size=16,
+                qkv_proj=linear(64, 32),
+                o_proj=linear(32, 32),
+                q_norm=norm(8),
+                k_norm=norm(8),
+            ),
+            mlp=NS(gate_up_proj=linear(128, 32), down_proj=linear(32, 64)),
+        )
+        for _ in range(5)
+    ]
+    return model
+
+
+@CUDA
+@pytest.mark.parametrize("arm", ["stock", "prior"])
+@torch.inference_mode()
+def test_integrated_reference_graph_traces_packed_prefix_events_and_corruption(
+    monkeypatch, arm
+):
+    """Real CUDA integration/lifetime, with explicitly staged golden boundaries.
+
+    The independent utility executes all five layers eagerly at B32 on GPU.
+    Its golden outputs are staged through graph32/64 trace/head callbacks; this
+    is deliberately NOT a production-attention numerical comparison. The real
+    checkpoint fixture captures actual native model boundaries instead.
+    """
+    torch.manual_seed(927)
+    small = torch.cuda.Stream()
+    large = small if arm == "stock" else torch.cuda.Stream()
+    model = _tiny_five_layer_reference_model()
+    session = obs.Session("cuda", hidden_size=32)
+    session.arm, session.initialized = arm, {"draft", "target"}
+    session.reference = NativeDSparkReference(model)
+    golden = NativeDSparkReference(model)
+    monkeypatch.setattr(obs, "_session", session)
+    worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+    worker.draft_model, worker.draft_model_runner = model, NS()
+    worker.__dict__["_spec_pdmux_small_stream"] = None if arm == "stock" else small
+    graph_bs = 32 if arm == "stock" else 64
+    worker.server_args = NS(cuda_graph_config=NS(decode=NS(bs=[32, graph_bs])))
+    worker._maybe_build_draft_sampler()
+    sampler = worker.draft_model_runner.draft_block_sampler
+    small.wait_stream(torch.cuda.current_stream())
+    large.wait_stream(torch.cuda.current_stream())
+    batches = []
+    for slot in range(1 if arm == "stock" else 2):
+        batch = NS(
+            reqs=_reqs(slot),
+            prefix_lens=[0] * 32,
+            extend_lens=[1 + i % 4 for i in range(32)],
+        )
+        if arm != "stock":
+            batch.spec_pdmux_slot = slot
+        with torch.cuda.stream(small):
+            positions = torch.cat(
+                [torch.arange(n, device="cuda") for n in batch.extend_lens]
+            )
+            features = torch.randn(
+                sum(batch.extend_lens), 160, dtype=torch.bfloat16, device="cuda"
+            )
+            obs.prefill_context(worker, batch, features, positions)
+            keys = session.ledger.keys(batch.reqs)
+            for key in keys:
+                golden.register_request(key)
+            golden.append_packed_context(keys, features, positions, batch.extend_lens)
+        batches.append(batch)
+    staged = torch.zeros(6, graph_bs, 7, 32, dtype=torch.bfloat16, device="cuda")
+    ids = torch.full(
+        (graph_bs, 7), model.mask_token_id, dtype=torch.int64, device="cuda"
+    )
+    rows = torch.zeros(graph_bs, dtype=torch.int64, device="cuda")
+    fb = NS(batch_size=graph_bs, input_ids=ids.flatten(), req_pool_indices=rows)
+    verify_scratch = torch.empty((32, 8), dtype=torch.int64, device="cuda")
+
+    def captured_boundaries():
+        for index in range(6):
+            obs.capture_draft_hidden(index, staged[index].reshape(graph_bs * 7, 32), fb)
+        sampler(staged[5].reshape(graph_bs * 7, 32), fb)
+
+    fixture = Path(__file__).resolve().parents[2] / "manual/b6_same_input_observer.yaml"
+    specs = PatchConfig(**yaml.safe_load(fixture.read_text())).patches
+    selected = [
+        p
+        for p in specs
+        if p.target.endswith(
+            (
+                "Qwen3DSparkModel.propose",
+                "_DSparkDraftSampler.__call__",
+                "DFlashWorkerV2._make_draft_block",
+            )
+        )
+    ]
+    assert len(selected) == 3
+    with CodePatcher(patches=selected):
+        graph = _capture_on(small, captured_boundaries)
+        # Prepare both independent owners before introducing delayed events.
+        prepared = []
+        with torch.cuda.stream(small):
+            for slot, batch in enumerate(batches):
+                keys = session.ledger.keys(batch.reqs)
+                ticket = golden.begin_batch(slot, 1, keys)
+                seed = torch.arange(32, device="cuda") % 8
+                block = golden.forward_block(ticket, seed)
+                positions = (
+                    torch.tensor(ticket.prefix_lengths, device="cuda")[:, None]
+                    + torch.arange(8, device="cuda")[None]
+                )
+                counts = tuple(1 + i % 8 for i in range(32))
+                features = torch.randn(32, 8, 160, dtype=torch.bfloat16, device="cuda")
+                for row, count in enumerate(counts):
+                    features[row, count:] = float("nan")
+                golden.append_context(keys, features, positions, counts, ticket=ticket)
+                golden.finish_batch(ticket)
+                prepared.append((seed, block, positions, counts, features))
+        small.synchronize()
+        tickets = []
+        for slot, (batch, payload) in enumerate(zip(batches, prepared)):
+            seed, block, positions, counts, features = payload
+            with torch.cuda.stream(small):
+                obs.begin_draft(worker, batch, arm != "stock")
+                t = session.current_draft
+                rows.zero_()
+                rows[:32].copy_(session.draft.rows[:32])
+                ids[:32, 0].copy_(seed)
+                staged[:, :32].copy_(torch.stack((*block.layer_hidden, block.hidden)))
+                graph.replay()
+                obs.draft_graph(True)
+                verify_scratch[:, 0].copy_(seed)
+                verify_scratch[:, 1:].copy_(sampler.tokens[:32])
+                locations = (torch.arange(256, device="cuda") + 1 + slot * 256).view(
+                    32, 8
+                )
+                worker._make_draft_block(
+                    verify_scratch,
+                    positions.flatten(),
+                    locations,
+                    own_outputs=arm != "stock",
+                )
+                assert obs.disjoint(t.snapshots["tokens"], verify_scratch)
+                ready = torch.cuda.Event()
+                ready.record(small)
+            large.wait_event(ready)
+            with torch.cuda.stream(large):
+                t.snapshots.update(
+                    hidden=features.clone(),
+                    committed=torch.tensor(counts, device="cuda"),
+                )
+                t.reference_context = torch.empty(0, device="cuda")
+                t.layers = set(
+                    range(5)
+                )  # Writer coverage belongs to its separate component.
+                torch.cuda._sleep(1_000_000_000)
+                verified = torch.cuda.Event()
+                verified.record(large)
+            small.wait_event(verified)
+            with torch.cuda.stream(small):
+                session.current_write = t
+                obs.finish_append(slot)
+            assert not t.event.query(), "pending real readback was not exercised"
+            if slot == 0:
+                session.poll()
+            # Do not poll a ready older owner while a later SMALL event is
+            # pending: eager reference value guards are allowed to wait for
+            # SMALL and finish that later ticket too. Drain below, under the
+            # real reader-stream lifetime check.
+            assert t in session.inflight and t.snapshots
+            tickets.append(t)
+        # Deliberate graph scratch reuse cannot replace owned hidden snapshots.
+        with torch.cuda.stream(small):
+            staged.fill_(99)
+            graph.replay()
+        old_prefix_pointers = {
+            tensor.data_ptr()
+            for prefix in session.reference._prefixes.values()
+            for tensor in prefix.keys + prefix.values
+        }
+        reader = torch.cuda.current_stream() if arm == "stock" else small
+        if arm == "stock":
+            assert reader.cuda_stream != small.cuda_stream
+        registered = set()
+        original_record = torch.Tensor.record_stream
+
+        def record_reader(tensor, stream):
+            registered.add((tensor.data_ptr(), stream.cuda_stream))
+            return original_record(tensor, stream)  # Real CUDA allocator registration.
+
+        with monkeypatch.context() as lifetime:
+            lifetime.setattr(torch.Tensor, "record_stream", record_reader)
+            session.poll(wait=True)
+        assert {(ptr, reader.cuda_stream) for ptr in old_prefix_pointers} <= registered
+        assert session.stats["reference_completed"] == len(batches)
+        assert session.stats["reference_layer_comparisons"] == [len(batches)] * 6
+        for key, expected in golden._prefixes.items():
+            actual = session.reference._prefixes[key]
+            assert actual.length == expected.length
+            assert all(
+                torch.equal(a, b)
+                for a, b in zip(
+                    actual.keys + actual.values, expected.keys + expected.values
+                )
+            )
+            assert all(torch.isfinite(a).all() for a in actual.keys + actual.values)
+        assert all(not t.snapshots for t in tickets)
+
+        # The next proposal uses carried prefixes. A fifth-layer trace mutation
+        # must fail exactly and retain evidence, without publishing more KV.
+        batch = batches[0]
+        keys = session.ledger.keys(batch.reqs)
+        before = {key: session.reference._prefixes[key] for key in keys}
+        with torch.cuda.stream(small):
+            expected_ticket = golden.begin_batch(0, 2, keys)
+            seed = torch.arange(32, device="cuda") % 8
+            block = golden.forward_block(expected_ticket, seed)
+            obs.begin_draft(worker, batch, arm != "stock")
+            t = session.current_draft
+            rows[:32].copy_(session.draft.rows[:32])
+            ids[:32, 0].copy_(seed)
+            staged[:, :32].copy_(torch.stack((*block.layer_hidden, block.hidden)))
+            staged[4, 31, 6, 0] += 1
+            graph.replay()
+            obs.draft_graph(True)
+            verify_scratch[:, 0].copy_(seed)
+            verify_scratch[:, 1:].copy_(sampler.tokens[:32])
+            positions = (
+                torch.tensor(expected_ticket.prefix_lengths, device="cuda")[:, None]
+                + torch.arange(8, device="cuda")[None]
+            )
+            locations = (torch.arange(256, device="cuda") + 1).view(32, 8)
+            worker._make_draft_block(
+                verify_scratch,
+                positions.flatten(),
+                locations,
+                own_outputs=arm != "stock",
+            )
+            t.snapshots.update(
+                hidden=torch.zeros(32, 8, 160, dtype=torch.bfloat16, device="cuda"),
+                committed=torch.ones(32, dtype=torch.int64, device="cuda"),
+            )
+            t.reference_context, t.layers = torch.empty(0, device="cuda"), set(range(5))
+            session.current_write = t
+            obs.finish_append(0)
+        with pytest.raises(AssertionError, match="draft hidden boundary 4"):
+            session.poll(wait=True)
+        assert t.snapshots and session.failure["stage"] == "draft hidden boundary 4"
+        assert all(
+            session.reference._prefixes[key] is value for key, value in before.items()
+        )
+        receipt = session.snapshot()
+        assert receipt["diagnostic_failure"] is not None
+        assert receipt["full_checkpoint_native_semantics"] is False

@@ -10,7 +10,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.debug_utils.b6_native_attention_reference import NativeDSparkReference
-from sglang.srt.debug_utils.b6_same_input_observer import native_head_reference
+from sglang.srt.debug_utils import b6_same_input_observer as observer
+from sglang.srt.debug_utils.b6_same_input_observer import (
+    native_head_reference,
+    native_norm,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -453,3 +457,349 @@ def test_non_native_contract_inputs_are_rejected(mutation):
         m.fc = nn.Linear(32, 8, bias=False, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
         NativeDSparkReference(m)
+
+
+def packed_inputs(ref, keys, lengths):
+    features = torch.randn(sum(lengths), 5 * ref.hidden_size).bfloat16()
+    positions = torch.cat(
+        [
+            torch.arange(ref._prefixes[key].length, ref._prefixes[key].length + count)
+            for key, count in zip(keys, lengths)
+        ]
+    )
+    return features, positions
+
+
+@pytest.mark.parametrize("rows", [32, 64])
+def test_packed_actual_m_ragged_chunked_prefill_all_layers_and_recovery(rows):
+    native = model()
+    refs = [NativeDSparkReference(native), NativeDSparkReference(native)]
+    keys = tuple((i + 1, 1) for i in range(rows))
+    for ref in refs:
+        for key in keys:
+            ref.register_request(key)
+    for chunk in (0, 1):
+        lengths = tuple(1 + (i + chunk) % 5 for i in range(rows))
+        features, positions = packed_inputs(refs[0], keys, lengths)
+        old = [refs[0]._prefixes[key] for key in keys]
+        calls, original = [], F.linear
+
+        def linear(x, weight, bias=None):
+            calls.append(tuple(x.shape))
+            return original(x, weight, bias)
+
+        with patch.object(F, "linear", linear):
+            refs[0].append_packed_context(keys, features, positions, lengths)
+        assert calls == [(sum(lengths), 40)] + [(sum(lengths), 8)] * 10
+        refs[1].append_packed_context(
+            keys, features.clone(), positions.clone(), lengths
+        )
+        context = native_norm(F.linear(features, native.fc.weight), native.hidden_norm)
+        for index, layer in enumerate(native.layers):
+            attn = layer.self_attn
+            _, wk, wv = refs[0]._projection_weights(attn)
+            k = F.linear(context, wk).reshape(1, sum(lengths), 1, 4)
+            k = refs[0]._rotary(native_norm(k, attn.k_norm), positions[None])[0]
+            v = F.linear(context, wv).reshape(sum(lengths), 1, 4)
+            offset = 0
+            for row, (key, count) in enumerate(zip(keys, lengths)):
+                prefix = refs[0]._prefixes[key]
+                assert torch.equal(
+                    prefix.keys[index],
+                    torch.cat([old[row].keys[index], k[offset : offset + count]]),
+                )
+                assert torch.equal(
+                    prefix.values[index],
+                    torch.cat([old[row].values[index], v[offset : offset + count]]),
+                )
+                offset += count
+    for slot in range(rows // 32):
+        owned_keys = keys[32 * slot : 32 * (slot + 1)]
+        tickets = [ref.begin_batch(slot, 1, owned_keys) for ref in refs]
+        blocks = [
+            ref.forward_block(ticket, torch.arange(32))
+            for ref, ticket in zip(refs, tickets)
+        ]
+        exact_block(*blocks)
+        counts = tuple(1 + i % 8 for i in range(32))
+        features, positions = inputs(refs[0], owned_keys, counts, width=8)
+        poisoned = features.clone()
+        for row, count in enumerate(counts):
+            poisoned[row, count:] = float("nan")
+        for ref, ticket, source in zip(refs, tickets, (features, poisoned)):
+            ref.append_context(owned_keys, source, positions, counts, ticket=ticket)
+            ref.finish_batch(ticket)
+        exact_prefixes(*refs, owned_keys)
+
+
+@pytest.mark.parametrize(
+    "failure", ["position", "nan", "autocast", "projection", "publication"]
+)
+def test_packed_failure_does_not_publish_any_prefix(failure):
+    ref, _, slots = initialized_pair()
+    keys = slots[0]
+    lengths = tuple(1 + i % 4 for i in range(32))
+    features, positions = packed_inputs(ref, keys, lengths)
+    original = {key: ref._prefixes[key] for key in keys}
+    if failure == "position":
+        positions[-1] += 1
+    elif failure == "nan":
+        features[-1, 0] = float("nan")
+    if failure in ("projection", "publication"):
+        owner, name = (F, "linear") if failure == "projection" else (torch, "cat")
+        real = getattr(owner, name)
+        calls = 0
+
+        def fail_late(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            # Publication follows the ten RoPE cat calls; fail after a complete
+            # replacement row was constructed, not just at first allocation.
+            if calls == (11 if failure == "projection" else 21):
+                raise RuntimeError("injected allocation/projection failure")
+            return real(*args, **kwargs)
+
+        with patch.object(owner, name, fail_late), pytest.raises(RuntimeError):
+            ref.append_packed_context(keys, features, positions, lengths)
+    elif failure == "autocast":
+        with torch.autocast("cpu", dtype=torch.float16), pytest.raises(ValueError):
+            ref.append_packed_context(keys, features, positions, lengths)
+    else:
+        with pytest.raises(ValueError):
+            ref.append_packed_context(keys, features, positions, lengths)
+    assert all(ref._prefixes[key] is prefix for key, prefix in original.items())
+
+
+def test_all_prefix_read_paths_register_reader_before_projection_or_attention():
+    ref, _, slots = initialized_pair()
+    keys = slots[0]
+    packed, positions = packed_inputs(ref, keys, (1,) * 32)
+    registrations = []
+    original = F.linear
+
+    def projection(*args, **kwargs):
+        assert registrations, "prefix reader must be registered before queued work"
+        return original(*args, **kwargs)
+
+    with patch.object(
+        ref, "_record_prefix_read_stream", side_effect=lambda k: registrations.append(k)
+    ), patch.object(F, "linear", projection):
+        ref.append_packed_context(keys, packed, positions, (1,) * 32)
+        assert registrations == [keys]
+        registrations.clear()
+        ticket = ref.begin_batch(0, 1, keys)
+        ref.forward_block(ticket, torch.arange(32))
+        assert registrations == [keys]
+        registrations.clear()
+        features, positions = inputs(ref, keys, (1,) * 32, width=8)
+        ref.append_context(keys, features, positions, (1,) * 32, ticket=ticket)
+        assert registrations == [keys]
+
+
+class DiagnosticEvent:
+    """CPU event-order fixture, not evidence of CUDA scheduling/overlap."""
+
+    def __init__(self):
+        self.ready = False
+        self.waits = 0
+
+    def record(self, stream):
+        self.stream = stream
+
+    def query(self):
+        return self.ready
+
+    def synchronize(self):
+        self.waits += 1
+        self.ready = True
+
+
+def diagnostic_session(monkeypatch, arm="prior"):
+    session = observer.Session("cpu", hidden_size=8)
+    session.arm = arm
+    session.initialized = {"draft", "target"}
+    session.reference = NativeDSparkReference(model())
+    worker = SimpleNamespace(
+        _spec_pdmux_small_stream=None if arm == "stock" else object(),
+        draft_model=session.reference.model,
+    )
+    monkeypatch.setattr(observer, "_session", session)
+    monkeypatch.setattr(torch.cuda, "Event", DiagnosticEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda: pytest.fail("device-wide synchronization forbidden"),
+    )
+    batches = []
+    for slot in range(1 if arm == "stock" else 2):
+        reqs = [
+            SimpleNamespace(req_pool_idx=32 * slot + row + 1, retraction_count=0)
+            for row in range(32)
+        ]
+        lengths = [1 + row % 4 for row in range(32)]
+        batch = SimpleNamespace(reqs=reqs, prefix_lens=[0] * 32, extend_lens=lengths)
+        if arm != "stock":
+            batch.spec_pdmux_slot = slot
+        features = torch.randn(sum(lengths), 40).bfloat16()
+        positions = torch.cat([torch.arange(n) for n in lengths])
+        observer.prefill_context(worker, batch, features, positions)
+        batches.append(batch)
+    # Tiny synthetic native-output stand-in only; serving/CUDA parity is not
+    # inferred from agreement with this independent instance of the utility.
+    golden = copy.deepcopy(session.reference)
+    return session, worker, batches, golden
+
+
+def enqueue_diagnostic(session, worker, batch, golden):
+    concurrent = session.arm != "stock"
+    observer.begin_draft(worker, batch, concurrent)
+    ticket = session.current_draft
+    keys = tuple(zip(ticket.rows, ticket.generations))
+    expected_ticket = golden.begin_batch(ticket.slot, ticket.epoch, keys)
+    seed = torch.arange(32)
+    block = golden.forward_block(expected_ticket, seed)
+    for index, hidden in enumerate((*block.layer_hidden, block.hidden)):
+        observer.capture_draft_hidden(index, hidden.reshape(32 * 7, 8), None)
+    observer.observed_proposal(golden.model, block.hidden, seed, block, 0.0)
+    observer.draft_graph(True)
+    tokens = torch.cat([seed[:, None], block.tokens], 1)
+    positions = (
+        torch.tensor(expected_ticket.prefix_lengths)[:, None] + torch.arange(8)[None]
+    )
+    locations = torch.arange(256).reshape(32, 8) + 256 * ticket.slot + 1
+    originals = tokens, positions.reshape(-1), locations
+    actual = tuple(t.clone() for t in originals) if concurrent else originals
+    observer.own_block(*actual, concurrent, originals)
+    counts = tuple(1 + i % 8 for i in range(32))
+    features = torch.randn(32, 8, 40).bfloat16()
+    for row, count in enumerate(counts):
+        features[row, count:] = float("nan")
+    ticket.snapshots.update(hidden=features.clone(), committed=torch.tensor(counts))
+    # The existing same-input/prefix-writer tests cover those real call sites.
+    # Here the event publication boundary is exercised with CPU-owned tensors.
+    ticket.reference_context = torch.empty(0)
+    ticket.layers = set(range(5))
+    session.current_write = ticket
+    observer.finish_append(ticket.slot)
+    golden.append_context(keys, features, positions, counts, ticket=expected_ticket)
+    golden.finish_batch(expected_ticket)
+    return ticket
+
+
+@pytest.mark.parametrize("arm", ["stock", "prior", "candidate"])
+def test_observer_replays_owned_full32_reference_after_readiness_and_retains_prefix(
+    monkeypatch, arm
+):
+    s, worker, batches, golden = diagnostic_session(monkeypatch, arm)
+    tickets = [enqueue_diagnostic(s, worker, batch, golden) for batch in batches]
+    s.trace.hidden.fill_(123)  # Captured graph storage is already reusable.
+    s.poll()
+    assert s.stats["reference_completed"] == 0 and all(t.snapshots for t in tickets)
+    # A ready second owner must not overtake an earlier prefix/publication.
+    tickets[-1].event.ready = True
+    if len(tickets) == 2:
+        s.poll()
+        assert s.stats["reference_completed"] == 0
+    s.poll(wait=True)
+    assert s.stats["reference_completed"] == len(batches)
+    assert s.stats["reference_layer_comparisons"] == [len(batches)] * 6
+    assert s.stats["slot_max_batch_checked"] == (
+        [32, 0] if arm == "stock" else [32, 32]
+    )
+    for batch in batches:
+        exact_prefixes(s.reference, golden, s.ledger.keys(batch.reqs))
+    assert not s.inflight and len(s.free_mailboxes) == 4
+    assert all(not t.snapshots and not hasattr(t, "row_values") for t in tickets)
+    receipt = s.snapshot()
+    assert receipt["active"] and receipt["diagnostic_failure"] is None
+    assert receipt["full_checkpoint_native_semantics"] is False
+    assert (
+        receipt["serving_parity"] == "NOT_ESTABLISHED"
+        and receipt["scheduling_perturbed"]
+    )
+    assert receipt["reference_prefix_tensor_bytes"] > 0
+
+
+def test_observer_four_mailbox_bound_drains_specific_events_before_reuse(monkeypatch):
+    s, worker, batches, golden = diagnostic_session(monkeypatch)
+    tickets = [enqueue_diagnostic(s, worker, batches[i % 2], golden) for i in range(4)]
+    assert len(s.inflight) == 4 and not s.free_mailboxes
+    newest = enqueue_diagnostic(s, worker, batches[0], golden)
+    assert s.stats["reference_completed"] == 4
+    assert all(t.event.waits == 1 for t in tickets)
+    assert s.inflight == [newest] and len(s.free_mailboxes) == 3
+    s.poll(wait=True)
+    assert s.stats["reference_completed"] == 5
+
+
+@pytest.mark.parametrize(
+    "mutation,stage",
+    [
+        ("layer4", "draft hidden boundary 4"),
+        ("final", "draft hidden boundary 5"),
+        ("confidence", "native confidence"),
+        ("prefix", "accepted-prefix metadata"),
+        ("length", "accepted-prefix metadata"),
+    ],
+)
+def test_observer_exact_failure_retains_evidence_and_never_appends_prefix(
+    monkeypatch, mutation, stage
+):
+    s, worker, batches, golden = diagnostic_session(monkeypatch)
+    before = dict(s.reference._prefixes)
+    t = enqueue_diagnostic(s, worker, batches[0], golden)
+    if mutation in ("layer4", "final"):
+        t.snapshots["draft_hidden"][4 if mutation == "layer4" else 5, 31, 6, 0] += 1
+    elif mutation == "confidence":
+        t.snapshots["confidence"][31, 6] += 1
+    else:
+        t.row_mailbox[31, 0 if mutation == "prefix" else 1] = -1
+    with pytest.raises(AssertionError, match=stage):
+        s.poll(wait=True)
+    assert s.failure["stage"] == stage and t in s.inflight and t.snapshots
+    assert s.stats["reference_completed"] == s.stats["completed"] == 0
+    assert all(s.reference._prefixes[key] is old for key, old in before.items())
+    receipt = s.snapshot()
+    assert receipt["diagnostic_failure"]["stage"] == stage
+    assert receipt["retained_ticket_tensor_bytes"] > 0
+    assert receipt["full_checkpoint_native_semantics"] is False
+
+
+def test_observer_chunked_prefill_and_row_reuse_drain_old_generation(monkeypatch):
+    s, worker, batches, golden = diagnostic_session(monkeypatch)
+    batch = batches[0]
+    keys = s.ledger.keys(batch.reqs)
+    batch.prefix_lens = list(s.reference.prefix_lengths(keys))
+    batch.extend_lens = [1 + i % 3 for i in range(32)]
+    features, positions = packed_inputs(s.reference, keys, batch.extend_lens)
+    observer.prefill_context(worker, batch, features, positions)
+    golden.append_packed_context(keys, features, positions, batch.extend_lens)
+    old = enqueue_diagnostic(s, worker, batch, golden)
+    replacement = SimpleNamespace(
+        reqs=[
+            SimpleNamespace(req_pool_idx=row, retraction_count=0) for row in old.rows
+        ],
+        prefix_lens=[0] * 32,
+        extend_lens=[2] * 32,
+        spec_pdmux_slot=0,
+    )
+    observer.prefill_context(
+        worker, replacement, torch.zeros(64, 40).bfloat16(), torch.arange(2).repeat(32)
+    )
+    new_keys = s.ledger.keys(replacement.reqs)
+    assert old.event.waits == 1 and not old.snapshots
+    assert set(keys).isdisjoint(new_keys)
+    assert all(key not in s.reference._prefixes for key in keys)
+    assert s.reference.prefix_lengths(new_keys) == (2,) * 32
+    assert s.stats["reference_prefill_batches"] == 4
+    before = dict(s.reference._prefixes)
+    replacement.prefix_lens[-1] = 1
+    with pytest.raises(AssertionError, match="chunked prefill"):
+        observer.prefill_context(
+            worker,
+            replacement,
+            torch.zeros(64, 40).bfloat16(),
+            torch.arange(2).repeat(32),
+        )
+    assert all(s.reference._prefixes[key] is value for key, value in before.items())

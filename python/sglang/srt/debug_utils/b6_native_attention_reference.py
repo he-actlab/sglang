@@ -259,11 +259,11 @@ class NativeDSparkReference:
             (a for a in self._slots if a is not None and key in a.ticket.keys), None
         )
 
-    def _keys(self, keys):
+    def _keys(self, keys, *, max_rows=32):
         keys = tuple(keys)
         _require(
-            1 <= len(keys) <= 32 and len(set(keys)) == len(keys),
-            "distinct at-most32 request batch required",
+            1 <= len(keys) <= max_rows and len(set(keys)) == len(keys),
+            f"distinct at-most{max_rows} request batch required",
         )
         for key in keys:
             self._validate_key(key)
@@ -330,6 +330,107 @@ class NativeDSparkReference:
     def _projection_weights(attn):
         return attn.qkv_proj.weight.split([attn.q_size, attn.kv_size, attn.kv_size])
 
+    def _record_prefix_read_stream(self, keys):
+        # The caller establishes producer readiness. Independently retain the
+        # allocator lifetime when stock snapshot/replay uses a different current
+        # stream: replacement may release the old prefixes before queued reads
+        # and cats have completed. No new stream or readiness fence is created.
+        if self.device.type == "cuda":
+            stream = torch.cuda.current_stream(self.device)
+            for key in keys:
+                prefix = self._prefixes[key]
+                for tensor in prefix.keys + prefix.values:
+                    tensor.record_stream(stream)
+
+    def _publish_context(self, keys, new_keys, new_values, lengths):
+        # Build every replacement before changing any logical prefix. In
+        # particular, a failed allocation must not publish only some rows.
+        replacements = {}
+        for row, key in enumerate(keys):
+            old = self._prefixes[key]
+            replacements[key] = _Prefix(
+                tuple(
+                    torch.cat([a, b], dim=0) for a, b in zip(old.keys, new_keys[row])
+                ),
+                tuple(
+                    torch.cat([a, b], dim=0)
+                    for a, b in zip(old.values, new_values[row])
+                ),
+                old.length + lengths[row],
+            )
+        self._prefixes.update(replacements)
+
+    @torch.inference_mode()
+    def append_packed_context(self, keys, target_features, positions, lengths):
+        """Append actual-M prefill features without B*max_length padding.
+
+        Only prefill/chunked prefill uses this entry point. Tokenwise separate
+        projections preserve the author ordering; this is not a batch-one
+        attention fallback. Native coalesced prefill may contain up to64 rows,
+        while forward_block remains at most32 per real owner.
+        """
+        _require(
+            not torch.is_autocast_enabled(self.device.type),
+            "native BF16 reference requires autocast disabled",
+        )
+        keys = self._keys(keys, max_rows=64)
+        lengths = tuple(lengths)
+        _require(
+            len(lengths) == len(keys)
+            and all(type(n) is int and n > 0 for n in lengths),
+            "positive host packed lengths required",
+        )
+        total = sum(lengths)
+        _require(
+            target_features.shape == (total, 5 * self.hidden_size)
+            and target_features.dtype == torch.bfloat16
+            and target_features.device == self.device,
+            "native packed BF16 target features required",
+        )
+        _require(
+            positions.shape == (total,)
+            and positions.dtype == torch.int64
+            and positions.device == self.device,
+            "packed absolute context positions required",
+        )
+        _require(
+            not any(self._owner(key) for key in keys),
+            "packed prefill cannot replace an active batch",
+        )
+        self._record_prefix_read_stream(keys)
+        offset = 0
+        for key, length in zip(keys, lengths):
+            start = self._prefixes[key].length
+            _require(
+                torch.equal(
+                    positions[offset : offset + length],
+                    torch.arange(start, start + length, device=self.device),
+                ),
+                "noncontiguous or stale packed positions",
+            )
+            offset += length
+        _require(
+            torch.isfinite(target_features).all(), "nonfinite accepted target features"
+        )
+        context = native_norm(
+            F.linear(target_features, self.model.fc.weight), self.model.hidden_norm
+        )
+        new_keys, new_values = [[] for _ in keys], [[] for _ in keys]
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            _, wk, wv = self._projection_weights(attn)
+            k = F.linear(context, wk).reshape(
+                1, total, self.num_kv_heads, self.head_dim
+            )
+            v = F.linear(context, wv).reshape_as(k)
+            k = self._rotary(native_norm(k, attn.k_norm), positions[None])
+            offset = 0
+            for row, length in enumerate(lengths):
+                new_keys[row].append(k[0, offset : offset + length].clone())
+                new_values[row].append(v[0, offset : offset + length].clone())
+                offset += length
+        self._publish_context(keys, new_keys, new_values, lengths)
+
     @torch.inference_mode()
     def append_context(
         self, keys, target_features, positions, valid_lengths, *, ticket=None
@@ -390,6 +491,7 @@ class NativeDSparkReference:
                 self.prefix_lengths(keys) == ticket.prefix_lengths,
                 "prefix changed during draft/verify ownership",
             )
+        self._record_prefix_read_stream(keys)
         for i, key in enumerate(keys):
             expected = torch.arange(
                 self._prefixes[key].length,
@@ -430,18 +532,7 @@ class NativeDSparkReference:
                 new_values[row].append(v[row, :n].clone())
         # Publish only after every layer succeeds. Context source and serving KV
         # are not retained/aliased, and rejected rows never enter this state.
-        for row, key in enumerate(keys):
-            old = self._prefixes[key]
-            self._prefixes[key] = _Prefix(
-                tuple(
-                    torch.cat([a, b], dim=0) for a, b in zip(old.keys, new_keys[row])
-                ),
-                tuple(
-                    torch.cat([a, b], dim=0)
-                    for a, b in zip(old.values, new_values[row])
-                ),
-                old.length + lengths[row],
-            )
+        self._publish_context(keys, new_keys, new_values, lengths)
         if active is not None:
             active.appended = True
 
@@ -482,7 +573,7 @@ class NativeDSparkReference:
             dropout_p=0.0,
             is_causal=False,
             scale=dim**-0.5,
-            **kwargs
+            **kwargs,
         )
         return output.transpose(1, 2).contiguous().reshape(bsz, width, self.hidden_size)
 
@@ -505,6 +596,7 @@ class NativeDSparkReference:
             and seed_ids.device == self.device,
             "one native int64 seed per row required",
         )
+        self._record_prefix_read_stream(ticket.keys)
         ids = torch.full(
             (bsz, 7), self.mask_token_id, dtype=torch.int64, device=self.device
         )

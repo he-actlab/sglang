@@ -1,5 +1,5 @@
-# Correctness-only B6 two-slot same-input diagnostic, NOT full native semantics.
-# No attention oracle, serving waiver, performance measurement or tensor offload.
+# Correctness-only B6 stock32/two32 independent draft-reference diagnostic.
+# Scoped waits perturb scheduling. No serving waiver, timing claim or offload.
 patches:
   - target: sglang.srt.debug_utils.dumper._Dumper.register_non_intrusive_dumper
     edits:
@@ -51,6 +51,23 @@ patches:
               ),
           )
           return observed_proposal(self, hidden_states, first_prev_token_ids, proposal, confidence_threshold)
+  - target: sglang.srt.models.dspark.Qwen3DSparkModel.forward
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import capture_draft_hidden
+    edits:
+      - match: hidden_states = layer(positions, hidden_states, forward_batch)
+        append: capture_draft_hidden(layer.self_attn.attn.layer_id, hidden_states, forward_batch)
+      - match: hidden_states = self.norm(hidden_states)
+        append: capture_draft_hidden(5, hidden_states, forward_batch)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2.forward_batch_generation
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import prefill_context
+    edits:
+      - match: |
+          self._append_target_hidden_to_draft_kv_by_loc(
+              target_hidden=logits_output.hidden_states,
+              cache_loc=batch.out_cache_loc,
+              positions=positions,
+          )
+        append: prefill_context(self, batch, logits_output.hidden_states, positions)
   - target: sglang.srt.speculative.dspark_worker_v2._DSparkDraftSampler.__call__
     preamble: from sglang.srt.debug_utils.b6_same_input_observer import sampler_rows
     edits:
@@ -64,12 +81,30 @@ patches:
       - match: return SimpleNamespace(
         prepend: own_block(tokens, positions, cache_locs, own_outputs, _b6_originals)
   - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._verify_block
-    preamble: from sglang.srt.debug_utils.b6_same_input_observer import begin_verify, verification
+    preamble: from sglang.srt.debug_utils.b6_same_input_observer import begin_verify, verification, begin_immediate_append, finish_append
     edits:
       - match: "# Include metadata, acceptance, target recovery, publication and owned"
         prepend: begin_verify(batch, block, slot)
       - match: hidden = hidden.view(bs, int(self.block_size), -1)
         append: verification(slot, candidates, target_predict, prefix_lens, commit_lens, bonus, out_tokens, new_seq_lens, hidden, can_run_cuda_graph)
+      - match: |
+          self._append_target_hidden_to_draft_kv_by_loc(
+              target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+              cache_loc=verify_out_cache_loc,
+              cache_loc_2d=verify_out_cache_loc_2d,
+              positions=positions,
+              commit_lens=commit_lens,
+          )
+        prepend: begin_immediate_append(self, hidden.reshape(-1, hidden.shape[-1]), verify_out_cache_loc, verify_out_cache_loc_2d, positions, commit_lens)
+      - match: |
+          self._append_target_hidden_to_draft_kv_by_loc(
+              target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+              cache_loc=verify_out_cache_loc,
+              cache_loc_2d=verify_out_cache_loc_2d,
+              positions=positions,
+              commit_lens=commit_lens,
+          )
+        append: finish_append(0)
   - target: sglang.srt.models.qwen2.Qwen2Model.forward
     preamble: from sglang.srt.debug_utils.b6_same_input_observer import capture_tap
     edits:
