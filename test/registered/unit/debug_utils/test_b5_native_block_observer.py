@@ -258,7 +258,7 @@ def test_pending_payloads_release_only_after_event(session, monkeypatch):
             hidden=torch.randn(32, 8, 4).bfloat16(),
             committed=(torch.arange(32) % 8 + 1).int(),
         )
-        t.checks = [torch.zeros((), dtype=torch.int64)]
+        obs._flag(t, "component.pending_payload", torch.zeros((), dtype=torch.int64))
         t.layers = set(range(6))
         obs.finish_append(slot)
     assert session.snapshot()["pending"] == 2
@@ -268,6 +268,7 @@ def test_pending_payloads_release_only_after_event(session, monkeypatch):
     assert result["completed"] == 2 and result["pending"] == 0
     assert result["slot_max_batch_checked"] == [32, 32]
     assert result["prefix_histogram"] == [8] * 8
+    assert all(not t.check_details for t in session.ledger.current)
     assert result["layers_checked"] == [2] * 6
     assert session.retained() == 0 and len(session.free) == 4
     assert result["full_checkpoint_native_semantics"] is False
@@ -366,7 +367,7 @@ def test_actual_tap_order_epoch_and_native_publication_are_checked(session, corr
         accept_lens=counts.clone(),
         next_token_ids=output.flatten().clone(),
         new_seq_lens=lengths.clone(),
-        next_draft_input=NS(bonus_tokens=bonus.clone()),
+        next_draft_input=NS(bonus_tokens=bonus.clone(), new_seq_lens=lengths.clone()),
     )
     if corrupt == "publication":
         result.next_token_ids[0] += 1
@@ -376,6 +377,366 @@ def test_actual_tap_order_epoch_and_native_publication_are_checked(session, corr
         obs.verification(
             0, candidates, target, prefix, counts, bonus, output, lengths, hidden, False
         )
+
+
+def native_publication_case(
+    session, use_triton, n=32, slot=0, prefix_dtype=torch.int32
+):
+    """Real native allocator/eager acceptance/publication ABI, not Triton math."""
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.speculative.dflash_utils import (
+        compute_dflash_correct_drafts_and_bonus,
+    )
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+    worker.device, worker.block_size = "cpu", 8
+    worker._use_triton_accept_bonus = use_triton
+    worker._accept_bonus_buffer_cap = 0
+    worker._accept_bonus_buffer_slot = slot
+    session.worker = worker
+    t = owner(session, slot, n)
+    session.target.activate(t)
+    session.target.record(torch.zeros(n, 5, dtype=torch.int64))
+    session.tap_epochs.fill_(t.epoch)
+    session.tap_slots.fill_(slot)
+    session.taps[: n * 8].zero_()
+    candidates = torch.arange(n * 8).reshape(n, 8)
+    target = candidates.roll(-1, 1)
+    accepted = torch.arange(n) % 8
+    target[torch.arange(n), accepted] += 10000
+    prefix = torch.arange(n, dtype=prefix_dtype) + 17
+    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+        candidates=candidates, target_predict=target
+    )
+    committed = accept_len.to(torch.int32) + 1
+    output = torch.empty((n, 8), dtype=torch.int64)
+    output[:, :7].copy_(candidates[:, 1:])
+    output[:, 7].zero_()
+    output.scatter_(1, accept_len.long()[:, None], bonus[:, None])
+    new_lens = prefix + committed.to(prefix.dtype)
+    if use_triton:
+        buffers = worker._next_accept_bonus_buffers(n)
+        # Populate actual native CPU buffers with eager integer values. This
+        # tests native storage/publication ABI, not execution of the CUDA kernel.
+        for dest, source in zip(
+            buffers, (accept_len, committed, bonus, output, new_lens)
+        ):
+            dest.copy_(source)
+        _, committed, bonus, output, new_lens = buffers
+    # Native concurrent verify freezes scratch before constructing its result.
+    committed, bonus, output, new_lens = (
+        value.clone() for value in (committed, bonus, output, new_lens)
+    )
+    obs.verification(
+        slot,
+        candidates,
+        target,
+        prefix,
+        committed,
+        bonus,
+        output,
+        new_lens,
+        session.taps[: n * 8].clone(),
+        True,
+    )
+    result = GenerationBatchResult(
+        accept_lens=committed,
+        next_token_ids=output.reshape(-1),
+        new_seq_lens=new_lens,
+        next_draft_input=worker._make_next_draft_input_decode(
+            bonus_tokens=bonus, new_seq_lens=new_lens
+        ),
+    )
+    return t, result, (committed, bonus, output, new_lens)
+
+
+@pytest.mark.parametrize("use_triton", [False, True])
+def test_actual_native_publication_abi(session, use_triton):
+    t, result, raw = native_publication_case(session, use_triton)
+    committed, bonus, output, new_lens = raw
+    pairs = (
+        ("accept_lens", result.accept_lens, committed),
+        ("next_token_ids", result.next_token_ids, output.reshape(-1)),
+        ("new_seq_lens", result.new_seq_lens, new_lens),
+        (
+            "next_draft_input.bonus_tokens",
+            result.next_draft_input.bonus_tokens,
+            bonus.to(torch.int64),
+        ),
+        (
+            "next_draft_input.new_seq_lens",
+            result.next_draft_input.new_seq_lens,
+            new_lens.to(torch.int64),
+        ),
+    )
+    for name, actual, expected in pairs:
+        print(
+            name,
+            tuple(actual.shape),
+            actual.dtype,
+            actual.device,
+            "expected",
+            tuple(expected.shape),
+            expected.dtype,
+            expected.device,
+        )
+        assert not obs.different(actual, expected)
+    assert bonus.dtype == (torch.int32 if use_triton else torch.int64)
+    assert new_lens.dtype == (torch.int64 if use_triton else torch.int32)
+    assert not torch.stack(t.checks).any()
+    obs.result_owned(result, 0)
+    assert not torch.stack(t.checks).any()
+
+
+@pytest.mark.parametrize("use_triton", [False, True])
+@pytest.mark.parametrize("prefix_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("slot,n", [(0, 1), (0, 32), (1, 32)])
+def test_native_publication_modes_slots_and_batch(
+    session, use_triton, prefix_dtype, slot, n
+):
+    t, result, raw = native_publication_case(session, use_triton, n, slot, prefix_dtype)
+    obs.result_owned(result, slot)
+    assert not torch.stack(t.checks).any()
+    assert t.snapshots["bonus"].dtype == raw[1].dtype
+    assert t.snapshots["new_lens"].dtype == raw[3].dtype
+    assert all("label" in detail for detail in t.check_details)
+    assert len(t.check_details) == len(t.checks)
+
+
+RESULT_FIELDS = (
+    "accept_lens",
+    "next_token_ids",
+    "new_seq_lens",
+    "next_draft_input.bonus_tokens",
+    "next_draft_input.new_seq_lens",
+)
+
+
+def result_field(result, field):
+    owner = result
+    parts = field.split(".")
+    for part in parts[:-1]:
+        owner = getattr(owner, part)
+    return owner, parts[-1]
+
+
+def assert_polled_failure(session, t, label):
+    t.event = NS(query=lambda: True)
+    t.error_count = len(t.checks)
+    t.mailbox = torch.stack(t.checks)
+    session.inflight.append(t)
+    with pytest.raises(
+        AssertionError, match="exact block diagnostic mismatch"
+    ) as error:
+        session.poll()
+    assert label in str(error.value)
+    assert "actual" in str(error.value) and "expected" in str(error.value)
+    assert (
+        "shape" in str(error.value)
+        and "dtype" in str(error.value)
+        and "device" in str(error.value)
+    )
+    # Failure retains the original ticket/payload and readback for diagnosis.
+    assert t in session.inflight and t.snapshots and t.check_details
+
+
+@pytest.mark.parametrize("use_triton", [False, True])
+@pytest.mark.parametrize("field", RESULT_FIELDS)
+def test_native_publication_value_corruption_is_named_at_readback(
+    session, use_triton, field
+):
+    t, result, _ = native_publication_case(session, use_triton, n=1)
+    parent, name = result_field(result, field)
+    altered = getattr(parent, name).clone()
+    altered.reshape(-1)[0] += 1
+    setattr(parent, name, altered)
+    obs.result_owned(result, 0)
+    assert_polled_failure(session, t, "result." + field)
+
+
+@pytest.mark.parametrize("field", RESULT_FIELDS)
+@pytest.mark.parametrize("change", ["shape", "dtype", "device"])
+def test_native_publication_metadata_errors_are_named_and_strict(
+    session, field, change
+):
+    _, result, _ = native_publication_case(session, True, n=1)
+    parent, name = result_field(result, field)
+    value = getattr(parent, name)
+    wrong = {
+        "shape": lambda: value.unsqueeze(0),
+        "dtype": lambda: value.to(
+            torch.int64 if value.dtype == torch.int32 else torch.int32
+        ),
+        "device": lambda: torch.empty_like(value, device="meta"),
+    }[change]()
+    setattr(parent, name, wrong)
+    with pytest.raises(ValueError, match="shape/dtype/device changed") as error:
+        obs.result_owned(result, 0)
+    assert "result." + field in str(error.value)
+    for key in ("actual", "expected", "shape", "dtype", "device"):
+        assert key in str(error.value)
+
+
+def test_verification_still_rejects_wrong_buffered_bonus_abi(session):
+    t, _, raw = native_publication_case(session, True, n=1)
+    # The publication conversion must never normalize the raw verification ABI.
+    with pytest.raises(ValueError, match="verification.bonus"):
+        obs._compare(t, "verification.bonus", raw[1].long(), raw[1])
+
+
+def test_manual_check_reset_cannot_mislabel_a_later_failure(session):
+    t = owner(session, 0, 1)
+    obs._flag(t, "first", torch.zeros((), dtype=torch.int64))
+    t.checks.clear()
+    with pytest.raises(AssertionError, match="labels/count changed"):
+        obs._flag(t, "second", torch.zeros((), dtype=torch.int64))
+
+
+def test_named_deferred_and_window_value_failures(session):
+    t = owner(session, 0, 1)
+    original = torch.zeros(8, 4, dtype=torch.bfloat16)
+    t.snapshots["hidden"] = original.clone()
+    held = original.clone()
+    held[0, 0] = 1
+    obs.deferred(0, original, dict(target_hidden=held))
+    assert_polled_failure(session, t, "deferred.target_hidden")
+
+
+@pytest.mark.parametrize("other", [False, True])
+def test_named_native_window_failures_retain_layer_role_and_ownership(session, other):
+    t = owner(session, 0, 1)
+    buffer = torch.zeros(4, 2, 3, dtype=torch.bfloat16)
+    ids, other_ids = torch.tensor([0]), torch.tensor([1])
+    expected, opposite = buffer[ids].clone(), buffer[other_ids].clone()
+    buffer[1 if other else 0, 0, 0] = 1
+    obs.window_after([(buffer, ids, expected, other_ids, opposite)], ticket=t)
+    assert_polled_failure(
+        session,
+        t,
+        "window.layer0.key." + ("other_slot" if other else "committed_and_rejected"),
+    )
+
+
+def test_strided_native_pool_reference_is_rejected_before_any_copy():
+    buffer = torch.zeros(32, 2, 4, dtype=torch.bfloat16)
+    # Selected windows do not overlap these rows, but shared storage is still
+    # rejected conservatively rather than hidden by a contiguous clone.
+    alias = buffer[16:32:2]
+    assert not alias.is_contiguous()
+    pool = NS(_get_key_buffer=lambda i: buffer, _get_value_buffer=lambda i: buffer)
+    with pytest.raises(AssertionError, match="window.layer0.key.*storage alias"):
+        obs.window_before(
+            pool, torch.arange(8).reshape(1, 8), torch.ones(1).int(), [(alias, alias)]
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        obs._projection_disjoint(buffer[::2], torch.empty(8, 2, 4).bfloat16()[::2])
+
+
+@pytest.mark.parametrize("batch", [1, 32])
+@torch.inference_mode()
+def test_actual_native_sequential_materializer_strided_v_is_independent(batch):
+    from sglang.srt.models.dflash import DFlashDraftModel
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    # Actual native methods with tiny synthetic weights, not checkpoint proof.
+    taps = [1, 10, 18, 27, 35, 44, 52, 61]
+    config = NS(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=6,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        max_position_embeddings=512,
+        rope_theta=1000000,
+        num_target_layers=64,
+        target_layer_ids=taps,
+        dflash_config=dict(target_layer_ids=taps),
+    )
+    with (
+        patch(
+            "sglang.srt.server_args._global_server_args",
+            NS(rl_on_policy_target=None, enable_symm_mem=False),
+        ),
+        patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True),
+        patch("sglang.srt.layers.rotary_embedding.factory._ROPE_DICT", {}),
+        patch("sglang.srt.layers.linear.get_tp_group", return_value=NS(world_size=1)),
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
+    ):
+        model = DFlashDraftModel(config).to(torch.bfloat16)
+        for value in model.parameters():
+            value.fill_(0.125)
+        m = batch * 8
+        hidden = torch.ones(m, model.fc.in_features, dtype=torch.bfloat16)
+        positions = torch.arange(m, dtype=torch.int64)
+        worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+        worker._target_worker = NS(model_runner=NS(device=torch.device("cpu")))
+        worker.draft_model = model
+        worker._use_fused_kv_materialize = False
+        worker._fused_kv_helper = None
+        native_values = []
+        worker.draft_model_runner = NS(
+            token_to_kv_pool=NS(
+                set_kv_buffer_prefix_valid=lambda layer, loc, commit, k, v, *scale: native_values.append(
+                    (k, v)
+                )
+            )
+        )
+        locations = torch.arange(1, m + 1).reshape(batch, 8)
+        committed = (torch.arange(batch) % 8 + 1).int()
+        worker._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=hidden,
+            cache_loc=locations.flatten(),
+            positions=positions,
+            cache_loc_2d=locations,
+            commit_lens=committed,
+        )
+        path, projected = obs.materializer_reference(worker, hidden, positions)
+        assert path == "sequential" and len(projected) == len(native_values) == 6
+        for native_pair, reference_pair in zip(native_values, projected):
+            for actual, reference in zip(native_pair, reference_pair):
+                assert not obs.different(actual, reference)
+            assert reference_pair[1].stride() == (8, 4, 1)
+            assert not reference_pair[1].is_contiguous()
+        keys = [torch.full((m + 2, 1, 4), -7, dtype=torch.bfloat16) for _ in range(6)]
+        values = [torch.full_like(k, -9) for k in keys]
+        pool = NS(
+            _get_key_buffer=lambda i: keys[i], _get_value_buffer=lambda i: values[i]
+        )
+        checks, comparisons = obs.window_before(pool, locations, committed, projected)
+        assert not torch.stack(checks).any()
+        # CPU writer sink only: use the actual native method's returned values,
+        # not the observer expectation, for accepted-prefix publication.
+        mask = torch.arange(8)[None, :] < committed[:, None]
+        for i, pair in enumerate(native_values):
+            for buffer, value in zip((keys[i], values[i]), pair):
+                buffer[locations[mask]] = value.reshape(batch, 8, 1, 4)[mask]
+        assert not torch.stack(obs.window_after(comparisons)).any()
+
+
+@pytest.mark.parametrize("wrong", ["device", "native_stride"])
+def test_window_metadata_failures_include_layer_role_and_tensor_details(wrong):
+    buffer = torch.zeros(32, 1, 4, dtype=torch.bfloat16)
+    reference = torch.empty(16, 1, 4, dtype=torch.bfloat16)[::2]
+    if wrong == "device":
+        reference = reference.to("meta")
+    else:
+        buffer = buffer[::2]
+    pool = NS(_get_key_buffer=lambda i: buffer, _get_value_buffer=lambda i: buffer)
+    with pytest.raises((ValueError, AssertionError)) as error:
+        obs.window_before(
+            pool,
+            torch.arange(8).reshape(1, 8),
+            torch.ones(1).int(),
+            [(reference, reference)],
+        )
+    text = str(error.value)
+    assert "window.layer0.key" in text
+    assert "actual" in text and "expected" in text and "device" in text
 
 
 def test_deferred_payload_must_be_owned_and_survive_original_reuse(session):

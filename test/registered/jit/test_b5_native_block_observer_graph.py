@@ -30,6 +30,90 @@ def requests(slot):
 
 
 @CUDA
+@pytest.mark.parametrize("batch", [1, 32])
+@pytest.mark.parametrize("slot", [0, 1])
+@torch.inference_mode()
+def test_native_buffered_acceptance_publication_abi_cuda(batch, slot, monkeypatch):
+    """Actual native kernel/buffers/constructor, not checkpoint or model proof."""
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.speculative.triton_ops.dflash import (
+        _compute_dflash_accept_bonus_triton_unchecked,
+    )
+
+    s = obs.Session("cuda", 2, [32, 64])
+    monkeypatch.setattr(obs, "_session", s)
+    worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+    worker.device, worker.block_size = "cuda", 8
+    worker._use_triton_accept_bonus = True
+    worker._accept_bonus_buffer_cap = 0
+    worker._accept_bonus_buffer_slot = slot
+    s.worker = worker
+    t = s.ledger.begin(slot, requests(slot)[:batch])
+    s.target.activate(t)
+    s.target.record(torch.zeros(batch, 5, dtype=torch.int64, device="cuda"))
+    s.tap_epochs.fill_(t.epoch)
+    s.tap_slots.fill_(slot)
+    s.taps[: batch * 8].zero_()
+    candidates = torch.arange(batch * 8, device="cuda").reshape(batch, 8)
+    target = candidates.roll(-1, 1)
+    accepted = torch.arange(batch, device="cuda") % 8
+    target[torch.arange(batch, device="cuda"), accepted] += 10000
+    prefix = torch.arange(batch, device="cuda", dtype=torch.int32) + 17
+    accept_len, committed, bonus, output, lengths = worker._next_accept_bonus_buffers(
+        batch
+    )
+    _compute_dflash_accept_bonus_triton_unchecked(
+        candidates=candidates,
+        target_top1=target,
+        accept_lens_out=accept_len,
+        commit_lens_out=committed,
+        bonus_ids_out=bonus,
+        out_tokens_out=output,
+        prefix_lens=prefix,
+        new_seq_lens_out=lengths,
+    )
+    # Native co-location freezes acceptance scratch before publishing the result.
+    committed, bonus, output, lengths = (
+        value.clone() for value in (committed, bonus, output, lengths)
+    )
+    obs.verification(
+        slot,
+        candidates,
+        target,
+        prefix,
+        committed,
+        bonus,
+        output,
+        lengths,
+        s.taps[: batch * 8].clone(),
+        True,
+    )
+    result = GenerationBatchResult(
+        accept_lens=committed,
+        next_token_ids=output.reshape(-1),
+        new_seq_lens=lengths,
+        next_draft_input=worker._make_next_draft_input_decode(
+            bonus_tokens=bonus, new_seq_lens=lengths
+        ),
+    )
+    assert bonus.dtype == torch.int32
+    assert result.next_draft_input.bonus_tokens.dtype == torch.int64
+    obs.result_owned(result, slot)
+    assert not torch.stack(t.checks).any().item()
+    assert torch.equal(committed, (accepted + 1).int())
+    assert torch.equal(lengths, prefix.long() + committed)
+    # A changed published value must still fail exact comparison, not be cast away.
+    result.next_draft_input.bonus_tokens[0].add_(1)
+    obs.result_owned(result, slot)
+    failures = [
+        detail["label"]
+        for detail, flag in zip(t.check_details, torch.stack(t.checks).tolist())
+        if flag
+    ]
+    assert failures == ["result.next_draft_input.bonus_tokens"]
+
+
+@CUDA
 @torch.inference_mode()
 def test_b5_singleton_seed_byte_comparison_cuda_graph_replay():
     """Actual warmup layout; diagnostic helper only, not full-model proof."""
@@ -38,7 +122,9 @@ def test_b5_singleton_seed_byte_comparison_cuda_graph_replay():
     mismatch = torch.empty((), device="cuda", dtype=torch.bool)
     column = tokens[:, 0]
     assert column.shape == (1,) and column.stride() == (8,)
-    assert column.is_contiguous() and column.contiguous().data_ptr() == column.data_ptr()
+    assert (
+        column.is_contiguous() and column.contiguous().data_ptr() == column.data_ptr()
+    )
     pointers = [value.data_ptr() for value in (tokens, seed, mismatch)]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

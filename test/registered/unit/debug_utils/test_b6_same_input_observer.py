@@ -476,6 +476,8 @@ def test_real_native_acceptance_buffer_abi_and_eager_fallback(
             for use_triton, actual in ((True, fast), (False, eager)):
                 worker._use_triton_accept_bonus = use_triton
                 ticket.checks.clear()
+                if hasattr(ticket, "check_details"):
+                    ticket.check_details.clear()
                 print(
                     observer.__name__,
                     slot,
@@ -500,6 +502,8 @@ def test_real_native_acceptance_buffer_abi_and_eager_fallback(
                         corrupted = [x.clone() for x in actual]
                         corrupted[field].reshape(-1)[0] += 1
                         ticket.checks.clear()
+                        if hasattr(ticket, "check_details"):
+                            ticket.check_details.clear()
                         observer.verification(
                             slot,
                             candidates,

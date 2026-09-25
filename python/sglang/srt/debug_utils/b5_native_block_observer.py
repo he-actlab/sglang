@@ -25,6 +25,41 @@ APPEND_BUDGET = 128 * 1024**2
 _session = None
 
 
+def _metadata(value):
+    return dict(
+        shape=tuple(value.shape), dtype=str(value.dtype), device=str(value.device)
+    )
+
+
+def _difference(label, actual, expected):
+    try:
+        return different(actual, expected)
+    except ValueError as error:
+        raise ValueError(
+            f"B5 {label}: {error}; actual={_metadata(actual)}, "
+            f"expected={_metadata(expected)}"
+        ) from error
+
+
+def _flag(t, label, flag, actual=None, expected=None):
+    # CPU metadata only: never read a device flag before its existing event.
+    if not hasattr(t, "check_details"):
+        t.check_details = [
+            dict(label=f"component.check[{i}]") for i in range(len(t.checks))
+        ]
+    if len(t.check_details) != len(t.checks):
+        raise AssertionError("B5 diagnostic check labels/count changed")
+    detail = dict(label=label)
+    if actual is not None:
+        detail.update(actual=_metadata(actual), expected=_metadata(expected))
+    t.check_details.append(detail)
+    t.checks.append(flag.long())
+
+
+def _compare(t, label, actual, expected):
+    _flag(t, label, _difference(label, actual, expected), actual, expected)
+
+
 def storage_bytes(tensors):
     stores = {}
     for t in tensors:
@@ -110,10 +145,23 @@ class Session:
             if not t.event.query():
                 continue
             values = t.mailbox.tolist()
+            if hasattr(t, "check_details") and len(t.check_details) != t.error_count:
+                raise AssertionError("B5 diagnostic check labels/count changed")
             if any(values[: t.error_count]):
                 self.stats["failure_count"] += 1
+                details = getattr(t, "check_details", [])
+                failed = [
+                    (
+                        details[i]
+                        if i < len(details)
+                        else dict(label=f"component.check[{i}]")
+                    )
+                    for i, value in enumerate(values[: t.error_count])
+                    if value
+                ]
                 raise AssertionError(
-                    "B5 exact block diagnostic mismatch: " + repr(values)
+                    "B5 exact block diagnostic mismatch: "
+                    + repr(dict(failed_checks=failed, values=values))
                 )
             self.stats["completed"] += 1
             self.stats["slot_completed"][t.slot] += 1
@@ -130,6 +178,8 @@ class Session:
             # Preserve only ownership metadata, never a completed GPU payload.
             t.snapshots.clear()
             t.checks.clear()
+            if hasattr(t, "check_details"):
+                t.check_details.clear()
             del t.mailbox, t.values
             del t.native_locations
 
@@ -153,7 +203,7 @@ class Session:
             retained_ticket_tensor_bytes=self.retained(),
             pinned_mailbox_bytes=4 * 128 * 8,
             **self.plan,
-            **self.stats
+            **self.stats,
         )
 
 
@@ -329,22 +379,25 @@ def own_block(tokens, positions, locations, own_outputs, originals):
         raise AssertionError("deferred block aliases reusable graph scratch")
     n = len(t.rows)
     expected_positions = s.prefix[:n, None] + torch.arange(8, device=s.device)
-    t.checks += [
-        different(tokens[:, 0], s.seed[:n]).long(),
-        different(tokens[:, 1:], s.checked_tokens[t.slot, :n]).long(),
-        different(positions.reshape(n, 8), expected_positions).long(),
-        different(locations, s.locations[:n]).long(),
-    ]
+    for name, actual, expected in (
+        ("seed", tokens[:, 0], s.seed[:n]),
+        ("proposals", tokens[:, 1:], s.checked_tokens[t.slot, :n]),
+        ("positions", positions.reshape(n, 8), expected_positions),
+        ("locations", locations, s.locations[:n]),
+    ):
+        _compare(t, "own_block." + name, actual, expected)
     t.snapshots.update(
         tokens=tokens.clone(), positions=positions.clone(), locations=locations.clone()
     )
-    for w in (s.inputs, s.head):
+    for name, w in (("inputs", s.inputs), ("head", s.head)):
         n = len(t.rows)
-        t.checks += [
-            w.flags[t.slot, :n].any().long().clone(),
-            (w.stamps[t.slot, :n, 0] != t.epoch).any().long(),
-            (w.stamps[t.slot, :n, 1] != w.generations[:n]).any().long(),
-        ]
+        _flag(t, f"own_block.{name}.graph_flags", w.flags[t.slot, :n].any().clone())
+        _flag(t, f"own_block.{name}.epoch", (w.stamps[t.slot, :n, 0] != t.epoch).any())
+        _flag(
+            t,
+            f"own_block.{name}.generation",
+            (w.stamps[t.slot, :n, 1] != w.generations[:n]).any(),
+        )
 
 
 def ticket(slot):
@@ -370,7 +423,7 @@ def begin_verify(batch, block, slot):
         ("positions", block.positions),
         ("locations", block.cache_locs),
     ):
-        t.checks.append(different(actual, t.snapshots[name]).long())
+        _compare(t, "begin_verify." + name, actual, t.snapshots[name])
     _session.target.activate(t)
 
 
@@ -402,23 +455,28 @@ def verification(
         prefix,
         use_triton=s.worker._use_triton_accept_bonus,
     )
-    t.checks += [
-        different(a, b).long()
-        for a, b in zip((committed, bonus, output, new_lens), expected)
-    ]
-    t.checks += [
-        different(
-            hidden.reshape(-1, FEATURES), s.taps[: hidden.numel() // FEATURES]
-        ).long(),
-        (s.tap_epochs != t.epoch).any().long(),
-        (s.tap_slots != t.slot).any().long(),
-    ]
+    for name, actual, reference in zip(
+        ("committed", "bonus", "output", "new_lens"),
+        (committed, bonus, output, new_lens),
+        expected,
+    ):
+        _compare(t, "verification." + name, actual, reference)
+    _compare(
+        t,
+        "verification.target_features",
+        hidden.reshape(-1, FEATURES),
+        s.taps[: hidden.numel() // FEATURES],
+    )
+    _flag(t, "verification.tap_epoch", (s.tap_epochs != t.epoch).any())
+    _flag(t, "verification.tap_slot", (s.tap_slots != t.slot).any())
     n, w = len(t.rows), s.target
-    t.checks += [
-        w.flags[t.slot, :n].any().long(),
-        (w.stamps[t.slot, :n, 0] != t.epoch).any().long(),
-        (w.stamps[t.slot, :n, 1] != w.generations[:n]).any().long(),
-    ]
+    _flag(t, "verification.target.graph_flags", w.flags[t.slot, :n].any())
+    _flag(t, "verification.target.epoch", (w.stamps[t.slot, :n, 0] != t.epoch).any())
+    _flag(
+        t,
+        "verification.target.generation",
+        (w.stamps[t.slot, :n, 1] != w.generations[:n]).any(),
+    )
     t.snapshots.update(
         hidden=hidden.clone(),
         committed=committed.clone(),
@@ -430,15 +488,24 @@ def verification(
 
 def result_owned(result, slot):
     t = ticket(slot)
-    for value, name in (
-        (result.accept_lens, "committed"),
-        (result.next_token_ids, "output"),
-        (result.new_seq_lens, "new_lens"),
-        (result.next_draft_input.bonus_tokens, "bonus"),
+    # _make_next_draft_input_decode explicitly publishes int64 bonus/lengths.
+    # Raw verification above still requires the native buffered/eager ABI.
+    for name, value, expected in (
+        ("accept_lens", result.accept_lens, t.snapshots["committed"]),
+        ("next_token_ids", result.next_token_ids, t.snapshots["output"].reshape(-1)),
+        ("new_seq_lens", result.new_seq_lens, t.snapshots["new_lens"]),
+        (
+            "next_draft_input.bonus_tokens",
+            result.next_draft_input.bonus_tokens,
+            t.snapshots["bonus"].to(torch.int64),
+        ),
+        (
+            "next_draft_input.new_seq_lens",
+            result.next_draft_input.new_seq_lens,
+            t.snapshots["new_lens"].to(torch.int64),
+        ),
     ):
-        t.checks.append(
-            different(value.reshape_as(t.snapshots[name]), t.snapshots[name]).long()
-        )
+        _compare(t, "result." + name, value, expected)
 
 
 def deferred(slot, original, materialize):
@@ -446,8 +513,11 @@ def deferred(slot, original, materialize):
     held = materialize["target_hidden"]
     if not disjoint(held, original):
         raise AssertionError("deferred feature payload aliases target graph output")
-    t.checks.append(
-        different(held.reshape_as(t.snapshots["hidden"]), t.snapshots["hidden"]).long()
+    _compare(
+        t,
+        "deferred.target_hidden",
+        held.reshape_as(t.snapshots["hidden"]),
+        t.snapshots["hidden"],
     )
 
 
@@ -502,6 +572,22 @@ def materializer_reference(worker, hidden, positions):
     return "sequential", values
 
 
+def _projection_disjoint(buffer, reference):
+    if reference.is_contiguous():
+        return disjoint(buffer, reference)
+    if not buffer.is_contiguous():
+        raise ValueError("native KV buffer requires a contiguous span")
+    if buffer.device != reference.device:
+        return True
+    # Native sequential kv_proj_only returns a strided split view. Prove
+    # separate whole storages before comparing it; never copy away an alias.
+    a, b = buffer.untyped_storage(), reference.untyped_storage()
+    return (
+        a.data_ptr() + a.nbytes() <= b.data_ptr()
+        or b.data_ptr() + b.nbytes() <= a.data_ptr()
+    )
+
+
 def window_before(pool, locations, committed, projected, other_locations=None):
     """Read-only native windows and independent prefix selection; never a writer."""
     ids = locations.flatten()
@@ -512,13 +598,26 @@ def window_before(pool, locations, committed, projected, other_locations=None):
         checks.append((ids[:, None] == other_ids[None, :]).any().long())
     for i, values in enumerate(projected):
         buffers = (pool._get_key_buffer(i), pool._get_value_buffer(i))
-        for b, value in zip(buffers, values):
+        for role, b, value in zip(("key", "value"), buffers, values):
+            label = f"window.layer{i}.{role}"
+            context = f"actual={_metadata(b)}, expected={_metadata(value)}"
             if (
                 b.dtype != torch.bfloat16
                 or value.dtype != b.dtype
-                or not disjoint(b, value)
+                or value.device != b.device
             ):
-                raise AssertionError("native/reference KV precision or storage alias")
+                raise AssertionError(
+                    f"{label}: native/reference KV precision/device changed; {context}"
+                )
+            try:
+                separate = _projection_disjoint(b, value)
+            except ValueError as error:
+                raise ValueError(f"{label}: {error}; {context}") from error
+            if not separate:
+                raise AssertionError(
+                    f"{label}: native/reference KV precision or storage alias; "
+                    + context
+                )
             before = b[ids].reshape(*locations.shape, *b.shape[1:])
             expected = prefix_expected(before, value.reshape_as(before), committed)
             other = None if other_ids is None else b[other_ids].clone()
@@ -526,12 +625,23 @@ def window_before(pool, locations, committed, projected, other_locations=None):
     return checks, comparisons
 
 
-def window_after(comparisons):
+def window_after(comparisons, ticket=None):
     checks = []
-    for b, ids, expected, other_ids, other in comparisons:
-        checks.append(different(b[ids].reshape_as(expected), expected).long())
+    for i, (b, ids, expected, other_ids, other) in enumerate(comparisons):
+        label = f"window.layer{i // 2}.{'key' if i % 2 == 0 else 'value'}"
+        actual = b[ids].reshape_as(expected)
+        checks.append(
+            _difference(label + ".committed_and_rejected", actual, expected).long()
+        )
+        if ticket is not None:
+            _flag(
+                ticket, label + ".committed_and_rejected", checks[-1], actual, expected
+            )
         if other_ids is not None:
-            checks.append(different(b[other_ids], other).long())
+            actual = b[other_ids]
+            checks.append(_difference(label + ".other_slot", actual, other).long())
+            if ticket is not None:
+                _flag(ticket, label + ".other_slot", checks[-1], actual, other)
     return checks
 
 
@@ -562,8 +672,11 @@ def observed_append(worker, native_call, **materialize):
             "positions": "positions",
             "commit_lens": "committed",
         }[key]
-        t.checks.append(
-            different(value.reshape_as(t.snapshots[name]), t.snapshots[name]).long()
+        _compare(
+            t,
+            "observed_append." + key,
+            value.reshape_as(t.snapshots[name]),
+            t.snapshots[name],
         )
     _require_budget(torch.cuda.mem_get_info()[0], APPEND_BUDGET)
     path, reference = materializer_reference(
@@ -582,7 +695,10 @@ def observed_append(worker, native_call, **materialize):
         reference,
         other_locations,
     )
-    t.checks += checks
+    for label, flag in zip(
+        ("window.duplicate_locations", "window.other_slot_location_overlap"), checks
+    ):
+        _flag(t, label, flag)
     native_call(**materialize)
     selected = (
         "fused"
@@ -593,7 +709,7 @@ def observed_append(worker, native_call, **materialize):
         raise AssertionError(
             "native materialization fell back during diagnostic comparison"
         )
-    t.checks += window_after(comparisons)
+    window_after(comparisons, ticket=t)
     t.layers = set(range(len(reference)))
     if path not in s.stats["materializer_paths"]:
         s.stats["materializer_paths"].append(path)
