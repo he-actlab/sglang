@@ -701,11 +701,14 @@ def test_qkv_context_capture_and_restoration_on_real_cuda_handle(
     )
 
     def projection():
-        with pdmux.cublas_sm_count_target(width):
-            obs.capture_first_layer_stage(attn, "input_norm", source)
-            native_output.copy_(torch.nn.functional.linear(source, weight))
+        obs.capture_first_layer_stage(attn, "input_norm", source)
+        native_output.copy_(torch.nn.functional.linear(source, weight))
 
-    graph = _capture_on(small, projection)
+    # Native capture sets the hint before entering CUDA graph capture. Only the
+    # observer's getter executes within the captured Python callback.
+    small.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(small), pdmux.cublas_sm_count_target(width):
+        graph = _capture_on(small, projection)
     captured = trace.qkv_capture_context[graph_rows]
     assert captured["context"]["is_capturing"]
     assert captured["context"]["sm_target"] == width
