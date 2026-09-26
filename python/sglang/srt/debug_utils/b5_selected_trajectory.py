@@ -110,10 +110,24 @@ def validate_config(config):
         )
         rid = f'{prefix}-{row["phase"]}-{row["idx"]:04d}-{row["prompt_sha"]}'
         result[rid] = dict(row, rid=rid)
+    warmup = config["server_warmup"]
+    unpadded, offsets = warmup["unpadded_input_ids"], warmup["image_offsets"]
     require(
-        config["server_warmup_input_ids"]
-        and all(type(x) is int and x >= 0 for x in config["server_warmup_input_ids"]),
-        "server warmup identity",
+        set(warmup) == {"max_new_tokens", "unpadded_input_ids", "image_offsets"}
+        and warmup["max_new_tokens"] == 8
+        and unpadded
+        and all(type(x) is int and x >= 0 for x in unpadded),
+        "server warmup unpadded identity",
+    )
+    require(
+        offsets
+        and all(
+            isinstance(o, list) and len(o) == 2 and all(type(x) is int for x in o)
+            for o in offsets
+        )
+        and all(0 <= s <= e < len(unpadded) for s, e in offsets)
+        and all(a[1] < b[0] for a, b in zip(offsets, offsets[1:])),
+        "server warmup image offsets",
     )
     return result
 
@@ -336,23 +350,62 @@ class Session:
         self.owners, self.seen, self.coverage, self.terminals = {}, set(), {}, {}
         self.seed_checked = set()
         self.counts = dict(prefill=0, verify=0, first_seed=0, discarded=0)
+        self.startup = None
+
+    def _startup(self, req):
+        """Exact unpadded warmup text plus the actual image offset/pad linkage.
+
+        Native pads hash GPU-preprocessed image features, so the pad value is
+        bound from the request's own item, never predicted. One request
+        generation only, before any benchmark request.
+        """
+        if self.startup is not None:
+            require(self.startup[0] is req, "repeated startup warmup request")
+            require(
+                list(req.origin_input_ids) == self.startup[1],
+                "startup warmup input changed",
+            )
+            return
+        from sglang.srt.managers.schedule_batch import _compute_pad_value
+
+        warmup = self.config["server_warmup"]
+        require(not self.seen, "startup warmup after benchmark traffic")
+        require(
+            req.sampling_params.max_new_tokens == warmup["max_new_tokens"],
+            "startup warmup cap",
+        )
+        require(
+            list(req.origin_input_ids_unpadded) == warmup["unpadded_input_ids"],
+            "startup warmup unpadded text",
+        )
+        mm = req.multimodal_inputs
+        items = [] if mm is None else list(mm.mm_items)
+        require(len(items) == 1 and items[0].is_image(), "startup single image")
+        item = items[0]
+        offsets = [list(o) for o in (item.offsets or ())]
+        require(offsets == warmup["image_offsets"], "startup warmup image offsets")
+        require(
+            isinstance(item.hash, int)
+            and not isinstance(item.hash, bool)
+            and item.pad_value == _compute_pad_value(item.hash),
+            "startup warmup hash-to-pad linkage",
+        )
+        padded = list(warmup["unpadded_input_ids"])
+        for start, end in offsets:
+            padded[start : end + 1] = [item.pad_value] * (end - start + 1)
+        require(list(req.origin_input_ids) == padded, "startup warmup padded input")
+        self.startup = (req, padded, item.pad_value)
 
     def row(self, req):
         row = self.rows.get(req.rid)
         p = req.sampling_params
         if row is None:
-            require(
-                (
-                    list(req.origin_input_ids) == self.config["server_warmup_input_ids"]
-                    and p.max_new_tokens == 8
-                )
-                or (
-                    req.rid.startswith("HEALTH_CHECK")
-                    and list(req.origin_input_ids) == [0]
-                    and p.max_new_tokens == 1
-                ),
-                "unregistered request",
-            )
+            if not (
+                req.rid.startswith("HEALTH_CHECK")
+                and list(req.origin_input_ids) == [0]
+                and p.max_new_tokens == 1
+            ):
+                self._startup(req)
             return None
         require(
             list(req.origin_input_ids) == row["input_ids"],
@@ -812,6 +865,11 @@ class Session:
             window=WINDOW,
             counts=dict(self.counts),
             seen_requests=len(self.seen),
+            startup_warmup=dict(
+                bound=self.startup is not None,
+                image_offsets=self.config["server_warmup"]["image_offsets"],
+                pad_value=None if self.startup is None else self.startup[2],
+            ),
             failures=self.failures,
             pending=len(self.pending),
             retained_tensor_bytes=self.retained_bytes,

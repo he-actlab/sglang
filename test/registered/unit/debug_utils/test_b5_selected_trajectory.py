@@ -47,7 +47,11 @@ def catalog(tmp_path):
         rid_prefix="b5-selected-test",
         output_directory=str(tmp_path / "captures"),
         requests=rows,
-        server_warmup_input_ids=[99, 98],
+        server_warmup=dict(
+            max_new_tokens=8,
+            unpadded_input_ids=[99, 98, 7, 7, 7, 97],
+            image_offsets=[[2, 4]],
+        ),
         workload=dict(
             dataset="gsm8k",
             requests=192,
@@ -255,10 +259,30 @@ def session(tmp_path):
         "purpose",
         "window",
         "workload",
+        "warmup_cap",
+        "warmup_key",
+        "warmup_offset_range",
+        "warmup_offset_overlap",
+        "warmup_offset_empty",
     ],
 )
 def test_catalog_fail_closed(tmp_path, case):
     c = catalog(tmp_path)
+    w = c["server_warmup"]
+    if case.startswith("warmup_"):
+        if case == "warmup_cap":
+            w["max_new_tokens"] = 32
+        elif case == "warmup_key":
+            c["server_warmup_input_ids"] = w.pop("unpadded_input_ids")
+        elif case == "warmup_offset_range":
+            w["image_offsets"] = [[2, 6]]
+        elif case == "warmup_offset_overlap":
+            w["image_offsets"] = [[2, 3], [3, 4]]
+        else:
+            w["image_offsets"] = []
+        with pytest.raises((RuntimeError, KeyError)):
+            obs.validate_config(c)
+        return
     if case == "missing":
         c["requests"].pop()
     elif case == "order":
@@ -299,6 +323,87 @@ def test_request_identity_and_native_settings(session, case):
         r.retraction_count = 1
     else:
         r.sampling_params.temperature = 0.5
+    with pytest.raises(RuntimeError):
+        session.row(r)
+
+
+def startup_req(session, image_hash=123456789):
+    from sglang.srt.managers.schedule_batch import _compute_pad_value
+
+    w = session.config["server_warmup"]
+    pad = _compute_pad_value(image_hash)
+    padded = list(w["unpadded_input_ids"])
+    for start, end in w["image_offsets"]:
+        padded[start : end + 1] = [pad] * (end - start + 1)
+    item = NS(
+        offsets=[tuple(o) for o in w["image_offsets"]],
+        hash=image_hash,
+        pad_value=pad,
+        is_image=lambda: True,
+    )
+    return NS(
+        rid="native-warmup-uuid",
+        origin_input_ids=padded,
+        origin_input_ids_unpadded=list(w["unpadded_input_ids"]),
+        multimodal_inputs=NS(mm_items=[item]),
+        sampling_params=NS(max_new_tokens=8),
+    )
+
+
+def test_startup_warmup_binds_actual_pad_once_before_benchmark(session):
+    r = startup_req(session)
+    assert session.row(r) is None
+    r.multimodal_inputs = None  # Native clears features after completion.
+    assert session.row(r) is None
+    receipt = session.snapshot()["startup_warmup"]
+    assert receipt == dict(
+        bound=True, image_offsets=[[2, 4]], pad_value=r.origin_input_ids[2]
+    )
+    assert session.snapshot()["seen_requests"] == 0
+    session.row(requests(session)[0])
+    health = NS(
+        rid="HEALTH_CHECK_1",
+        origin_input_ids=[0],
+        sampling_params=NS(max_new_tokens=1),
+    )
+    assert session.row(health) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["text", "offset", "pad", "hash", "cap", "image_count", "nonstartup", "repeat"],
+)
+def test_startup_warmup_fail_closed(session, case):
+    r = startup_req(session)
+    item = r.multimodal_inputs.mm_items[0]
+    if case == "text":
+        r.origin_input_ids_unpadded[0] += 1
+    elif case == "offset":
+        item.offsets = [(1, 3)]
+    elif case == "pad":
+        r.origin_input_ids[3] += 1
+    elif case == "hash":
+        item.hash += 1
+    elif case == "cap":
+        r.sampling_params.max_new_tokens = 32
+    elif case == "image_count":
+        r.multimodal_inputs.mm_items.append(item)
+    elif case == "nonstartup":
+        session.row(requests(session)[0])
+    else:
+        session.row(r)
+        r = startup_req(session)
+    with pytest.raises(RuntimeError):
+        session.row(r)
+    if case != "repeat":
+        assert session.snapshot()["startup_warmup"]["bound"] is False
+
+
+def test_startup_warmup_input_cannot_change_after_binding(session):
+    r = startup_req(session)
+    session.row(r)
+    r.origin_input_ids = list(r.origin_input_ids)
+    r.origin_input_ids[-1] += 1
     with pytest.raises(RuntimeError):
         session.row(r)
 
