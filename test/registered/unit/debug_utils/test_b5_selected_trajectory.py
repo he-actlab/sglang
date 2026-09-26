@@ -3,6 +3,7 @@
 import copy
 import inspect
 import json
+from array import array
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -73,7 +74,8 @@ class Req:
         self.req_pool_idx, self.mamba_pool_idx = physical, torch.tensor(
             physical, dtype=torch.int32
         )
-        self.output_ids, self.done = [], False
+        # Native Req.output_ids is array("q") (schedule_batch.py:725).
+        self.output_ids, self.done = array("q"), False
         self.is_retracted, self.retraction_count = False, 0
         self.grammar, self.return_logprob = None, False
         self.sampling_params = NS(

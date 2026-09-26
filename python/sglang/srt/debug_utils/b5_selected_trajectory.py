@@ -805,7 +805,7 @@ class Session:
         previous = self.coverage.setdefault(req.rid, set())
         if (
             not start < end
-            or visible != req.output_ids[: len(visible)]
+            or visible != list(req.output_ids[: len(visible)])
             or previous & positions
             or previous != set(range(start))
         ):
@@ -824,7 +824,7 @@ class Session:
             native_appended_tokens=list(tokens),
             published_tokens=visible[start:end],
             accepted_prefix=list(req.output_ids[:start]),
-            accepted_prefix_sha256=digest(req.output_ids[:start]),
+            accepted_prefix_sha256=digest(list(req.output_ids[:start])),
             top_two_margins=margins,
             prefill_prefix_is_unobserved=(
                 kind == "prefill" and cap.metadata["prefixes"][i] != 0
