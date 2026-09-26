@@ -1,0 +1,95 @@
+# Opt-in selector-only diagnostic, never a clean/performance control.
+# Requires source-bound catalog+SHA. Same no-manager guard as B5/B6.
+patches:
+  - target: sglang.srt.debug_utils.dumper._Dumper.register_non_intrusive_dumper
+    edits:
+      - match: "self._http_manager  # noqa: B018"
+        prepend: |
+          if (self._config.enable is not False
+                  or self._config.non_intrusive_mode != "off"
+                  or self._config.server_port_parsed != "reuse"):
+              raise ValueError("B5 source-patcher-only dumper settings required")
+          if self.__dict__.get("_http_manager") is not None:
+              raise RuntimeError("B5 fixture cannot retire an active dumper manager")
+          self.__dict__["_http_manager"] = None
+          return None
+  - target: sglang.srt.debug_utils.dumper._Dumper.apply_source_patches
+    edits:
+      - match: config_path = self._config.source_patcher_config
+        replacement: return
+  - target: sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs
+    preamble: from sglang.srt.debug_utils.b5_selected_trajectory import initialize as initialize_selected
+    edits:
+      - match: self.eager_runner = EagerRunner(self)
+        prepend: initialize_selected(self)
+  - target: sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation
+    preamble: from sglang.srt.debug_utils.b5_selected_trajectory import capture_prefill
+    edits:
+      - match: |
+          if not forward_batch.is_prefill_only:
+              # For normal requests, sample the next token ids.
+              batch_result.next_token_ids = self.model_runner.sample(
+                  logits_output, forward_batch
+              )
+        replacement: |
+          if not forward_batch.is_prefill_only:
+              # For normal requests, sample the next token ids.
+              batch_result.next_token_ids = self.model_runner.sample(
+                  logits_output, forward_batch
+              )
+              capture_prefill(self, batch, forward_batch, batch_result, is_verify)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2.forward_batch_generation
+    preamble: from sglang.srt.debug_utils.b5_selected_trajectory import prefill_relay
+    edits:
+      - match: |
+          batch_output.next_draft_input = self._make_next_draft_input_prefill(
+              bonus_tokens=next_token_ids,
+              seq_lens=batch.seq_lens,
+          )
+        append: prefill_relay(batch, batch_output)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._draft_block
+    preamble: from sglang.srt.debug_utils.b5_selected_trajectory import first_seed
+    edits:
+      - match: bs = len(batch.seq_lens)
+        prepend: first_seed(batch, draft_input)
+  - target: sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._verify_block
+    preamble: from sglang.srt.debug_utils.b5_selected_trajectory import capture_verify
+    edits:
+      - match: |
+          if slot is not None:
+              self._defer_draft_materialization(
+        prepend: capture_verify(self, batch, verify_forward_batch, result, candidates, target_predict, prefix_lens, bonus, slot)
+  - target: sglang.srt.managers.scheduler_components.batch_result_processor.SchedulerBatchResultProcessor.process_batch_result_prefill
+    preamble: from sglang.srt.debug_utils.b5_selected_trajectory import publish, discard
+    edits:
+      - match: |
+          req.update_finish_state()
+          if req.finished():
+        replacement: |
+          req.update_finish_state()
+          publish(req, [next_token_id], result, "prefill")
+          if req.finished():
+      - match: |
+          # drain its accounting without streaming it.
+          continue
+        replacement: |
+          # drain its accounting without streaming it.
+          discard(req, result, "prefill")
+          continue
+  - target: sglang.srt.managers.scheduler_components.batch_result_processor.SchedulerBatchResultProcessor.process_batch_result_decode
+    preamble: from sglang.srt.debug_utils.b5_selected_trajectory import publish, discard
+    edits:
+      - match: req.update_finish_state(new_accept_len)
+        append: publish(req, next_token_id, result, "verify")
+      - match: |
+          # And all the over-allocated tokens will be freed in `release_kv_cache`.
+          continue
+        replacement: |
+          # And all the over-allocated tokens will be freed in `release_kv_cache`.
+          discard(req, result, "verify")
+          continue
+  - target: sglang.srt.managers.scheduler.Scheduler.get_internal_state
+    preamble: from sglang.srt.debug_utils.b5_selected_trajectory import snapshot as selected_snapshot
+    edits:
+      - match: ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        append: ret["b5_selected_trajectory"] = selected_snapshot()
