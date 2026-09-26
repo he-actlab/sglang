@@ -113,9 +113,9 @@ def sampling():
     )
 
 
-def worker(n=32):
+def worker(n=32, plan_info=None):
     wrapper = NS(
-        _plan_info=[1, 2, 3, 16, False],
+        _plan_info=[1, 2, 3, 16, False] if plan_info is None else plan_info,
         _backend="fa2",
         is_cuda_graph_enabled=True,
         _qo_indptr_buf=torch.arange(65, dtype=torch.int32) * 8,
@@ -142,7 +142,7 @@ def worker(n=32):
     )
 
 
-def prefill(s, reqs, *, capture=True):
+def prefill(s, reqs, *, capture=True, plan_info=None):
     n = len(reqs)
     lens = [len(r.origin_input_ids) for r in reqs]
     b = NS(
@@ -177,7 +177,7 @@ def prefill(s, reqs, *, capture=True):
         ),
     )
     if capture:
-        s.capture_prefill(worker(n), b, f, result)
+        s.capture_prefill(worker(n, plan_info), b, f, result)
         s.prefill_relay(b, result)
     return b, f, result
 
@@ -188,7 +188,7 @@ def publish_prefill(s, reqs, result):
         s.publish(r, r.output_ids[-1:], result, "prefill")
 
 
-def verify(s, reqs, slot=0, accepted=7):
+def verify(s, reqs, slot=0, accepted=7, plan_info=None):
     n = len(reqs)
     lens = torch.tensor([len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs])
     b = NS(
@@ -229,7 +229,15 @@ def verify(s, reqs, slot=0, accepted=7):
         extra_keep_alive_refs=None,
     )
     s.capture_verify(
-        NS(target_worker=worker(n)), b, f, result, candidates, target, lens, bonus, slot
+        NS(target_worker=worker(n, plan_info)),
+        b,
+        f,
+        result,
+        candidates,
+        target,
+        lens,
+        bonus,
+        slot,
     )
     return b, f, result
 
@@ -587,6 +595,41 @@ def test_plan_identity_is_copied_not_recomputed(session):
     assert cap.metadata["plans"][0]["plan_info"] == [1, 2, 3, 16, False]
     assert "_qo_indptr_buf" in cap.metadata["plans"][0]["observed_layout_fields"]
     assert "plan_0_qo_indptr_buf" in cap.tensors
+
+
+def test_flashinfer_tvm_ffi_plan_info_is_copied_for_prefill_and_verify(session):
+    # The native FlashInfer 0.6.12 plan type; selected r1 failed on it.
+    import tvm_ffi
+
+    reqs = requests(session)
+    _, _, result = prefill(session, reqs, plan_info=tvm_ffi.Array([1, 5, 0, 16]))
+    plan = result._b5_selected_trajectory.metadata["plans"][0]
+    assert type(plan["plan_info"]) is list and plan["plan_info"] == [1, 5, 0, 16]
+    publish_prefill(session, reqs, result)
+    _, _, result = verify(session, reqs, plan_info=tvm_ffi.Array([1, 8, 0, 16]))
+    plan = result._b5_selected_trajectory.metadata["plans"][0]
+    assert type(plan["plan_info"]) is list and plan["plan_info"] == [1, 8, 0, 16]
+
+
+@pytest.mark.parametrize(
+    "case", ["missing", "device_element", "float_element", "string"]
+)
+def test_plan_identity_fail_closed(session, case):
+    import tvm_ffi
+
+    info = dict(
+        missing=None,
+        device_element=[1, torch.tensor(5)],
+        float_element=tvm_ffi.Array([1, 2.5]),
+        string="15016",
+    )[case]
+    reqs = requests(session)
+    b, f, result = prefill(session, reqs, capture=False)
+    native = worker(len(reqs))
+    wrapper = native.model_runner.attn_backend.full_attn_backend.forward_metadata
+    wrapper.prefill_wrappers[0]._plan_info = info
+    with pytest.raises(RuntimeError, match="host plan identity unavailable"):
+        session.capture_prefill(native, b, f, result)
 
 
 def test_native_shape_key_dataclass_serializes_exact_fields(session):

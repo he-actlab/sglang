@@ -12,6 +12,7 @@ import math
 import os
 import re
 import subprocess
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -277,9 +278,10 @@ def _plan_context(worker, forward, graph, tensors):
     n = gr.bs if gr is not None else forward.batch_size
     for i, wrapper in enumerate(wrappers):
         info = getattr(wrapper, "_plan_info", None)
+        # FlashInfer 0.6.12 returns tvm_ffi.container.Array: a Sequence of
+        # host ints, not a list/tuple (selected r1 failed on the list check).
         require(
-            isinstance(info, (list, tuple))
-            and all(type(x) in (int, bool) for x in info),
+            isinstance(info, Sequence) and all(type(x) in (int, bool) for x in info),
             "host plan identity unavailable",
         )
         plan = dict(
