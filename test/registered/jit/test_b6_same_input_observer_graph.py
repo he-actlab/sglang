@@ -7,6 +7,7 @@ native KV correctness or model fit.
 Only this test creates streams; the opt-in serving observer creates none.
 """
 
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -308,7 +309,9 @@ def test_integrated_reference_graph_traces_packed_prefix_events_and_corruption(
     The independent utility executes all five layers eagerly at B32 on GPU.
     Its golden outputs are staged through graph32/64 trace/head callbacks; this
     is deliberately NOT a production-attention numerical comparison. The real
-    checkpoint fixture captures actual native model boundaries instead.
+    checkpoint fixture captures actual native model boundaries instead. This
+    staged fixture also has no native phase/QKV capture context: the separate
+    real-handle test below covers that strict guard, not this lifetime test.
     """
     torch.manual_seed(927)
     small = torch.cuda.Stream()
@@ -319,6 +322,7 @@ def test_integrated_reference_graph_traces_packed_prefix_events_and_corruption(
     session.reference = NativeDSparkReference(model)
     golden = NativeDSparkReference(model)
     monkeypatch.setattr(obs, "_session", session)
+    monkeypatch.setattr(obs, "_reference_draft_context", lambda *_: nullcontext())
     worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
     worker.draft_model, worker.draft_model_runner = model, NS()
     worker.__dict__["_spec_pdmux_small_stream"] = None if arm == "stock" else small
@@ -699,8 +703,20 @@ def test_qkv_context_capture_and_restoration_on_real_cuda_handle(
     native_output = torch.empty(
         (graph_rows * 7, 16), dtype=torch.bfloat16, device="cuda"
     )
+    ids = torch.ones(graph_rows * 7, dtype=torch.int64, device="cuda")
+    positions = torch.arange(graph_rows * 7, device="cuda")
+    batch = NS(
+        forward_mode=NS(name="TARGET_VERIFY"),
+        spec_algorithm=NS(name="DSPARK"),
+        spec_info=NS(draft_token_num=7),
+        batch_size=graph_rows,
+        out_cache_loc=positions.clone(),
+        req_pool_indices=torch.arange(graph_rows, device="cuda"),
+        seq_lens=torch.ones(graph_rows, dtype=torch.int32, device="cuda"),
+    )
 
     def projection():
+        obs.capture_first_layer_entry(ids, positions, source, batch)
         obs.capture_first_layer_stage(attn, "input_norm", source)
         native_output.copy_(torch.nn.functional.linear(source, weight))
 
@@ -715,6 +731,12 @@ def test_qkv_context_capture_and_restoration_on_real_cuda_handle(
     assert captured["context"]["stream"] == small.cuda_stream
     assert captured["input"]["shape"] == [graph_rows * 7, 8]
     assert captured["weight"] == obs._tensor_layout(weight)
+    assert captured["entry_phase"] == dict(
+        forward_mode="TARGET_VERIFY",
+        algorithm="DSPARK",
+        width=7,
+        graph_rows=graph_rows,
+    )
     tickets = []
     for slot in (0, 1):
         with torch.cuda.stream(small):
@@ -729,6 +751,16 @@ def test_qkv_context_capture_and_restoration_on_real_cuda_handle(
             ticket.snapshots["layer0_qkv"] = native_output.reshape(
                 graph_rows, 7, 16
             ).clone()
+            # This primitive fixture captures entry + input_norm, not all
+            # layer stages. Own the real input_norm stamp/shape from replay.
+            index = trace.names.index("input_norm")
+            ticket.snapshots["layer0_graph_rows"] = trace.graph_rows[
+                slot, index : index + 1
+            ].clone()
+            ticket.snapshots["layer0_stamps"] = trace.stamps[
+                slot, index : index + 1
+            ].clone()
+            ticket.draft_graph_replayed = True
             ready = torch.cuda.Event()
             ready.record(small)
         ready.synchronize()  # Component-only drain, not an added observer wait.
@@ -791,6 +823,47 @@ def test_qkv_context_capture_and_restoration_on_real_cuda_handle(
                         result, native_output
                     )
                     assert torch.isfinite(result).all()
+                # Exercise the actual strict forward context on this real
+                # captured handle/stream. No physical green partition is used.
+                calls = []
+
+                def reference_primitive():
+                    calls.append(tuple(owned.flatten(0, 1).shape))
+                    assert pdmux._cublas_sm_count_target_get() == width
+                    if fail_allocated_replay:
+                        raise RuntimeError("injected reference failure")
+                    return linear(owned.flatten(0, 1), weight)
+
+                if fail_allocated_replay:
+                    with pytest.raises(
+                        RuntimeError, match="injected reference failure"
+                    ):
+                        with obs._reference_draft_context(session, ticket):
+                            reference_primitive()
+                else:
+                    with obs._reference_draft_context(session, ticket):
+                        reference_primitive()
+                reference_context = ticket.reference_execution_context
+                assert reference_context["entered"] == dict(original, sm_target=width)
+                assert reference_context["restored"] == original
+                assert obs._qkv_execution_context(session.device) == original
+                assert calls == [(graph_rows * 7, 8)]
+                assert reference_context["status"] == (
+                    "FAILED_REFERENCE_DRAFT_CONTEXT"
+                    if fail_allocated_replay
+                    else "MATCHED_CAPTURE_CONTEXT_NOT_SEMANTIC_PROOF"
+                )
+                captured["entry_phase"]["width"] = 8
+                with pytest.raises(AssertionError, match="phase/context/weight"):
+                    with obs._reference_draft_context(session, ticket):
+                        pytest.fail("mismatched phase reached reference callback")
+                captured["entry_phase"]["width"] = 7
+                ticket.snapshots["layer0_graph_rows"].fill_(live_rows - 1)
+                with pytest.raises(AssertionError, match="shape/epoch"):
+                    with obs._reference_draft_context(session, ticket):
+                        pytest.fail("mismatched shape reached reference callback")
+                ticket.snapshots["layer0_graph_rows"].fill_(graph_rows)
+                assert obs._qkv_execution_context(session.device) == original
         assert obs._qkv_execution_context(session.device) == before_outer
     small.synchronize()
     assert budgets == [2 * graph_rows * 7 * 16 * 2] * 2

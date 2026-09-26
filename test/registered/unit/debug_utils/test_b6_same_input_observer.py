@@ -1391,3 +1391,211 @@ def test_qkv_context_artifact_keeps_original_fatal_error(qkv_cpu_context, tmp_pa
     assert (
         not payload["full_checkpoint_native_semantics"] and not payload["timing_valid"]
     )
+
+
+def reference_context_component(state, n=32, graph_rows=64, slot=0):
+    """CPU tensors, actual entry hook and manager; only CUDA handle calls mocked."""
+    session, ticket, *_ = first_layer_component(n, graph_rows, slot)
+    snapshots = ticket.snapshots
+    batch = NS(
+        forward_mode=NS(name="TARGET_VERIFY"),
+        spec_algorithm=NS(name="DSPARK"),
+        spec_info=NS(draft_token_num=7),
+        batch_size=graph_rows,
+        out_cache_loc=snapshots["layer0_out_cache_loc"][:graph_rows].flatten(),
+        req_pool_indices=snapshots["layer0_rows"][:graph_rows],
+        seq_lens=snapshots["layer0_prefix"][:graph_rows],
+    )
+    obs.capture_first_layer_entry(
+        snapshots["layer0_input_ids"][:graph_rows].flatten(),
+        snapshots["layer0_positions"][:graph_rows].flatten(),
+        snapshots["layer0_entry"][:graph_rows].flatten(0, 1),
+        batch,
+    )
+    attn = bind_qkv_capture(session, ticket, state, graph_rows)
+    obs.draft_graph(True)
+    # This selects the strict CUDA-context contract with the handle API mocked
+    # above. All tensors stay on CPU; no CUDA initialization or kernel is used.
+    session.device = torch.device("cuda")
+    return session, ticket, attn, batch
+
+
+@pytest.mark.parametrize("n,graph_rows", [(31, 32), (32, 64)])
+@pytest.mark.parametrize("slot", [0, 1])
+@torch.inference_mode()
+def test_reference_context_actual_phase_restore_and_capture_ownership(
+    qkv_cpu_context, n, graph_rows, slot
+):
+    session, ticket, _, batch = reference_context_component(
+        qkv_cpu_context, n, graph_rows, slot
+    )
+    captured = copy.deepcopy(session.first_layer.qkv_capture_context[graph_rows])
+    # Later host/eager entry metadata must not relabel this captured graph.
+    batch.spec_info.draft_token_num = 8
+    session.first_layer.entry_phase["width"] = 8
+    original = {name: value.clone() for name, value in ticket.snapshots.items()}
+    with obs._reference_draft_context(session, ticket):
+        assert qkv_cpu_context["target"] == 52
+    details = ticket.reference_execution_context
+    assert details["status"] == "MATCHED_CAPTURE_CONTEXT_NOT_SEMANTIC_PROOF"
+    assert details["native_capture"] == captured
+    assert details["native_capture"]["entry_phase"] == dict(
+        forward_mode="TARGET_VERIFY",
+        algorithm="DSPARK",
+        width=7,
+        graph_rows=graph_rows,
+    )
+    assert details["entered"] == dict(details["before"], sm_target=52)
+    assert details["restored"] == details["before"]
+    assert qkv_cpu_context["sets"] == [52, 0] and qkv_cpu_context["target"] == 0
+    assert all(not obs.different(ticket.snapshots[k], v) for k, v in original.items())
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "not_replayed",
+        "missing_sizes",
+        "missing_stamps",
+        "stale_epoch",
+        "mixed_shapes",
+        "below_live_shape",
+        "missing_capture",
+        "mode",
+        "algorithm",
+        "width",
+        "phase_rows",
+        "capture_site",
+        "capture_route",
+        "current_route",
+        "capture_target",
+        "not_capturing",
+        "weight",
+        "current_stream",
+        "current_handle",
+    ],
+)
+@torch.inference_mode()
+def test_reference_context_rejects_unbound_phase_before_forward(
+    qkv_cpu_context, failure
+):
+    session, ticket, attn, _ = reference_context_component(qkv_cpu_context)
+    record = session.first_layer.qkv_capture_context[64]
+    if failure == "not_replayed":
+        ticket.draft_graph_replayed = False
+    elif failure in ("missing_sizes", "missing_stamps"):
+        del ticket.snapshots[
+            "layer0_" + ("graph_rows" if failure == "missing_sizes" else "stamps")
+        ]
+    elif failure == "stale_epoch":
+        ticket.snapshots["layer0_stamps"][0] -= 1
+    elif failure == "mixed_shapes":
+        ticket.snapshots["layer0_graph_rows"][0] = 32
+    elif failure == "below_live_shape":
+        ticket.snapshots["layer0_graph_rows"].fill_(31)
+    elif failure == "missing_capture":
+        session.first_layer.qkv_capture_context.clear()
+    elif failure in ("mode", "algorithm", "width", "phase_rows"):
+        key, value = {
+            "mode": ("forward_mode", "EXTEND"),
+            "algorithm": ("algorithm", "DFLASH"),
+            "width": ("width", 8),
+            "phase_rows": ("graph_rows", 32),
+        }[failure]
+        record["entry_phase"][key] = value
+    elif failure == "capture_site":
+        record["capture_site"] = "prefix_append"
+    elif failure == "capture_route":
+        record["qkv_placement_tagged"] = True
+    elif failure == "current_route":
+        attn._native_block_draft_placement = object()
+    elif failure == "capture_target":
+        record["context"]["sm_target"] = 0
+    elif failure == "not_capturing":
+        record["context"]["is_capturing"] = False
+    elif failure == "weight":
+        attn.qkv_proj.weight = torch.nn.Parameter(attn.qkv_proj.weight.clone())
+    elif failure == "current_stream":
+        qkv_cpu_context["stream"] += 1
+    elif failure == "current_handle":
+        qkv_cpu_context["handle"] += 1
+    called = False
+    with pytest.raises(AssertionError, match="reference"):
+        with obs._reference_draft_context(session, ticket):
+            called = True
+    assert not called and qkv_cpu_context["sets"] == []
+    assert (
+        ticket.reference_execution_context["status"] == "FAILED_REFERENCE_DRAFT_CONTEXT"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure", ["forward", "context_changed", "phase_changed", "restoration"]
+)
+@torch.inference_mode()
+def test_reference_context_exception_and_mutation_restore(
+    qkv_cpu_context, monkeypatch, failure
+):
+    from sglang.srt.multiplex import pdmux_context as pdmux
+
+    session, ticket, _, _ = reference_context_component(qkv_cpu_context)
+    if failure == "restoration":
+        setter = pdmux._cublas_sm_count_target_set
+        monkeypatch.setattr(
+            pdmux,
+            "_cublas_sm_count_target_set",
+            lambda value: setter(value) if value else None,
+        )
+    error = RuntimeError if failure == "forward" else AssertionError
+    match = {
+        "forward": "injected reference failure",
+        "restoration": "not restored",
+    }.get(failure, "changed during forward")
+    with pytest.raises(error, match=match):
+        with obs._reference_draft_context(session, ticket):
+            if failure == "forward":
+                raise RuntimeError("injected reference failure")
+            if failure == "context_changed":
+                qkv_cpu_context["target"] = 1
+            if failure == "phase_changed":
+                session.first_layer.qkv_capture_context[64]["entry_phase"]["width"] = 8
+    details = ticket.reference_execution_context
+    assert details["status"] == "FAILED_REFERENCE_DRAFT_CONTEXT"
+    if failure != "restoration":
+        assert details["restored"] == details["before"]
+        assert qkv_cpu_context["target"] == 0 and qkv_cpu_context["sets"] == [52, 0]
+
+
+@pytest.mark.parametrize("arm", ["stock", "candidate"])
+@torch.inference_mode()
+def test_reference_context_nonprior_preserves_existing_scope(qkv_cpu_context, arm):
+    session, ticket, _, _ = reference_context_component(qkv_cpu_context)
+    session.arm = arm
+    with obs._reference_draft_context(session, ticket):
+        assert qkv_cpu_context["target"] == 0
+    assert qkv_cpu_context["sets"] == []
+    assert not hasattr(ticket, "reference_execution_context")
+
+
+def test_reference_context_wraps_only_forward_not_prefix_append():
+    source = source_method(
+        "sglang/srt/debug_utils/b6_same_input_observer.py",
+        "Session",
+        "replay_reference",
+    )
+    method = ast.parse(source).body[0]
+    scoped = next(n for n in method.body if isinstance(n, ast.With))
+    assert (
+        ast.unparse(scoped.items[0].context_expr)
+        == "_reference_draft_context(self, ticket)"
+    )
+    assert len(scoped.body) == 1 and isinstance(scoped.body[0], ast.Assign)
+    assert ast.unparse(scoped.body[0].value.func) == "ref.forward_block"
+    append = next(
+        n
+        for n in method.body
+        if isinstance(n, ast.Expr)
+        and isinstance(n.value, ast.Call)
+        and ast.unparse(n.value.func) == "ref.append_context"
+    )
+    assert method.body.index(append) > method.body.index(scoped)
