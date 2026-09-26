@@ -270,10 +270,18 @@ def _plan_context(worker, forward, graph, tensors):
         else:
             backend = gr.attn_backend
     backend = getattr(backend, "full_attn_backend", backend)
-    meta = backend.forward_metadata
-    wrappers = list(meta.prefill_wrappers)
-    if meta.use_ragged:
-        wrappers.append(backend.prefill_wrapper_ragged)
+    if gr is not None:
+        # Verify replay re-plans the captured wrappers in place (use_ragged=False)
+        # and leaves forward_metadata at the last eager forward
+        # (FlashInferAttnBackend.init_forward_metadata_out_graph).
+        wrappers = list(backend.prefill_cuda_graph_metadata[gr.bs])
+        use_ragged, extend_no_prefix = False, None
+    else:
+        meta = backend.forward_metadata
+        wrappers = list(meta.prefill_wrappers)
+        use_ragged, extend_no_prefix = meta.use_ragged, meta.extend_no_prefix
+        if use_ragged:
+            wrappers.append(backend.prefill_wrapper_ragged)
     plans = []
     n = gr.bs if gr is not None else forward.batch_size
     for i, wrapper in enumerate(wrappers):
@@ -333,8 +341,8 @@ def _plan_context(worker, forward, graph, tensors):
         graph_key=asdict(gr._replay_graph_key) if gr is not None else None,
         actual_batch=forward.batch_size,
         forward_mode=str(forward.forward_mode),
-        use_ragged=meta.use_ragged,
-        extend_no_prefix=meta.extend_no_prefix,
+        use_ragged=use_ragged,
+        extend_no_prefix=extend_no_prefix,
         plans=plans,
         input_shape=list(forward.input_ids.shape),
         input_stride=list(forward.input_ids.stride()),

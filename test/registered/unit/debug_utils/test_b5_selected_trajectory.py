@@ -116,18 +116,23 @@ def sampling():
 
 
 def worker(n=32, plan_info=None):
-    wrapper = NS(
-        _plan_info=[1, 2, 3, 16, False] if plan_info is None else plan_info,
-        _backend="fa2",
-        is_cuda_graph_enabled=True,
-        _qo_indptr_buf=torch.arange(65, dtype=torch.int32) * 8,
-        _paged_kv_indptr_buf=torch.arange(65, dtype=torch.int32) * 20,
-        _paged_kv_last_page_len_buf=torch.ones(64, dtype=torch.int32),
-    )
+    def wrapper(graph):
+        return NS(
+            _plan_info=[1, 2, 3, 16, False] if plan_info is None else plan_info,
+            _backend="fa2",
+            is_cuda_graph_enabled=graph,
+            _qo_indptr_buf=torch.arange(65, dtype=torch.int32) * 8,
+            _paged_kv_indptr_buf=torch.arange(65, dtype=torch.int32) * 20,
+            _paged_kv_last_page_len_buf=torch.ones(64, dtype=torch.int32),
+        )
+
+    # Native verify replay re-plans the captured wrappers in place and leaves
+    # forward_metadata at the last eager forward.
     full = NS(
         forward_metadata=NS(
-            prefill_wrappers=[wrapper], use_ragged=False, extend_no_prefix=False
-        )
+            prefill_wrappers=[wrapper(False)], use_ragged=False, extend_no_prefix=False
+        ),
+        prefill_cuda_graph_metadata={64: [wrapper(True)]},
     )
     backend = NS(full_attn_backend=full)
     graph = NS(
@@ -632,6 +637,18 @@ def test_plan_identity_fail_closed(session, case):
     wrapper.prefill_wrappers[0]._plan_info = info
     with pytest.raises(RuntimeError, match="host plan identity unavailable"):
         session.capture_prefill(native, b, f, result)
+
+
+def test_verify_plan_identity_reads_replayed_graph_wrappers(session):
+    reqs = requests(session)
+    _, _, result = prefill(session, reqs)
+    context = result._b5_selected_trajectory.metadata
+    assert context["graph_kind"] == "eager" and not context["plans"][0]["cuda_graph"]
+    publish_prefill(session, reqs, result)
+    _, _, result = verify(session, reqs)
+    context = result._b5_selected_trajectory.metadata
+    assert context["graph_kind"] == "decode_verify" and context["use_ragged"] is False
+    assert [p["cuda_graph"] for p in context["plans"]] == [True]
 
 
 def test_native_shape_key_dataclass_serializes_exact_fields(session):
