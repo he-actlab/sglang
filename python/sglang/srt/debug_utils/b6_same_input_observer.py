@@ -11,7 +11,8 @@ author-environment numerics, or independent target-attention correctness.
 
 import hashlib
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -363,6 +364,10 @@ class FirstLayerTrace:
             (2, len(self.names)), dtype=torch.int64, device=device
         )
         self.graph_rows = torch.zeros_like(self.stamps)
+        # Immutable host metadata from each actual graph capture, not a
+        # captured Python slot/ticket or a late read of activation storage.
+        self.qkv_capture_context = {}
+        self.entry_phase = None
 
     def persistent_tensors(self):
         return [*self.tensors.values(), self.stamps, self.graph_rows]
@@ -453,6 +458,241 @@ class FirstLayerTrace:
         )
         ticket.snapshots["layer0_graph_rows"] = sizes.clone()
         ticket.snapshots["layer0_stamps"] = self.stamps[slot].clone()
+
+
+def _tensor_layout(value):
+    try:
+        version = value._version
+    except RuntimeError:
+        # Inference tensors genuinely have no version counter. Do not invent
+        # one or present pointer/layout equality as a weight-content proof.
+        version = None
+    return dict(
+        shape=list(value.shape),
+        stride=list(value.stride()),
+        dtype=str(value.dtype),
+        device=str(value.device),
+        storage_offset=value.storage_offset(),
+        data_ptr=value.data_ptr(),
+        version=version,
+        version_available=version is not None,
+    )
+
+
+def _qkv_execution_context(device):
+    from sglang.srt.multiplex import pdmux_context as pdmux
+
+    handle = int(torch.cuda.current_blas_handle())
+    result = dict(
+        blas_handle=handle,
+        stream=int(torch.cuda.current_stream(device).cuda_stream),
+        sm_target=pdmux._cublas_sm_count_target_get(),
+        is_capturing=torch.cuda.is_current_stream_capturing(),
+    )
+    if int(torch.cuda.current_blas_handle()) != handle:
+        raise AssertionError("cuBLAS handle changed during diagnostic inspection")
+    return result
+
+
+@contextmanager
+def _reference_draft_context(session, ticket):
+    """Match only the prior graph-draft phase; never prefix materialization.
+
+    The independent reference's separate projections and exact gates are
+    unchanged. CPU fixtures have no cuBLAS context; stock/candidate retain
+    their existing behavior and are not covered by this correction.
+    """
+    if session.arm != "prior" or session.device.type == "cpu":
+        yield
+        return
+    from sglang.srt.multiplex import pdmux_context as pdmux
+
+    details = {"status": "FAILED_REFERENCE_DRAFT_CONTEXT"}
+    ticket.reference_execution_context = details
+    trace = session.first_layer
+    sizes = ticket.snapshots.get("layer0_graph_rows")
+    stamps = ticket.snapshots.get("layer0_stamps")
+    if (
+        not getattr(ticket, "draft_graph_replayed", False)
+        or trace is None
+        or sizes is None
+        or stamps is None
+    ):
+        raise AssertionError("reference requires owned native draft graph metadata")
+    rows = sizes.tolist()
+    if (
+        not rows
+        or len(set(rows)) != 1
+        or not len(ticket.rows) <= rows[0] <= 64
+        or not torch.all(stamps == ticket.epoch)
+    ):
+        raise AssertionError("reference draft graph shape/epoch changed")
+    graph_rows = rows[0]
+    captured = deepcopy(trace.qkv_capture_context.get(graph_rows))
+    details["native_capture"] = captured
+    expected_phase = dict(
+        forward_mode="TARGET_VERIFY",
+        algorithm="DSPARK",
+        width=7,
+        graph_rows=graph_rows,
+    )
+    attn = session.reference.model.layers[0].self_attn
+    split = pdmux.SPEC_SM_ALLOCATED_SPLIT
+    if (
+        not isinstance(captured, dict)
+        or captured.get("capture_site") != "DSparkAttention.forward:before_forward_qkv"
+        or captured.get("entry_phase") != expected_phase
+        or captured.get("control_arm") != "prior"
+        or captured.get("qkv_placement_tagged") is not False
+        or getattr(attn, "_native_block_draft_placement", None) is not None
+        or not captured.get("context", {}).get("is_capturing")
+        or not isinstance(split, tuple)
+        or len(split) != 2
+        or any(type(v) is not int or v <= 0 for v in split)
+        or captured["context"]["sm_target"] != split[1]
+        or captured.get("weight") != _tensor_layout(attn.qkv_proj.weight)
+    ):
+        raise AssertionError("reference draft capture phase/context/weight changed")
+    before = _qkv_execution_context(session.device)
+    details["before"] = before
+    if (
+        before["is_capturing"]
+        or session.small_stream is None
+        or before["stream"] != int(session.small_stream.cuda_stream)
+        or captured["context"]["stream"] != before["stream"]
+        or captured["context"]["blas_handle"] != before["blas_handle"]
+    ):
+        raise AssertionError("reference draft left its captured native stream/handle")
+    width = captured["context"]["sm_target"]
+    try:
+        with pdmux.cublas_sm_count_target(width) as previous:
+            entered = _qkv_execution_context(session.device)
+            details["entered"] = entered
+            if previous != before["sm_target"] or entered != dict(
+                before, sm_target=width
+            ):
+                raise AssertionError("reference draft context entry was not verified")
+            yield
+            if (
+                _qkv_execution_context(session.device) != entered
+                or trace.qkv_capture_context.get(graph_rows) != captured
+                or _tensor_layout(attn.qkv_proj.weight) != captured["weight"]
+            ):
+                raise AssertionError("reference draft context changed during forward")
+    except Exception as exc:
+        details["error"] = repr(exc)
+        raise
+    finally:
+        restored = _qkv_execution_context(session.device)
+        details["restored"] = restored
+        if restored != before:
+            raise AssertionError("reference draft context was not restored")
+    details["status"] = "MATCHED_CAPTURE_CONTEXT_NOT_SEMANTIC_PROOF"
+
+
+def _qkv_context_replays(session, ticket, x, weight, packed, original_context=None):
+    """Two additional diagnostic outputs; never substitutes for the oracle.
+
+    Actual allocated width, observed capture target and eager target are
+    distinct facts. Only the prior arm's un-routed projection is eligible.
+    Matching the SM-count target does not establish identical whole-library
+    planning contexts. Failures never replace the original fatal error.
+    """
+    from sglang.srt.multiplex import pdmux_context as pdmux
+
+    n, g = len(ticket.rows), x.shape[0]
+    details, outputs = {"status": "FAILED_CONTEXT_DIAGNOSTIC"}, {}
+    before = None
+    try:
+        if session.arm != "prior":
+            details.update(
+                status="NOT_APPLICABLE_REQUIRES_UNROUTED_PRIOR",
+                control_arm=session.arm,
+            )
+            return details, outputs
+        if x.ndim != 3 or x.shape[1] != 7 or not n <= g <= 64:
+            raise ValueError("QKV context replay lost the actual padded M")
+        native = session.first_layer.qkv_capture_context.get(g)
+        details["native_capture"] = native
+        if native is None or not native.get("context", {}).get("is_capturing"):
+            raise ValueError("QKV context replay lacks the actual graph capture")
+        attn = session.reference.model.layers[0].self_attn
+        if (
+            native["control_arm"] != "prior"
+            or native["qkv_placement_tagged"]
+            or getattr(attn, "_native_block_draft_placement", None) is not None
+        ):
+            raise ValueError("entry context cannot bind a routed QKV projection")
+        source = x.flatten(0, 1)
+        details.update(
+            replay_input=_tensor_layout(source),
+            replay_weight=_tensor_layout(weight),
+            actual_graph_rows=g,
+            live_rows=n,
+            primitive_gemm_m=g * 7,
+            torch_version=str(torch.__version__),
+            torch_cuda_version=torch.version.cuda,
+        )
+        if native["weight"] != details["replay_weight"]:
+            raise AssertionError("QKV weight view/version changed after capture")
+        split = pdmux.SPEC_SM_ALLOCATED_SPLIT
+        if (
+            not isinstance(split, tuple)
+            or len(split) != 2
+            or any(type(v) is not int or v <= 0 for v in split)
+        ):
+            raise ValueError("QKV diagnostic requires the actual allocated split")
+        width = split[1]
+        details["allocated_small_width"] = width
+        if native["context"]["sm_target"] != width:
+            raise ValueError("captured QKV SM target differs from allocated SMALL")
+        before = _qkv_execution_context(session.device)
+        details["before"] = before
+        details["original_eager_context"] = original_context
+        if original_context != before:
+            raise AssertionError("original eager QKV context was not verified")
+        if before["is_capturing"] or (
+            session.small_stream is not None
+            and before["stream"] != int(session.small_stream.cuda_stream)
+        ):
+            raise AssertionError("QKV diagnostic left its existing eager stream")
+        # Two extra full-padded-M BF16 results at most. Workspace and CPU
+        # artifact copies remain separate from this non-admission prediction.
+        session.budget(2 * g * 7 * weight.shape[0] * x.element_size())
+        outputs["qkv_same_context_repeat"] = F.linear(source, weight).reshape(g, 7, -1)
+        details["after_same_context_repeat"] = _qkv_execution_context(session.device)
+        if details["after_same_context_repeat"] != before:
+            raise AssertionError("same-context QKV replay changed execution context")
+        with pdmux.cublas_sm_count_target(width) as previous:
+            details["entered"] = _qkv_execution_context(session.device)
+            if previous != before["sm_target"] or details["entered"] != dict(
+                before, sm_target=width
+            ):
+                raise AssertionError("allocated-width QKV context was not verified")
+            outputs["qkv_allocated_width_replay"] = F.linear(source, weight).reshape(
+                g, 7, -1
+            )
+        details["status"] = "COMPLETE_CONTEXT_DIAGNOSTIC_NOT_SEMANTIC_PROOF"
+    except Exception as exc:
+        details["error"] = repr(exc)
+    finally:
+        if before is not None:
+            try:
+                details["restored"] = _qkv_execution_context(session.device)
+                if details["restored"] != before:
+                    raise AssertionError("QKV diagnostic context was not restored")
+            except Exception as exc:
+                details["status"] = "FAILED_CONTEXT_DIAGNOSTIC"
+                details["restoration_error"] = repr(exc)
+    details["exact"] = {}
+    for name, value in outputs.items():
+        details["exact"][name + "_vs_native"] = not bool(
+            different(value[:n], ticket.snapshots["layer0_qkv"][:n])
+        )
+        details["exact"][name + "_vs_original_eager"] = not bool(
+            different(value[:n], packed[:n])
+        )
+    return details, outputs
 
 
 def first_layer_evidence(session, ticket):
@@ -564,7 +804,17 @@ def first_layer_evidence(session, ticket):
         native_norm(entry, layer.input_layernorm),
         live=True,
     )
+    original_context = None
+    if session.arm == "prior" and g in trace.qkv_capture_context:
+        try:
+            original_context = _qkv_execution_context(session.device)
+        except Exception as exc:
+            original_context = {"error": repr(exc)}
     packed = F.linear(x.flatten(0, 1), attn.qkv_proj.weight).reshape(g, 7, -1)
+    context, extra = _qkv_context_replays(
+        session, ticket, x, attn.qkv_proj.weight, packed, original_context
+    )
+    expected.update(extra)
     check("qkv_packed_same_input", s["layer0_qkv"][:g], packed, live=True)
     separate = torch.cat(
         [
@@ -609,6 +859,7 @@ def first_layer_evidence(session, ticket):
             primitive_gemm_m=g * 7,
             exact=exact,
             independent_prefix=prefix_equal,
+            qkv_context_replay=context,
             attention_scope="Actual attention output plus actual active-row prefix/plan/Q/K/V are retained. No additional SDPA replay or native FlashInfer equality claim.",
             limitations="Separate/packed GEMM and author norm/RoPE comparisons are diagnostics, not substitutions, tolerances or causal conclusions. Residual/MLP are outside this localization.",
         ),
@@ -877,6 +1128,9 @@ class Session:
             generations=ticket.generations,
             prefix_lengths=ticket.layer0_prefix_lengths,
             evidence=evidence,
+            reference_execution_context=getattr(
+                ticket, "reference_execution_context", None
+            ),
             tensor_sha256=digest,
             tensors=tensors,
             timing_valid=False,
@@ -922,7 +1176,8 @@ class Session:
             + (sum(prefix) + 2 * sum(counts)) * 5 * 2 * kv * 2
         )
         owned = ref.begin_batch(ticket.slot, ticket.epoch, keys)
-        result = ref.forward_block(owned, ticket.snapshots["tokens"][:, 0])
+        with _reference_draft_context(self, ticket):
+            result = ref.forward_block(owned, ticket.snapshots["tokens"][:, 0])
         ticket.reference_block = result  # Retained on failure for diagnosis.
         for index, expected in enumerate((*result.layer_hidden, result.hidden)):
             self.compare(
@@ -1214,10 +1469,41 @@ def capture_first_layer_entry(ids, positions, hidden, forward_batch):
     if _session.first_layer is None:
         raise AssertionError("first-layer evidence was not initialized before capture")
     _session.first_layer.entry(ids, positions, hidden, forward_batch)
+    # Host-only phase metadata belongs to this model-entry callback. The QKV
+    # capture copies it, so subsequent eager entries cannot relabel a graph.
+    _session.first_layer.entry_phase = dict(
+        forward_mode=getattr(forward_batch.forward_mode, "name", None),
+        algorithm=getattr(forward_batch.spec_algorithm, "name", None),
+        width=getattr(forward_batch.spec_info, "draft_token_num", None),
+        graph_rows=forward_batch.batch_size,
+    )
 
 
 def capture_first_layer_stage(attn, name, value):
     if attn.attn.layer_id == 0:
+        if name == "input_norm" and _session.arm == "prior":
+            record = dict(
+                capture_site="DSparkAttention.forward:before_forward_qkv",
+                entry_phase=deepcopy(_session.first_layer.entry_phase),
+                control_arm=_session.arm,
+                qkv_placement_tagged=getattr(
+                    attn, "_native_block_draft_placement", None
+                )
+                is not None,
+            )
+            try:
+                record["context"] = _qkv_execution_context(value.device)
+                if record["context"]["is_capturing"]:
+                    record.update(
+                        input=_tensor_layout(value),
+                        weight=_tensor_layout(attn.qkv_proj.weight),
+                    )
+                    _session.first_layer.qkv_capture_context[value.shape[0] // 7] = (
+                        record
+                    )
+            except Exception as exc:
+                record["error"] = repr(exc)
+                _session.first_layer.qkv_capture_context[value.shape[0] // 7] = record
         _session.first_layer.stage(name, value)
 
 
@@ -1402,6 +1688,7 @@ def sampler_rows(forward_batch):
 def draft_graph(graph):
     if not graph:
         raise AssertionError("native seven-position draft graph replay required")
+    _session.current_draft.draft_graph_replayed = True
     _session.stats["draft_graph_replays"][_session.current_draft.slot] += 1
 
 
