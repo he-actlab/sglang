@@ -1,0 +1,35 @@
+# Manual correctness fixture. Not enabled by any normal runner.
+# DUMPER_ENABLE=false DUMPER_SERVER_PORT=reuse DUMPER_NON_INTRUSIVE_MODE=off
+# SGLANG_B2_FIRST_TOKEN_DIAGNOSTIC_KIND=correctness-only
+# SGLANG_B2_FIRST_TOKEN_DIAGNOSTIC_CONFIG=<frozen request catalog>
+patches:
+  - target: sglang.srt.debug_utils.dumper._Dumper.apply_source_patches
+    edits:
+      - match: config_path = self._config.source_patcher_config
+        replacement: return
+  - target: sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs
+    preamble: from sglang.srt.debug_utils.b2_first_token_diagnostic import initialize
+    edits:
+      - match: self.eager_runner = EagerRunner(self)
+        prepend: initialize(self)
+  - target: sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation
+    preamble: from sglang.srt.debug_utils.b2_first_token_diagnostic import capture
+    edits:
+      - match: |
+          if not forward_batch.is_prefill_only:
+              # For normal requests, sample the next token ids.
+              batch_result.next_token_ids = self.model_runner.sample(
+                  logits_output, forward_batch
+              )
+        replacement: |
+          if not forward_batch.is_prefill_only:
+              # For normal requests, sample the next token ids.
+              batch_result.next_token_ids = self.model_runner.sample(
+                  logits_output, forward_batch
+              )
+              capture(self, batch, forward_batch, batch_result, is_verify)
+  - target: sglang.srt.managers.scheduler_components.batch_result_processor.SchedulerBatchResultProcessor.process_batch_result_prefill
+    preamble: from sglang.srt.debug_utils.b2_first_token_diagnostic import publish
+    edits:
+      - match: req.output_ids.append(next_token_id)
+        append: publish(req, next_token_id)
