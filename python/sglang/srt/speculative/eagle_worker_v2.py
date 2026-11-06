@@ -1185,6 +1185,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
+    def _spec_pdmux_mask_staging(self, batch: ScheduleBatch, backend_buf: torch.Tensor) -> torch.Tensor:
+        """The per-slot tree-mask staging buffer (same size / dtype as the backend's fill-after-draft buffer)."""
+        slot = getattr(batch, "spec_pdmux_slot", None)
+        if slot is None:
+            raise AssertionError("--enable-spec-pdmux: batch carries no spec_pdmux_slot for mask staging")
+        bufs = self.__dict__.setdefault("_spec_pdmux_mask_bufs", {})
+        buf = bufs.get(slot)
+        if buf is None or buf.shape != backend_buf.shape or buf.dtype != backend_buf.dtype:
+            buf = bufs[slot] = torch.empty_like(backend_buf)
+        return buf
+
     def _build_verify_input(
         self,
         batch: ScheduleBatch,
@@ -1222,14 +1233,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # before any concurrency is safe. Checked per call because
             # adaptive spec (apply_runtime_state) can swap the target
             # backend at runtime.
-            assert tree_mask_buf is None and position_buf is None, (
-                "--enable-spec-pdmux: target attention backend "
-                f"{type(self.target_worker.model_runner.attn_backend).__name__} "
-                "exposes verify buffers to fill after draft; draft(B) would "
-                "clobber verify(A)'s tree-mask/positions under two-slot "
-                "operation. Per-slot staging (spec-pdmux M2.1) is required "
-                "for this backend."
-            )
+            # Per-slot staging (spec-pdmux M2.1) for backends that expose fill-after-draft buffers (triton: the
+            # tree mask; positions None): draft(slot) builds into its slot's own buffer of the backend buffer's
+            # size, and the backend's target-verify replay copies spec_info.custom_mask into its static buffer on
+            # the forward (large) stream, inside verify(slot).  The slot's next draft is issued after its extend,
+            # which waits verify_done[slot], so a staging buffer is never rewritten while its verify needs it.
+            if position_buf is not None:
+                raise AssertionError(
+                    "--enable-spec-pdmux: target attention backend "
+                    f"{type(self.target_worker.model_runner.attn_backend).__name__} "
+                    "exposes a positions buffer to fill after draft; per-slot staging covers the tree mask only."
+                )
+            if tree_mask_buf is not None:
+                tree_mask_buf = self._spec_pdmux_mask_staging(batch, tree_mask_buf)
 
         # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
         # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
@@ -3286,6 +3302,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_lens,
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        _trace_dir = os.environ.get("SGLANG_HELION_SPEC_TRACE")
+        if _trace_dir and not batch.forward_mode.is_idle():
+            # diagnostic (conjugate_tvm_v025): per verify, each request's draft tokens and accept length, keyed by its
+            # prompt and the number of tokens generated before this verify; synchronizes, so debug runs only
+            import json as _json
+
+            _bs = len(batch.reqs)
+            _dt = verify_input.draft_token.view(_bs, -1).tolist()
+            _al = accept_lens.tolist()
+            _sl = batch.seq_lens.tolist()
+            with open(os.path.join(_trace_dir, f"verify_{os.getpid()}.jsonl"), "a") as _f:
+                for _i, _r in enumerate(batch.reqs):
+                    _f.write(_json.dumps({"prompt": [int(t) for t in _r.origin_input_ids[:8]], "plen": len(_r.origin_input_ids),
+                                          "gen": len(_r.output_ids), "seq_len": _sl[_i], "draft": _dt[_i],
+                                          "accept": _al[_i], "bs": _bs,
+                                          "slot": getattr(batch, "spec_pdmux_slot", None)}) + "\n")
         new_seq_lens = batch.seq_lens + accept_lens
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),

@@ -276,6 +276,26 @@ def initialize_spec_stream_pair(
         if SPEC_QKV128_STREAM is None and _dedicated_qkv128_stream_enabled():
             SPEC_QKV128_STREAM = torch.cuda.Stream(device=gpu_id)
         return SPEC_STREAM_PAIR
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_SPEC_PDMUX_PLAIN_STREAMS.get():
+        # Two ordinary CUDA streams on the full device: the slot scheduler, its per-slot events and stream
+        # ordering are unchanged; only the SM confinement is gone.  The "allocated" split reports the full SM
+        # count for both streams (consumers that size work by SM count see the whole device).
+        full = torch.cuda.get_device_properties(gpu_id).multi_processor_count
+        SPEC_STREAM_PAIR = (torch.cuda.Stream(device=gpu_id), torch.cuda.Stream(device=gpu_id))
+        SPEC_SM_SPLIT = (large_sm, small_sm)
+        SPEC_SM_ALLOCATED_SPLIT = (full, full)
+        SPEC_PREFILL_STREAM = torch.cuda.Stream(device=gpu_id)
+        if _dedicated_qkv128_stream_enabled():
+            SPEC_QKV128_STREAM = torch.cuda.Stream(device=gpu_id)
+        logger.info(
+            "[spec-pdmux] plain streams (SGLANG_SPEC_PDMUX_PLAIN_STREAMS): no green-ctx partition, "
+            "requested=(%d,%d) allocated=(%d,%d) physical=%d gpu=%d",
+            large_sm, small_sm, full, full, full, gpu_id,
+        )
+        return SPEC_STREAM_PAIR
+
     from sgl_kernel import spatial
 
     large_stream, small_stream, allocated_large, allocated_small = (
