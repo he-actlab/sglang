@@ -233,6 +233,8 @@ class Envs:
 
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
+    # Swap kernel calls for exported Helion ports (conjugate_tvm_v025 conjugate/sglang_swap; needs it on PYTHONPATH)
+    SGLANG_HELION_SWAP = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)

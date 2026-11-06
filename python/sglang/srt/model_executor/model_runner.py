@@ -364,6 +364,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
     ):
+        self.maybe_init_helion_swap()
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         # Set on target by `_resolve_memory_pool_config`; passed in for draft
@@ -610,6 +611,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_revision=model_revision,
             is_draft_model=is_draft_model,
         )
+
+    def maybe_init_helion_swap(self):
+        # SGLANG_HELION_SWAP: swap SGLang's kernel calls for the exported Helion ports (conjugate_tvm_v025,
+        # conjugate/sglang_swap/patch.py) before the model is built; idempotent, target and draft runners share it.
+        if not envs.SGLANG_HELION_SWAP.get():
+            return
+        from conjugate.sglang_swap.patch import install as helion_swap_install
+
+        helion_swap_install()
 
     def init_msprobe(self):
         # Init the msprobe
